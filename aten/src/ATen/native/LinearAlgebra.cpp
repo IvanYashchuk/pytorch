@@ -368,8 +368,10 @@ Tensor& addmm_cpu_out(Tensor &result, const Tensor& self, const Tensor& mat1, co
 }
 
 Tensor addmm_cpu(const Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha) {
-  Tensor result = at::empty({0}, self.options());
-  return addmm_cpu_out(result, self, mat1, mat2, beta, alpha);
+  at::ScalarType common_dtype = at::result_type(mat1, mat2);
+  auto options = TensorOptions().dtype(common_dtype).device(self.device());
+  Tensor result = at::empty({0}, options);
+  return addmm_cpu_out(result, self.toType(common_dtype), mat1.toType(common_dtype), mat2.toType(common_dtype), beta, alpha);
 }
 
 Tensor &addmm_cpu_(Tensor& self, const Tensor& mat1, const Tensor& mat2, Scalar beta, Scalar alpha) {
