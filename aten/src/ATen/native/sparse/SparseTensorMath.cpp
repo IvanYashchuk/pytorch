@@ -1126,12 +1126,13 @@ SparseTensor& _sspaddmm_out_cpu(
           int64_t i_end = csr_accessor[h+1];
           for (int64_t i = i_start; i < i_end; i++) {
             scalar_t val = values_accessor[i];
+            int64_t row = indices_accessor[0][i];
             int64_t col = indices_accessor[1][i];
             if (col >= 0 && col < dim_j) {
               THBlas_axpy<scalar_t>(dim_k,
                   cast_alpha * val,
                   dense_ptr + col * dense_stride0, dense_stride1,
-                  newv_ptr + p * newv_stride0, 1);
+                  newv_ptr + row * dim_k, 1);
             } else {
               AT_ERROR("index out of bound. sspmm: ", col, " not between 1 and ", dim_j);
             }
