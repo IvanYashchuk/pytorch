@@ -92,29 +92,42 @@ def create_derivative(f: NativeFunction, formula: str, var_names: Tuple[str, ...
     )
 
 def create_forward_derivative(f: NativeFunction, formula: str, names: Tuple[str, ...]) -> ForwardDerivative:
-    assert len(names) == 1, "Forward derivatives can define gradients for only one output at a time"
-    var_name = names[0]
-    var_type: Optional[Type] = None
-    for r in f.func.returns:
-        if r.name == var_name:
-            var_type = r.type
-            break
+    # assert len(names) == 1, "Forward derivatives can define gradients for only one output at a time"
+    # var_name = names#[0]
+    # var_type: Optional[Type] = None
+    var_types: List[Type] = []
+    # for r, name in enumerate(f.func.returns, names):
+    print(f"f.func.returns {f.func.returns}")
+    print(f"names {names}")
+    # for idx, (r, name) in enumerate(zip(f.func.returns, names)):
+    for name in names:
+        for r in f.func.returns:
+            if r.name == name:
+                var_types.append(r.type)
+        # print(f"r.name {r.name}")
+        # print(f"name {name}")
+        # # assert r.name == name or r.name is None, "Forward derivative name must match the return names"
+        # if r.name == name:
+        #     var_types.append(r.type)
+            # break
     # Handle default return names
-    if var_type is None:
-        if var_name == "result":
+    # if var_type is None:
+    if not var_types:
+        assert len(names) == 1, "Forward derivatives can define gradients for only one output at a time"
+        if names[0] == "result":
             assert len(f.func.returns) == 1
-            var_type = f.func.returns[0].type
+            var_types.append(f.func.returns[0].type)
         else:
-            res = re.findall(r"^result(\d+)$", var_name)
+            res = re.findall(r"^result(\d+)$", names[0])
             if len(res) == 1:
                 arg_idx = int(res[0])
-                var_type = f.func.returns[arg_idx].type
+                var_types.append(f.func.returns[arg_idx].type)
 
-    assert var_type is not None, "No matching output for forward derivative definition"
+    assert var_types, "No matching output for forward derivative definition"
     return ForwardDerivative(
         formula=formula,
-        var_name=var_name,
-        var_type=var_type,
+        var_names=names,
+        var_types=var_types,
         required_inputs_fw_grad=None,
         required_inputs_primal=None,
         required_original_self_value=False,
@@ -243,8 +256,8 @@ def postprocess_forward_derivatives(
 
         updated_derivatives.append(ForwardDerivative(
             formula=formula,
-            var_name=defn.var_name,
-            var_type=defn.var_type,
+            var_names=defn.var_names,
+            var_types=defn.var_types,
             required_inputs_fw_grad=required_inputs_tangent,
             required_inputs_primal=required_inputs_primal,
             required_original_self_value=False,
@@ -253,14 +266,15 @@ def postprocess_forward_derivatives(
     return updated_derivatives
 
 def is_forward_derivative_definition(all_arg_names: List[str], names: Tuple[str, ...]) -> bool:
-    if len(names) > 1:
-        # Forward definition are always for a single output at a time
-        return False
-    name = names[0]
-    if name not in all_arg_names:
-        return True
-    else:
-        return False
+    # if len(names) > 1:
+    #     # Forward definition are always for a single output at a time
+    #     return False
+    # name = names[0]
+    # if name not in all_arg_names:
+    #     return True
+    # else:
+    #     return False
+    return not any(name in all_arg_names for name in names)
 
 def create_differentiability_info(
     defn: Dict[Any, Any],
@@ -367,6 +381,11 @@ def create_differentiability_info(
             formula = defn[raw_names]
             names = split_names(raw_names)
 
+            if "eigenvalues" in names or "eigenvectors" in names:
+                print(f"\nnames {names}\n")
+                print(f"f.func.returns {f.func.returns}")
+                print(f"formula = defn[raw_names] {defn[raw_names]}")
+                print(f"defn.keys() {defn.keys()}")
             if is_forward_derivative_definition(all_arg_names, names):
                 forward_derivatives.append(create_forward_derivative(f, formula, names))
             else:

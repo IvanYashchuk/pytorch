@@ -56,13 +56,13 @@ class ForwardDerivative:
     # replaced by the automatically generated formula.
     formula: str
 
-    # Name of the output argument for which this formula calculates forward
+    # Names of the output arguments for which this formula calculates forward
     # derivatives
-    var_name: str
+    var_names: List[str]
 
-    # Type of the output argument for which this formula calculates forward
+    # Types of the output arguments for which this formula calculates forward
     # derivatives
-    var_type: Type
+    var_types: List[Type]
 
     # Inputs for which the forward derivatives are required for this formula
     required_inputs_fw_grad: Optional[Tuple[str, ...]]
@@ -280,6 +280,9 @@ def match_differentiability_info(
                             f"in-place function is not supported: {f.func}")
 
         # For functions that have a single def for out-of-place and inplace (like abs())
+        if info and "linalg_eig" in info.name:
+            print(f"info.name {info.name}")
+            print(f"info.forward_derivatives {info.forward_derivatives}")
         if info and info.forward_derivatives:
             forward_derivatives = info.forward_derivatives
 
@@ -343,8 +346,8 @@ def match_differentiability_info(
 
                 forward_derivatives = [ForwardDerivative(
                     formula=formula,
-                    var_name="self",
-                    var_type=fw_info.var_type,
+                    var_names=["self",],
+                    var_types=fw_info.var_types,
                     required_inputs_fw_grad=fw_info.required_inputs_fw_grad,
                     required_inputs_primal=required_primals,
                     required_original_self_value=required_original_self_value,

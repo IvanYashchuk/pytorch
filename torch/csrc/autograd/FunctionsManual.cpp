@@ -2588,6 +2588,13 @@ Tensor eigh_jvp_eigenvectors(
   return at::matmul(eigenvectors, tmp.div(E));
 }
 
+std::tuple<Tensor, Tensor> eigh_jvp(const Tensor& input_tangent, const Tensor& eigenvalues, const Tensor& eigenvectors) {
+  Tensor eigenvalues_tangent, eigenvectors_tangent;
+  eigenvalues_tangent = eigh_jvp_eigenvalues(input_tangent, eigenvalues, eigenvectors);
+  eigenvectors_tangent = eigh_jvp_eigenvectors(input_tangent, eigenvalues, eigenvectors);
+  return std::make_tuple(eigenvalues_tangent, eigenvectors_tangent);
+}
+
 Tensor eigh_backward(const std::vector<torch::autograd::Variable> &grads, const Tensor& self,
                      bool eigenvectors, const Tensor& L, const Tensor& V) {
   // This function is used for both torch.symeig and torch.linalg.eigh.

@@ -469,6 +469,10 @@ def emit_body(fn: NativeFunctionWithDifferentiabilityInfo) -> List[str]:
     fw_derivatives = fn.fw_derivatives
 
     name = cpp.name(f.func)
+
+    if "linalg_eigh" in name:
+        print(f"fw_derivatives {fw_derivatives}")
+
     inplace = f.func.kind() == SchemaKind.inplace
     is_out_fn = f.func.kind() == SchemaKind.out
     returns_void = len(f.func.returns) == 0
@@ -505,10 +509,18 @@ def emit_body(fn: NativeFunctionWithDifferentiabilityInfo) -> List[str]:
             return differentiable_inputs
         names = set(name for d in info.derivatives for name in d.var_names)
         differentiable = [arg for arg in differentiable_inputs if arg.name in names]
+        if "eigenvalues" in names or "eigenvectors" in names:
+            print(f"names is {names}")
+            print(f"differentiable is {differentiable}")
+            print(f"differentiable_inputs is {differentiable_inputs}")
+            raise RuntimeError
         if len(differentiable) != len(names):
             missing = names - set(arg.name for arg in differentiable)
             raise RuntimeError(f'Missing arguments for derivatives: {missing} in {info.name}')
         return differentiable
+
+    if "eigh" in name:
+        print(fn)
 
     differentiable_inputs = gen_differentiable_inputs(f)
     args_with_derivatives = find_args_with_derivatives(differentiable_inputs)
@@ -879,8 +891,8 @@ def emit_body(fn: NativeFunctionWithDifferentiabilityInfo) -> List[str]:
                 requires_fw_grad = \
                     f'({fn.info.output_differentiability_conditions[0]}) && ({requires_fw_grad})'
 
-            content.append(f"auto {get_any_has_forward_grad_name(derivative.var_name)} = {requires_fw_grad};\n"
-                           f"(void){get_any_has_forward_grad_name(derivative.var_name)};")
+            content.append(f"auto {get_any_has_forward_grad_name(derivative.var_names)} = {requires_fw_grad};\n"
+                           f"(void){get_any_has_forward_grad_name(derivative.var_names)};")
 
         return content
 
@@ -892,7 +904,7 @@ def emit_body(fn: NativeFunctionWithDifferentiabilityInfo) -> List[str]:
     def emit_fw_derivatives() -> List[str]:
         content: List[str] = []
         for derivative in fw_derivatives:
-            res = derivative.var_name
+            res = derivative.var_names
             if f.func.name.name.inplace:
                 # TODO update this when inplace namings are unified
                 res = "self"

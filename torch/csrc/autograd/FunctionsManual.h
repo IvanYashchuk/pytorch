@@ -174,6 +174,7 @@ Tensor linalg_lstsq_jvp(
 );
 Tensor eigh_jvp_eigenvectors(const Tensor& input_tangent, const Tensor& eigenvalues, const Tensor& eigenvectors);
 Tensor eigh_jvp_eigenvalues(const Tensor& input_tangent, const Tensor& eigenvalues, const Tensor& eigenvectors);
+std::tuple<Tensor, Tensor> eigh_jvp(const Tensor& input_tangent, const Tensor& eigenvalues, const Tensor& eigenvectors);
 Tensor eigh_backward(const std::vector<torch::autograd::Variable> &grads, const Tensor& self,
                     bool eigenvectors, const Tensor& L, const Tensor& V);
 std::tuple<Tensor, Tensor> triangular_solve_backward(
