@@ -11,7 +11,7 @@ from .constants import (API_BLAS, API_C10, API_CAFFE2, API_DRIVER, API_FFT,
                         CONV_NUMERIC_LITERAL, CONV_OCCUPANCY, CONV_OTHER,
                         CONV_PEER, CONV_SPECIAL_FUNC, CONV_STREAM,
                         CONV_SURFACE, CONV_TEX, CONV_THREAD, CONV_TYPE,
-                        CONV_VDPAU, CONV_VERSION, HIP_UNSUPPORTED)
+                        CONV_VDPAU, CONV_VERSION, HIP_UNSUPPORTED, API_SOLVER)
 
 """ Mapping of CUDA functions, include files, constants, and types to ROCm/HIP equivalents
 This closely follows the implementation in hipify-clang
@@ -7760,6 +7760,18 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict(
     ]
 )
 
+CUDA_SOLVER_MAP = collections.OrderedDict(
+    [
+        ("cusolverDnHandle_t", ("rocblas_handle", CONV_TYPE, API_SOLVER)),
+        ("cusolverDn.h", ("rocsolver.h", CONV_INCLUDE_CUDA_MAIN_H, API_SOLVER)),
+        ("cusolverDnSpotrfBatched", ("rocsolver_spotrf_batched", CONV_MATH_FUNC, API_SOLVER)),
+        ("cusolverDnDpotrfBatched", ("rocsolver_Dpotrf_batched", CONV_MATH_FUNC, API_SOLVER)),
+        ("cusolverDnCpotrfBatched", ("rocsolver_Cpotrf_batched", CONV_MATH_FUNC, API_SOLVER)),
+        ("cusolverDnZpotrfBatched", ("rocsolver_zpotrf_batched", CONV_MATH_FUNC, API_SOLVER)),
+        ("cusolverStatus_t", ("rocblas_status", CONV_TYPE, API_SOLVER)),
+    ]
+)
+
 CUDA_SPARSE_MAP = collections.OrderedDict(
     [
         ("cusparseStatus_t", ("hipsparseStatus_t", CONV_MATH_FUNC, API_SPARSE)),
@@ -8233,6 +8245,7 @@ CUDA_TO_HIP_MAPPINGS = [
     CUDA_TYPE_NAME_MAP,
     CUDA_INCLUDE_MAP,
     CUDA_SPARSE_MAP,
+    CUDA_SOLVER_MAP,
     C10_MAPPINGS,
     PYTORCH_SPECIFIC_MAPPINGS,
     CAFFE2_SPECIFIC_MAPPINGS,

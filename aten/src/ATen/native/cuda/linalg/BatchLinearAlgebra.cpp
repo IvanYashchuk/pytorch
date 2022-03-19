@@ -1718,25 +1718,26 @@ void cholesky_helper_magma(const Tensor& input, bool upper, const Tensor& info) 
 }
 
 static void cholesky_kernel(const Tensor& input, const Tensor& info, bool upper) {
-#ifdef USE_CUSOLVER
-  auto preferred_backend = at::globalContext().linalgPreferredBackend();
-  switch (preferred_backend) {
-    case at::LinalgBackend::Cusolver:
-      cholesky_helper_cusolver(input, upper, info);
-      break;
-    case at::LinalgBackend::Magma:
-      cholesky_helper_magma(input, upper, info);
-      break;
-    default:
-      if (batchCount(input) == 1 || !use_magma_ || use_cusolver_potrf_batched_) {
-        cholesky_helper_cusolver(input, upper, info);
-      } else {
-        cholesky_helper_magma(input, upper, info);
-      }
-  }
-#else
-  cholesky_helper_magma(input, upper, info);
-#endif // USE_CUSOLVER
+// #ifdef USE_CUSOLVER
+//   auto preferred_backend = at::globalContext().linalgPreferredBackend();
+//   switch (preferred_backend) {
+//     case at::LinalgBackend::Cusolver:
+//       cholesky_helper_cusolver(input, upper, info);
+//       break;
+//     case at::LinalgBackend::Magma:
+//       cholesky_helper_magma(input, upper, info);
+//       break;
+//     default:
+//       if (batchCount(input) == 1 || !use_magma_ || use_cusolver_potrf_batched_) {
+//         cholesky_helper_cusolver(input, upper, info);
+//       } else {
+//         cholesky_helper_magma(input, upper, info);
+//       }
+//   }
+// #else
+//   cholesky_helper_magma(input, upper, info);
+// #endif // USE_CUSOLVER
+  cholesky_helper_cusolver(input, upper, info);
 }
 
 REGISTER_CUDA_DISPATCH(cholesky_stub, &cholesky_kernel)

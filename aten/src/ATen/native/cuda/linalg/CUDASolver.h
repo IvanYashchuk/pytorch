@@ -7,11 +7,11 @@
 #define USE_CUSOLVER_64_BIT
 #endif
 
-#ifdef CUDART_VERSION
-
 namespace at {
 namespace cuda {
 namespace solver {
+
+#ifdef CUDART_VERSION
 
 #define CUDASOLVER_GETRF_ARGTYPES(Dtype)  \
     cusolverDnHandle_t handle, int m, int n, Dtype* dA, int ldda, int* ipiv, int* info
@@ -134,57 +134,6 @@ template<>
 void gesvdjBatched<c10::complex<float>>(CUDASOLVER_GESVDJ_BATCHED_ARGTYPES(c10::complex<float>, float));
 template<>
 void gesvdjBatched<c10::complex<double>>(CUDASOLVER_GESVDJ_BATCHED_ARGTYPES(c10::complex<double>, double));
-
-
-#define CUDASOLVER_POTRF_ARGTYPES(Dtype)  \
-    cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype* A, int lda, Dtype* work, int lwork, int* info
-
-template<class Dtype>
-void potrf(CUDASOLVER_POTRF_ARGTYPES(Dtype)) {
-  TORCH_INTERNAL_ASSERT(false, "at::cuda::solver::potrf: not implemented for ", typeid(Dtype).name());
-}
-template<>
-void potrf<float>(CUDASOLVER_POTRF_ARGTYPES(float));
-template<>
-void potrf<double>(CUDASOLVER_POTRF_ARGTYPES(double));
-template<>
-void potrf<c10::complex<float>>(CUDASOLVER_POTRF_ARGTYPES(c10::complex<float>));
-template<>
-void potrf<c10::complex<double>>(CUDASOLVER_POTRF_ARGTYPES(c10::complex<double>));
-
-
-#define CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(Dtype)  \
-    cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype* A, int lda, int* lwork
-
-template<class Dtype>
-void potrf_buffersize(CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(Dtype)) {
-  TORCH_INTERNAL_ASSERT(false, "at::cuda::solver::potrf_buffersize: not implemented for ", typeid(Dtype).name());
-}
-template<>
-void potrf_buffersize<float>(CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(float));
-template<>
-void potrf_buffersize<double>(CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(double));
-template<>
-void potrf_buffersize<c10::complex<float>>(CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(c10::complex<float>));
-template<>
-void potrf_buffersize<c10::complex<double>>(CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(c10::complex<double>));
-
-
-#define CUDASOLVER_POTRF_BATCHED_ARGTYPES(Dtype)  \
-    cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype** A, int lda, int* info, int batchSize
-
-template<class Dtype>
-void potrfBatched(CUDASOLVER_POTRF_BATCHED_ARGTYPES(Dtype)) {
-  TORCH_INTERNAL_ASSERT(false, "at::cuda::solver::potrfBatched: not implemented for ", typeid(Dtype).name());
-}
-template<>
-void potrfBatched<float>(CUDASOLVER_POTRF_BATCHED_ARGTYPES(float));
-template<>
-void potrfBatched<double>(CUDASOLVER_POTRF_BATCHED_ARGTYPES(double));
-template<>
-void potrfBatched<c10::complex<float>>(CUDASOLVER_POTRF_BATCHED_ARGTYPES(c10::complex<float>));
-template<>
-void potrfBatched<c10::complex<double>>(CUDASOLVER_POTRF_BATCHED_ARGTYPES(c10::complex<double>));
 
 #define CUDASOLVER_GEQRF_BUFFERSIZE_ARGTYPES(scalar_t) \
   cusolverDnHandle_t handle, int m, int n, scalar_t *A, int lda, int *lwork
@@ -631,8 +580,45 @@ void xsyevd<c10::complex<double>, double>(
 
 #endif // USE_CUSOLVER_64_BIT
 
+#endif // CUDART_VERSION
+
+#define CUDASOLVER_FLOAT_AND_COMPLEX_TYPES(FN, ARG_TYPES_MACRO)       \
+  template <typename scalar_t>                                        \
+  inline void FN(ARG_TYPES_MACRO(scalar_t)) {                         \
+    TORCH_INTERNAL_ASSERT(                                            \
+        false,                                                        \
+        "at::cuda::solver::FN: not implemented for ",                 \
+        typeid(scalar_t).name());                                     \
+  }                                                                   \
+  template <>                                                         \
+  void FN<float>(ARG_TYPES_MACRO(float));                             \
+  template <>                                                         \
+  void FN<double>(ARG_TYPES_MACRO(double));                           \
+  template <>                                                         \
+  void FN<c10::complex<float>>(ARG_TYPES_MACRO(c10::complex<float>)); \
+  template <>                                                         \
+  void FN<c10::complex<double>>(ARG_TYPES_MACRO(c10::complex<double>));
+
+#define CUDASOLVER_POTRF_ARGTYPES(Dtype)                                      \
+  cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype *A, int lda, \
+      Dtype *work, int lwork, int *info
+
+#define CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES(Dtype)                           \
+  cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype *A, int lda, \
+      int *lwork
+
+#define CUDASOLVER_POTRF_BATCHED_ARGTYPES(Dtype)                               \
+  cusolverDnHandle_t handle, cublasFillMode_t uplo, int n, Dtype **A, int lda, \
+      int *info, int batchSize
+
+CUDASOLVER_FLOAT_AND_COMPLEX_TYPES(potrf, CUDASOLVER_POTRF_ARGTYPES);
+CUDASOLVER_FLOAT_AND_COMPLEX_TYPES(
+    potrf_buffersize,
+    CUDASOLVER_POTRF_BUFFERSIZE_ARGTYPES);
+CUDASOLVER_FLOAT_AND_COMPLEX_TYPES(
+    potrfBatched,
+    CUDASOLVER_POTRF_BATCHED_ARGTYPES);
+
 } // namespace solver
 } // namespace cuda
 } // namespace at
-
-#endif // CUDART_VERSION

@@ -6,9 +6,9 @@
 #include <cusparse.h>
 #include <cublas_v2.h>
 
-#ifdef CUDART_VERSION
+// #ifdef CUDART_VERSION
 #include <cusolverDn.h>
-#endif
+// #endif
 
 #include <ATen/core/ATenGeneral.h>
 #include <ATen/Context.h>

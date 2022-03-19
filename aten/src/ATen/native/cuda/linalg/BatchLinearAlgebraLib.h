@@ -41,6 +41,9 @@ void triangular_solve_batched_cublas(const Tensor& A, const Tensor& B, bool left
 void gels_batched_cublas(const Tensor& a, Tensor& b, Tensor& infos);
 void lu_solve_batched_cublas(const Tensor& b, const Tensor& lu, const Tensor& pivots, TransposeType transpose);
 
+// entrance of calculations of `cholesky` using cusolver potrf and potrfBatched
+void cholesky_helper_cusolver(const Tensor& input, bool upper, const Tensor& info);
+
 #ifdef USE_CUSOLVER
 
 // entrance of calculations of `inverse` using cusolver getrf + getrs, cublas getrfBatched + getriBatched
@@ -50,8 +53,6 @@ Tensor& _linalg_inv_out_helper_cuda_lib(Tensor& result, Tensor& infos_getrf, Ten
 // entrance of calculations of `svd` using cusolver gesvdj and gesvdjBatched
 void svd_cusolver(const Tensor& A, const bool full_matrices, const bool compute_uv, const Tensor& U, const Tensor& S, const Tensor& V, const Tensor& info);
 
-// entrance of calculations of `cholesky` using cusolver potrf and potrfBatched
-void cholesky_helper_cusolver(const Tensor& input, bool upper, const Tensor& info);
 Tensor _cholesky_solve_helper_cuda_cusolver(const Tensor& self, const Tensor& A, bool upper);
 Tensor& cholesky_inverse_kernel_impl_cusolver(Tensor &result, Tensor& infos, bool upper);
 
