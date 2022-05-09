@@ -1416,12 +1416,14 @@ void ldl_factor_magma(
     bool upper,
     bool hermitian) {
   if (LD.is_complex()) {
+    auto suggest_backend_str =
+        at::globalContext().linalgPreferredBackend() == at::LinalgBackend::Magma
+        ? " Currently preferred backend is 'magma', please set 'default' or 'cusolver' backend with torch.backends.cuda.preferred_linalg_library"
+        : "";
     TORCH_CHECK(
         hermitian,
-        "torch.linalg.ldl_factor: complex tensors with hermitian=False flag are not supported with MAGMA backend. ",
-        "Currently preferred backend is ",
-        at::globalContext().linalgPreferredBackend(),
-        ", please set 'default' or 'cusolver' backend with torch.backends.cuda.preferred_linalg_library");
+        "torch.linalg.ldl_factor: complex tensors with hermitian=False flag are not supported with MAGMA backend.",
+        suggest_backend_str);
   }
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
       LD.scalar_type(), "ldl_factor_magma", [&] {

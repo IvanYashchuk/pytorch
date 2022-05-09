@@ -276,12 +276,14 @@ void ldl_factor_cusolver(
     bool upper,
     bool hermitian) {
   if (LD.is_complex()) {
+    auto suggest_backend_str =
+        at::globalContext().linalgPreferredBackend() == at::LinalgBackend::Cusolver
+        ? " Currently preferred backend is 'cusolver', please set 'default' or 'magma' backend with torch.backends.cuda.preferred_linalg_library"
+        : "";
     TORCH_CHECK(
         !hermitian,
-        "torch.linalg.ldl_factor: complex tensors with hermitian=True flag are not supported with cuSOLVER backend. ",
-        "Currently preferred backend is ",
-        at::globalContext().linalgPreferredBackend(),
-        ", please set 'default' or 'magma' backend with torch.backends.cuda.preferred_linalg_library");
+        "torch.linalg.ldl_factor: complex tensors with hermitian=True flag are not supported with cuSOLVER backend.",
+        suggest_backend_str);
   }
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
       LD.scalar_type(), "ldl_factor_looped_cusolver", [&] {
