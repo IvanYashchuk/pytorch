@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import inspect
 import functools
 from typing import Any, Dict, Optional, Tuple, Callable, Union
 import torch
@@ -214,12 +215,28 @@ class ProxyTorchDispatchMode(TorchDispatchMode):
             return wrap_output(real_out, proxy_out)
 
 
+def _get_default_args(func):
+    defaults = {}
+    sig = inspect.signature(func)
+    for name, param in sig.parameters.items():
+        if (param.kind == param.POSITIONAL_OR_KEYWORD and param.default is not param.empty):
+            defaults[name] = param.default
+    return defaults
+
+
 def make_fx(f, decomposition_table=None, trace_factory_functions=False):
     if decomposition_table is None:
         decomposition_table = {}
 
+    defaults = _get_default_args(f)
+
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
+        # Add default values to kwargs if they are not provided
+        for name, default in defaults.items():
+            if name not in kwargs:
+                kwargs[name] = default
+
         phs = pytree.tree_map(lambda x: fx.PH, (args, kwargs))  # type: ignore[attr-defined]
         phs_flat, _ = pytree.tree_flatten(phs)
         with decompose(decomposition_table):
