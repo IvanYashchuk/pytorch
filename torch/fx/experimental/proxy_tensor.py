@@ -173,8 +173,8 @@ def wrap_key(f, inps):
     flat_inps, _ = pytree.tree_flatten(inps)
 
     @functools.wraps(f)
-    def wrapped(*args):
-        flat_args, args_spec = pytree.tree_flatten(args)
+    def wrapped(*args, **kwargs):
+        flat_args, args_spec = pytree.tree_flatten((args, kwargs))
         assert (len(flat_args) == len(flat_inps))
         for idx, arg in enumerate(flat_args):
             if isinstance(flat_inps[idx], torch.Tensor):
@@ -186,7 +186,7 @@ def wrap_key(f, inps):
                 flat_args[idx] = flat_inps[idx]
 
         tree_args = pytree.tree_unflatten(flat_args, args_spec)
-        out = f(*tree_args)
+        out = f(*tree_args[0], **tree_args[1])
         flat_outs, out_spec = pytree.tree_flatten(out)
         for idx in range(len(flat_outs)):
             if isinstance(flat_outs[idx], torch.Tensor) and isinstance(flat_outs[idx], ProxyTensor):
@@ -219,10 +219,11 @@ def make_fx(f, decomposition_table=None, trace_factory_functions=False):
         decomposition_table = {}
 
     @functools.wraps(f)
-    def wrapped(*args):
-        phs = pytree.tree_map(lambda x: fx.PH, args)  # type: ignore[attr-defined]
+    def wrapped(*args, **kwargs):
+        phs = pytree.tree_map(lambda x: fx.PH, (args, kwargs))  # type: ignore[attr-defined]
+        phs_flat, _ = pytree.tree_flatten(phs)
         with decompose(decomposition_table):
-            t = dispatch_trace(wrap_key(f, args), concrete_args=tuple(phs),
+            t = dispatch_trace(wrap_key(f, (args, kwargs)), concrete_args=tuple(phs_flat),
                                trace_factory_functions=trace_factory_functions)
         return t
 

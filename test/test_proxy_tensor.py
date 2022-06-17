@@ -68,6 +68,22 @@ class TestProxyTensor(TestCase):
         new_inp = torch.randn(3)
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
+    def test_make_fx_kwargs(self, device):
+        def f(x, y=1.0):
+            return torch.sin(x) + y
+
+        x = torch.randn(3, device=device)
+        y = torch.randn(3, device=device)
+        fx_f = make_fx(f)(x, y=y)
+
+        new_x = torch.randn(3, device=device)
+        self.assertEqual(fx_f(new_x), f(new_x))
+
+        fx_f = make_fx(f)(x=x, y=y)
+
+        new_x = torch.randn(3, device=device)
+        self.assertEqual(fx_f(new_x), f(new_x))
+
     def test_scalar_device(self, device):
         def f(a, b):
             return a + b
