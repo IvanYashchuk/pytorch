@@ -23368,14 +23368,14 @@ TEST_F(NVFuserTest, FusionDivScalarLhs_CUDA) {
   auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
   auto t0 = at::randn({3, 3}, options);
   // There's no overload div(Scalar, Tensor) in ATen
-  auto aten_output = at::div(at::native::wrapped_scalar_tensor(at::Scalar(2.0), options.device()), t0);
+  auto aten_output = at::div(
+      at::native::wrapped_scalar_tensor(at::Scalar(2.0), options.device()), t0);
 
   FusionExecutor fe;
   fe.compileFusion(&fusion, {t0});
   auto cg_outputs = fe.runFusion({t0});
 
-  testValidate(
-      &fusion, cg_outputs, {t0}, {aten_output}, __LINE__, __FILE__);
+  testValidate(&fusion, cg_outputs, {t0}, {aten_output}, __LINE__, __FILE__);
 }
 
 // Repro of an issue of the reduction scheduler with a broadcast
