@@ -21438,7 +21438,7 @@ TEST_F(NVFuserTest, FusionCodegenAllocatedScalars_CUDA) {
 }
 
 TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
-  if (isDisabled(DisableOption::IndexHoist)) {
+  if (isOptionDisabled(DisableOption::IndexHoist)) {
     GTEST_SKIP() << "Index hoisting disabled";
   }
 
@@ -21618,7 +21618,7 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
 
 // Hoist indices for vectorized tensors
 TEST_F(NVFuserTest, FusionIndexHoist2_CUDA) {
-  if (isDisabled(DisableOption::IndexHoist)) {
+  if (isOptionDisabled(DisableOption::IndexHoist)) {
     GTEST_SKIP() << "Index hoisting disabled";
   }
 
@@ -24890,6 +24890,97 @@ TEST_F(NVFuserTest, FusionInsertMagicZero1_CUDA) {
       PredicateMagicZeroChecker::isProtected(tv2, gpulw),
       "Failed to protect the predicates of ",
       tv2->toString());
+}
+
+TEST_F(NVFuserTest, FusionRepro1860_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+  std::vector<bool> contiguity{true, false, false};
+
+  std::vector<int64_t> shape{1, -1, -1};
+  TensorView* tv0 = makeContigConcreteTensor(shape);
+  fusion.addInput(tv0);
+  TensorView* tv1 = makeContigConcreteTensor(shape);
+  fusion.addInput(tv1);
+  TensorView* tv2 = makeContigConcreteTensor(shape);
+  fusion.addInput(tv2);
+
+  std::vector<IterDomain*> domain1(3, nullptr);
+  for (const auto i : c10::irange(3)) {
+    if (i == 0) {
+      domain1[i] =
+          IterDomainBuilder(
+              FusionGuard::getCurFusion()->zeroVal(), IrBuilder::create<Int>(1))
+              .iter_type(IterType::Broadcast)
+              .build();
+    } else {
+      domain1[i] =
+          IterDomainBuilder(
+              FusionGuard::getCurFusion()->zeroVal(), IrBuilder::create<Int>(1))
+              .expanded_extent(IrBuilder::create<Int>(1 + i))
+              .iter_type(IterType::Broadcast)
+              .build();
+    }
+  }
+
+  TensorView* tv22 = IrBuilder::create<TensorView>(
+      IrBuilder::create<TensorDomain>(domain1, contiguity), DataType::Float);
+
+  tv22[1, b{2}, b{3}]
+
+      fusion.addInput(tv22);
+
+  auto tv3 = add(tv0, tv1);
+  auto tv4 = softmax(tv3, {0});
+  auto tv5 = add(tv4, tv22);
+  fusion.addOutput(tv5);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  at::Tensor input1 = at::randn({1, 2, 3}, options);
+  at::Tensor input2 = at::randn({1, 2, 3}, options);
+  at::Tensor input3 = at::randn({1, 2, 3}, options);
+  at::Tensor input4 = at::randn({1, 1, 1}, options).expand({1, 2, 3});
+  std::vector<IValue> aten_inputs = {input1, input2, input3, input4};
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs(aten_inputs);
+}
+
+TEST_F(NVFuserTest, FusionExpandReduce_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  auto tv0 = makeConcreteTensor({1, 8});
+  fusion->addInput(tv0);
+
+   tv1 = exp
+      nd(
+
+    uilder::create<Int>(12),
+    ilder::create<Int>(8)
+});
+
+auto tv2 = sum(tv1, {0});
+fusion->addOutput(tv2);
+
+auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+at::manual_seed(0);
+auto t0 = at::randn({1, 8}, options);
+
+FusionExecutorCache executor_cache(std::move(fusion));
+auto cg_outputs = executor_cache.runFusionWithInputs({t0});
+
+auto ref = t0.expand({12, 8}).sum({0});
+
+testValidate(
+    executor_cache.fusion(),
+    cg_outputs,
+    {t0},
+    {ref},
+    __LINE__,
+    __FILE__);
 }
 
 } // namespace jit

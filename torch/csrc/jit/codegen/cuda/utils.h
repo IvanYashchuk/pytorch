@@ -68,7 +68,7 @@ enum class DisableOption {
   UnrollWithRng //! Disable unrolling for kernels with RNG in them
 };
 
-TORCH_CUDA_CU_API bool isDisabled(DisableOption option);
+TORCH_CUDA_CU_API bool isOptionDisabled(DisableOption option);
 
 //! Types of features to enable
 //!
@@ -79,7 +79,7 @@ enum class EnableOption {
   KernelProfile //! Enable intra-kernel performance profiling
 };
 
-TORCH_CUDA_CU_API bool isEnabled(EnableOption option);
+TORCH_CUDA_CU_API bool isOptionEnabled(EnableOption option);
 
 // Check if fallback path should be used which will dispatch to eagermode if any
 // errors are encountered. Helpful for debugging.

@@ -1006,6 +1006,71 @@ TEST_F(NVFuserTest, FusionExpandRepro_CUDA) {
   testValidate(&fusion, outputs, aten_inputs, {out}, __LINE__, __FILE__);
 }
 
+TEST_F(NVFuserTest, FusionExpandView1_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  auto tv0 = makeConcreteTensor({4, 1, 8});
+  fusion->addInput(tv0);
+
+  auto tv1 = makeConcreteTensor({12, 8});
+  fusion->addInput(tv1);
+
+  auto tv2 = expand(
+      tv0,
+      {IrBuilder::create<Int>(4),
+       IrBuilder::create<Int>(3),
+       IrBuilder::create<Int>(8)});
+
+  auto tv3 = view(tv2, {4, 3, 8}, {12, 8});
+  auto tv4 = add(tv3, tv1);
+  fusion->addOutput(tv4);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::manual_seed(0);
+  auto t0 = at::randn({4, 1, 8}, options);
+  auto t1 = at::randn({12, 8}, options);
+
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1});
+
+  auto ref = at::native::reshape(t0.expand({4, 3, 8}), {12, 8}) + t1;
+
+  testValidate(
+      executor_cache.fusion(), cg_outputs, {t0, t1}, {ref}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionExpandView2_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  auto tv0 = makeConcreteTensor({1, 8});
+  fusion->addInput(tv0);
+
+  auto tv1 = makeConcreteTensor({3, 4, 8});
+  fusion->addInput(tv1);
+
+  auto tv2 =
+      expand(tv0, {IrBuilder::create<Int>(12), IrBuilder::create<Int>(8)});
+
+  auto tv3 = view(tv2, {12, 8}, {3, 4, 8});
+  auto tv4 = add(tv3, tv1);
+  fusion->addOutput(tv4);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::manual_seed(0);
+  auto t0 = at::randn({1, 8}, options);
+  auto t1 = at::randn({3, 4, 8}, options);
+
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1});
+
+  auto ref = at::native::reshape(t0.expand({12, 8}), {3, 4, 8}) + t1;
+
+  testValidate(
+      executor_cache.fusion(), cg_outputs, {t0, t1}, {ref}, __LINE__, __FILE__);
+}
+
 } // namespace jit
 } // namespace torch
 #endif // #if defined(USE_CUDA)

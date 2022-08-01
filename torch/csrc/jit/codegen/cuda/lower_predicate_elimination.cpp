@@ -837,7 +837,7 @@ bool PredicateElimination::setReductionInitValue(
 bool PredicateElimination::canOmitPredicate(const Expr* expr) const {
   // Predicate elimination can be disabled with
   // PYTORCH_NVFUSER_DISABLE=predicate_elimination
-  if (isDisabled(DisableOption::PredicateElimination)) {
+  if (isOptionDisabled(DisableOption::PredicateElimination)) {
     assertOnWarpOps(expr);
     return false;
   }

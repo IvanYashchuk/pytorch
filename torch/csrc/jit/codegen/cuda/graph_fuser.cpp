@@ -1459,18 +1459,15 @@ Value* guardView(
   auto view_sizes_constant_list =
       constant_as<c10::List<int64_t>>(view->inputs().back());
   TORCH_INTERNAL_ASSERT(view_sizes_constant_list.has_value());
-
+  std::vector<int64_t> view_sizes = view_sizes_constant_list->vec();
   // 2. Get constraints for self tensor and view_sizes
-  auto constraints = analyzeViewConstraint(
-      self_sizes_constant_list, view_sizes_constant_list->vec());
+  auto constraints =
+      analyzeViewConstraint(self_sizes_constant_list, view_sizes);
 
   // 3. Add constraints as constant to graph
-  auto self_tensor_constraint = fusion->owningGraph()->insertConstant(
-      IValue(constraints.original_constraint));
-  self_tensor_constraint->node()->moveBefore(versioning_if);
-  auto view_sizes_constraint =
-      fusion->owningGraph()->insertConstant(IValue(constraints.new_constraint));
-  view_sizes_constraint->node()->moveBefore(versioning_if);
+  auto full_constraints = fusion->owningGraph()->insertConstant(
+      IValue(constraints.conglomerateString()));
+  full_constraints->node()->moveBefore(versioning_if);
 
   // 4. Create CudaFusionViewGuard using input tensor, profile_ivalue
   // for view_sizes list, and constraints
@@ -1485,8 +1482,7 @@ Value* guardView(
               c10::Symbol::fromQualString("prim::CudaFusionViewGuard"),
               {fusion_value_to_runtime_size.at(self_value),
                view_sizes_runtime,
-               self_tensor_constraint,
-               view_sizes_constraint},
+               full_constraints},
               1)
           ->insertBefore(versioning_if);
   return viewcheck_node->output();

@@ -294,7 +294,8 @@ c10::optional<PointwiseParams> getPointwiseHeuristics(
   }
 
   // If we use RNG don't unroll so we can do correctness testing
-  if (fusion->isStochastic() && isDisabled(DisableOption::UnrollWithRng)) {
+  if (fusion->isStochastic() &&
+      isOptionDisabled(DisableOption::UnrollWithRng)) {
     max_unroll_factor = 1;
   }
 

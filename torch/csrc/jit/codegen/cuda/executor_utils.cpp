@@ -778,7 +778,20 @@ kir::ExpressionEvaluator bindKernelInputs(
 
       for (const auto dim : c10::irange(root_domain.size())) {
         const auto extent = root_domain[dim]->extent();
-        const auto value = aten_tensor.sizes()[dim];
+        if (root_domain[dim]->hasExpandedExtent()) {
+          TORCH_INTERNAL_ASSERT(
+              aten_tensor.strides()[dim] == 0,
+              "Execting an expanded dimension on ",
+              inputs[i]->toString(),
+              " dimension ",
+              dim,
+              " but found stride ",
+              aten_tensor.strides()[dim]);
+        }
+
+        const auto value = root_domain[dim]->hasExpandedExtent()
+            ? 1
+            : aten_tensor.sizes()[dim];
         if (value == 0 && tensor_input->uses().empty()) {
           // If there's no uses, ignore there's a size-0 dimension.
           continue;
@@ -794,7 +807,7 @@ kir::ExpressionEvaluator bindKernelInputs(
                 extent->toString(),
                 " to ",
                 value,
-                "but it's already set to ",
+                " but it's already set to ",
                 *prev_value);
             should_bind = false;
           }
@@ -839,14 +852,27 @@ ExpressionEvaluator bindFusionInputs(
           "Something went wrong configuring launch. Inputs do not match.");
 
       auto aten_tensor = aten_inputs[i].toTensor();
-      auto root_dom =
+      auto root_domain =
           TensorDomain::noReductions(cg_tensor->getMaybeRFactorDomain());
       TORCH_INTERNAL_ASSERT(
-          aten_tensor.ndimension() == (int64_t)root_dom.size(),
+          aten_tensor.ndimension() == (int64_t)root_domain.size(),
           "Something went wrong configuring launch. Inputs do not match.");
-      for (const auto dim : c10::irange(root_dom.size())) {
-        const auto extent = root_dom[dim]->extent();
-        const auto value = aten_tensor.sizes()[dim];
+      for (const auto dim : c10::irange(root_domain.size())) {
+        const auto extent = root_domain[dim]->extent();
+        if (root_domain[dim]->hasExpandedExtent()) {
+          TORCH_INTERNAL_ASSERT(
+              aten_tensor.strides()[dim] == 0,
+              "Execting an expanded dimension on ",
+              inputs[i]->toString(),
+              " dimension ",
+              dim,
+              " but found stride ",
+              aten_tensor.strides()[dim]);
+        }
+
+        const auto value = root_domain[dim]->hasExpandedExtent()
+            ? 1
+            : aten_tensor.sizes()[dim];
         if (value == 0 && cg_tensor->uses().empty()) {
           // If there's no uses, ignore there's a size-0 dimension.
           continue;
@@ -860,7 +886,7 @@ ExpressionEvaluator bindFusionInputs(
               extent,
               " to ",
               value,
-              "but it's already set to ",
+              " but it's already set to ",
               *prev_value);
         } else {
           evaluator.bind(extent, value);
@@ -897,7 +923,7 @@ std::pair<NvrtcFunction, std::string> nvrtcCompile(
     int id,
     c10::optional<int> opt_block_size) {
   FUSER_PERF_SCOPE("executor_utils::NVRTC");
-  if (isDisabled(DisableOption::ArchCheck)) {
+  if (isOptionDisabled(DisableOption::ArchCheck)) {
     TORCH_WARN(
         "NVFuser Compile: arch check disabled, should not compile any kernel");
   }
@@ -954,7 +980,7 @@ std::pair<NvrtcFunction, std::string> nvrtcCompile(
       "--std=c++14", compute.c_str(), "-default-device"};
 #endif
 
-  const bool disable_fma = isDisabled(DisableOption::Fma);
+  const bool disable_fma = isOptionDisabled(DisableOption::Fma);
 #ifdef __HIP_PLATFORM_HCC__
   if (disable_fma) {
     TORCH_WARN_ONCE(
@@ -978,7 +1004,7 @@ std::pair<NvrtcFunction, std::string> nvrtcCompile(
   args.push_back("-DNDEBUG");
 #endif
 
-  if (isEnabled(EnableOption::KernelProfile)) {
+  if (isOptionEnabled(EnableOption::KernelProfile)) {
     args.push_back("-DPYTORCH_NVFUSER_PROFILE_KERNEL");
   }
 
@@ -1243,7 +1269,7 @@ std::pair<NvrtcFunction, std::string> nvrtcCompile(
       lowered_kernel_name));
 
   TORCH_CHECK(
-      !isDisabled(DisableOption::ArchCheck),
+      !isOptionDisabled(DisableOption::ArchCheck),
       "NVFuser Compile: arch check disabled, should not return any compiled kernel");
 
   return {compiled_kernel_, ptxas_log.str()};
