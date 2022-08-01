@@ -24955,32 +24955,25 @@ TEST_F(NVFuserTest, FusionExpandReduce_CUDA) {
   auto tv0 = makeConcreteTensor({1, 8});
   fusion->addInput(tv0);
 
-   tv1 = exp
-      nd(
+  auto tv1 = expand(
+      tv0,
+      {IrBuilder::create<Int>(12),
+       IrBuilder::create<Int>(8)});
 
-    uilder::create<Int>(12),
-    ilder::create<Int>(8)
-});
+  auto tv2 = sum(tv1, {0});
+  fusion->addOutput(tv2);
 
-auto tv2 = sum(tv1, {0});
-fusion->addOutput(tv2);
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::manual_seed(0);
+  auto t0 = at::randn({1, 8}, options);
 
-auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
-at::manual_seed(0);
-auto t0 = at::randn({1, 8}, options);
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0});
 
-FusionExecutorCache executor_cache(std::move(fusion));
-auto cg_outputs = executor_cache.runFusionWithInputs({t0});
+  auto ref = t0.expand({12, 8}).sum({0});
 
-auto ref = t0.expand({12, 8}).sum({0});
-
-testValidate(
-    executor_cache.fusion(),
-    cg_outputs,
-    {t0},
-    {ref},
-    __LINE__,
-    __FILE__);
+  testValidate(
+      executor_cache.fusion(), cg_outputs, {t0}, {ref}, __LINE__, __FILE__);
 }
 
 } // namespace jit
