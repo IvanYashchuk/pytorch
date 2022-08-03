@@ -25048,9 +25048,7 @@ TEST_F(NVFuserTest, FusionRepro1860_CUDA) {
   TensorView* tv22 = IrBuilder::create<TensorView>(
       IrBuilder::create<TensorDomain>(domain1, contiguity), DataType::Float);
 
-  tv22[1, b{2}, b{3}]
-
-      fusion.addInput(tv22);
+  fusion.addInput(tv22);
 
   auto tv3 = add(tv0, tv1);
   auto tv4 = softmax(tv3, {0});
@@ -25076,10 +25074,8 @@ TEST_F(NVFuserTest, FusionExpandReduce_CUDA) {
   auto tv0 = makeConcreteTensor({1, 8});
   fusion->addInput(tv0);
 
-  auto tv1 = expand(
-      tv0,
-      {IrBuilder::create<Int>(12),
-       IrBuilder::create<Int>(8)});
+  auto tv1 =
+      expand(tv0, {IrBuilder::create<Int>(12), IrBuilder::create<Int>(8)});
 
   auto tv2 = sum(tv1, {0});
   fusion->addOutput(tv2);

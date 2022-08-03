@@ -62,7 +62,7 @@ namespace cuda {
 //!
 //! View process at compute time:
 //!   1) View takes in the input TensorView x, original runtime
-//!      std::vector<size_t>, and viewed runtime std::vector<size_t>.
+//!      std::vector<int64_t>, and viewed runtime std::vector<int64_t>.
 //!   2) AnalyzeView is called Which will figure out what series of
 //!      transformations is required from the input tensor to the output tensor.
 //!      These transformations are recorded.
@@ -88,7 +88,7 @@ class Transform : public PolymorphicBase {
  public:
   virtual std::string toString() const = 0;
 
-  size_t index() const {
+  int64_t index() const {
     return index_;
   }
 
@@ -96,9 +96,9 @@ class Transform : public PolymorphicBase {
   // Relevant location information for the transformation. Stored information is
   // related to when we have to apply that transformation (see long comment at
   // top of this file).
-  Transform(size_t index) : index_(index) {}
+  Transform(int64_t index) : index_(index) {}
 
-  const size_t index_ = 0;
+  const int64_t index_ = 0;
 };
 
 class ViewTransform : public Transform {
@@ -148,7 +148,7 @@ class ViewTransform : public Transform {
   virtual std::string toString() const = 0;
 
  protected:
-  ViewTransform(const size_t& index) : Transform(index) {}
+  ViewTransform(const int64_t& index) : Transform(index) {}
 };
 
 namespace {
@@ -158,7 +158,7 @@ namespace {
 //! positions for View.
 class MergeTransform final : public ViewTransform {
  public:
-  MergeTransform(size_t index) : ViewTransform(index) {}
+  MergeTransform(int64_t index) : ViewTransform(index) {}
 
   virtual std::string toString() const override {
     std::stringstream ss;
@@ -213,7 +213,7 @@ class MergeTransform final : public ViewTransform {
 //! The split tranformation creates two new iterDomains via an outer split.
 class SplitTransform final : public ViewTransform {
  public:
-  SplitTransform(const size_t index, size_t split_factor)
+  SplitTransform(const int64_t index, int64_t split_factor)
       : ViewTransform(index), split_factor_(split_factor) {
     TORCH_INTERNAL_ASSERT(
         split_factor > 0,
@@ -277,12 +277,12 @@ class SplitTransform final : public ViewTransform {
         current_transformed_domain.begin() + index_, factor_id);
   }
 
-  size_t split_factor() const {
+  int64_t split_factor() const {
     return split_factor_;
   }
 
  private:
-  const size_t split_factor_ = 0;
+  const int64_t split_factor_ = 0;
 };
 
 //! For any singleton dimensions in the new view, we create an implicit
@@ -290,7 +290,7 @@ class SplitTransform final : public ViewTransform {
 //! and view transformation steps.
 class BroadcastTransform final : public Transform {
  public:
-  BroadcastTransform(size_t index) : Transform(index) {}
+  BroadcastTransform(int64_t index) : Transform(index) {}
 
   virtual std::string toString() const override {
     std::stringstream ss;
@@ -303,7 +303,7 @@ class BroadcastTransform final : public Transform {
 //! them using a trivial reduction.
 class TrivialReductionTransform final : public Transform {
  public:
-  TrivialReductionTransform(size_t index) : Transform(index) {}
+  TrivialReductionTransform(int64_t index) : Transform(index) {}
 
   virtual std::string toString() const override {
     std::stringstream ss;
@@ -317,8 +317,8 @@ class TrivialReductionTransform final : public Transform {
 class AnalyzeViewTransformation {
  public:
   AnalyzeViewTransformation(
-      const std::vector<size_t>& original_view,
-      const std::vector<size_t>& new_view,
+      const std::vector<int64_t>& original_view,
+      const std::vector<int64_t>& new_view,
       std::vector<IterDomain*> root_domain = {})
       : root_domain_not_provided_(root_domain.empty()),
         root_domain_(root_domain),
@@ -328,11 +328,11 @@ class AnalyzeViewTransformation {
     TORCH_INTERNAL_ASSERT(
         root_domain.empty() || original_view.size() == root_domain.size(),
         "Incoming domain must match the original view sizes for view.");
-    // Check that the product of original and new view std::vector<size_t> are
+    // Check that the product of original and new view std::vector<int64_t> are
     // equal.
-    const size_t kOriginalNumElements = std::accumulate(
+    const int64_t kOriginalNumElements = std::accumulate(
         original_view_.begin(), original_view_.end(), 1, std::multiplies<>());
-    const size_t kNewNumElements = std::accumulate(
+    const int64_t kNewNumElements = std::accumulate(
         new_view_.begin(), new_view.end(), 1, std::multiplies<>());
     TORCH_INTERNAL_ASSERT(
         kOriginalNumElements == kNewNumElements,
@@ -367,22 +367,19 @@ class AnalyzeViewTransformation {
       constraint.broadcast_string.push_back(broadcast->index());
     }
 
-    // Dilimeter for split/merge transforms is
-    // std::numeric_limits<int64_t>::max() - 1;
+    // Dilimeter for split/merge transforms is -2
     for (auto split_merge : view_transforms_) {
       if (split_merge->isA<SplitTransform>()) {
         constraint.split_merge_string.push_back(split_merge->index());
         constraint.split_merge_string.push_back(
             split_merge->as<SplitTransform>()->split_factor());
-        constraint.split_merge_string.push_back(
-            std::numeric_limits<int64_t>::max() - 1);
+        constraint.split_merge_string.push_back(-2);
       } else {
         TORCH_INTERNAL_ASSERT(
             split_merge->isA<MergeTransform>(),
             "Unrecognized transformation found.");
         constraint.split_merge_string.push_back(split_merge->index());
-        constraint.split_merge_string.push_back(
-            std::numeric_limits<int64_t>::max() - 1);
+        constraint.split_merge_string.push_back(-2);
       }
     }
 
@@ -457,7 +454,7 @@ class AnalyzeViewTransformation {
 
   // Validation check after transformations are all found
 
-  bool isImplicitBroadcast(size_t original_view_index) const {
+  bool isImplicitBroadcast(int64_t original_view_index) const {
     if (root_domain_not_provided_) {
       return original_view_[original_view_index] == 1;
     } else {
@@ -481,14 +478,14 @@ class AnalyzeViewTransformation {
     //   3) The new_view_index which is directly associated with the new_view
     //      and the dimension in new_view we're currently trying to create.
 
-    size_t original_view_index = 0;
-    size_t transform_view_index = 0;
-    size_t new_view_index = 0;
-    size_t current_size = original_view_[0];
+    int64_t original_view_index = 0;
+    int64_t transform_view_index = 0;
+    int64_t new_view_index = 0;
+    int64_t current_size = original_view_[0];
 
     // Safety counters to make sure we don't end up in an infinite loop.
-    size_t prev_original_view_index = std::numeric_limits<size_t>::max();
-    size_t prev_new_view_index = std::numeric_limits<size_t>::max();
+    int64_t prev_original_view_index = std::numeric_limits<int64_t>::max();
+    int64_t prev_new_view_index = std::numeric_limits<int64_t>::max();
 
     TORCH_INTERNAL_ASSERT(
         view_transforms_.empty(),
@@ -640,8 +637,8 @@ class AnalyzeViewTransformation {
   const std::vector<IterDomain*> root_domain_;
   // Track if the root ID was transformed or kept ()
   std::vector<bool> root_is_transformed_;
-  const std::vector<size_t>& original_view_;
-  const std::vector<size_t>& new_view_;
+  const std::vector<int64_t>& original_view_;
+  const std::vector<int64_t>& new_view_;
 };
 
 //! Create new TensorDomain with a new root domain and modified rfactor domains
@@ -687,9 +684,9 @@ TensorDomain* createViewDomain(
       std::vector<bool>(new_rfactor_domain.size(), true));
 }
 
-//! Infer -1 value in new view std::vector<size_t> based on original view
-//! std::vector<size_t>
-std::pair<std::vector<size_t>, std::vector<size_t>> inferNewViewShape(
+} // namespace
+
+std::pair<std::vector<int64_t>, std::vector<int64_t>> inferViewShapes(
     const std::vector<int64_t>& original_sizes,
     const std::vector<int64_t>& new_sizes) {
   bool valid_original_sizes = std::all_of(
@@ -698,14 +695,14 @@ std::pair<std::vector<size_t>, std::vector<size_t>> inferNewViewShape(
       });
   TORCH_INTERNAL_ASSERT(valid_original_sizes);
 
-  std::vector<size_t> original_view(
+  std::vector<int64_t> original_view(
       original_sizes.begin(), original_sizes.end());
-  std::vector<size_t> new_view(new_sizes.size());
+  std::vector<int64_t> new_view(new_sizes.size());
 
   // TODO: refactor
   int64_t dynamic_index = -1;
-  size_t new_size_num_elements = 1;
-  for (size_t idx = 0; idx < new_sizes.size(); ++idx) {
+  int64_t new_size_num_elements = 1;
+  for (int64_t idx = 0; idx < new_sizes.size(); ++idx) {
     if (new_sizes[idx] == -1) {
       TORCH_INTERNAL_ASSERT(
           dynamic_index == -1, "Only one dimension can by inferred.")
@@ -717,7 +714,7 @@ std::pair<std::vector<size_t>, std::vector<size_t>> inferNewViewShape(
     }
   }
 
-  const size_t kNumElements = std::accumulate(
+  const int64_t kNumElements = std::accumulate(
       original_view.begin(), original_view.end(), 1, std::multiplies<>());
   if (dynamic_index != -1) {
     new_view[dynamic_index] = kNumElements / new_size_num_elements;
@@ -725,8 +722,6 @@ std::pair<std::vector<size_t>, std::vector<size_t>> inferNewViewShape(
 
   return {original_view, new_view};
 }
-
-} // namespace
 
 //! Generates the transformations necessary to convert
 //! from the original view into the new view.
@@ -743,9 +738,9 @@ AnalyzeViewResult analyzeView(
       TensorDomain::noReductions(original_view_tv->getMaybeRFactorDomain())
           .size() == original_sizes.size());
 
-  // Fill -1 dimension in new_std::vector<size_t> with size infered from all
+  // Fill -1 dimension in new_std::vector<int64_t> with size infered from all
   // other values
-  auto sizes = inferNewViewShape(original_sizes, new_sizes);
+  auto sizes = inferViewShapes(original_sizes, new_sizes);
 
   // Analysize the transformations required to go from original_sizes to
   // new_sizes
@@ -760,7 +755,7 @@ AnalyzeViewConstraint analyzeViewConstraint(
     const std::vector<int64_t>& original_sizes,
     const std::vector<int64_t>& new_sizes) {
   FUSER_PERF_SCOPE("analyzeViewConstraint");
-  auto sizes = inferNewViewShape(original_sizes, new_sizes);
+  auto sizes = inferViewShapes(original_sizes, new_sizes);
   AnalyzeViewTransformation analyzer(
       sizes.first /* original_view */, sizes.second /* new_view */);
   return analyzer.constraint();

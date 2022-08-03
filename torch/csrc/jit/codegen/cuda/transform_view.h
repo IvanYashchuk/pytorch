@@ -52,18 +52,18 @@ struct TORCH_API AnalyzeViewConstraint {
 
   std::vector<int64_t> conglomerateString() const {
     // Don't think this is necessary but just being safe. Using
-    // std::numeric_limits<int64_t>::max() as a dilimeter between values.
+    // -3 as a dilimeter between value groups.
     std::vector<int64_t> conglomerate = {
         (int64_t)original_constraint.size(),
         (int64_t)new_constraint.size(),
-        std::numeric_limits<int64_t>::max()};
+        -3};
     auto add_vec = [&conglomerate](const std::vector<int64_t>& vec) {
       for (auto element : vec) {
         conglomerate.push_back(element);
       }
       // TODO: Why doesn't this work?
       // conglomerate.insert(conglomerate.back(), vec.begin(), vec.end());
-      conglomerate.push_back(std::numeric_limits<int64_t>::max());
+      conglomerate.push_back(-3);
     };
     add_vec(original_constraint);
     add_vec(new_constraint);
@@ -73,7 +73,7 @@ struct TORCH_API AnalyzeViewConstraint {
     return conglomerate;
   }
 
-  bool is_same(const AnalyzeViewConstraint& other) const {
+  bool operator==(const AnalyzeViewConstraint& other) const {
     return other.conglomerateString() == this->conglomerateString();
   }
 
@@ -90,6 +90,14 @@ struct TORCH_API AnalyzeViewConstraint {
     return hash_value;
   }
 };
+
+//! Infer -1 value in new view std::vector<int64_t> based on original view
+//! std::vector<int64_t>. This shouldn't generally be used directly but is
+//! useful for testing.
+TORCH_CUDA_CU_API std::pair<std::vector<int64_t>, std::vector<int64_t>>
+inferViewShapes(
+    const std::vector<int64_t>& original_sizes,
+    const std::vector<int64_t>& new_sizes);
 
 // Find the transformations necessary to convert TensorView
 // from original size to new size.
