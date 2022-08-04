@@ -463,8 +463,15 @@ LaunchParams schedulePointwise(
   return params->lparams;
 }
 
+TensorView* getReferenceTensorView(Fusion* fusion) {
+  FusionGuard fg(fusion);
+  DomainMap domain_map(fusion);
+  auto reference_tv = domain_map.findReferenceTensorView();
+  return reference_tv;
+}
+
 bool hasReferenceTensorView(Fusion* fusion) {
-  return DomainMap::hasReferenceTensorView(fusion);
+  return getReferenceTensorView(fusion) != nullptr;
 }
 
 // TODO: Inline intermediate operations (avoid inlining unrolled/vectorized
@@ -515,10 +522,9 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
     return;
   }
 
-  DomainMap domain_map(fusion);
-  TensorView* reference_tv =
-      domain_map.findReferenceTensorView(params.break_point);
-
+  TensorView* reference_tv = getReferenceTensorView(fusion);
+fusion->printMath();
+std::cout<<"Ref: "<<reference_tv<<std::endl;
   TORCH_INTERNAL_ASSERT(
       reference_tv != nullptr,
       "Could not find a fully broadcasted output to reference schedule on.");

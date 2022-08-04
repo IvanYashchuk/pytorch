@@ -55,7 +55,7 @@ if GRAPH_EXECUTOR == ProfilingMode.PROFILING:
 FUSION_GROUP = 'prim::CudaFusionGroup'
 FUSION_GUARD = 'prim::CudaFusionGuard'
 # TODO: revert disabled alias ops
-ALIAS_TEST_DISABLED = True
+ALIAS_TEST_DISABLED = False
 
 
 @contextlib.contextmanager
@@ -3664,6 +3664,7 @@ class TestCudaFuser(JitTestCase):
         has_inferred_dimension = any([dim == -1 for dim in output_shape])
         if has_inferred_dimension:
             # prohibit fusing when view_shape contains an inferred dimension
+            # TODO: Revisit
             self.assertGraphContainsExactly(graph, FUSION_GROUP, 0)
             self.assertGraphContainsExactly(graph, 'prim::view_copy', 0)
         else:
@@ -3696,7 +3697,6 @@ class TestCudaFuser(JitTestCase):
         jit_o = t_jit(x.clone(), bias, output_shape)
         # eager - baseline
         o = t(x.clone(), bias, output_shape)
-
         self.assertEqual(o.dtype, jit_o.dtype)
         self.assertTrue(self._compare("comparing output failed", o, jit_o, error))
         graph = t_jit.graph_for(x, bias, output_shape)
@@ -3809,7 +3809,6 @@ class TestCudaFuser(JitTestCase):
                 total += 1
                 test_fn(all_views[idx], all_views[jdx], torch.float, 'cuda', 1e-6)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since view is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")

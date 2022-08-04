@@ -36,6 +36,9 @@ TORCH_CUDA_CU_API LaunchParams schedulePointwise(
 //!  the pointwise scheduler.
 bool hasReferenceTensorView(Fusion* fusion);
 
+// Return reference tensor view.
+TensorView* getReferenceTensorView(Fusion* fusion);
+
 } // namespace cuda
 } // namespace fuser
 } // namespace jit
