@@ -2435,14 +2435,14 @@ void CudaFuseGraph(std::shared_ptr<Graph>& graph) {
   GRAPH_DEBUG("Remove inplace operations: ", *graph);
 
   // TODO: separate passes into different file;
-  if (isEnabled(EnableOption::LinearDecomposition)) {
+  if (isOptionEnabled(EnableOption::LinearDecomposition)) {
     // TODO: restore decomposition after fusion, in case we are decomposing
     //       operation that can't be fused;
     decomposeLinearOps(graph->block());
   }
   GRAPH_DEBUG("After decompose Linear Ops by nvfuser: ", *graph);
 
-  if (isEnabled(EnableOption::ConvDecomposition)) {
+  if (isOptionEnabled(EnableOption::ConvDecomposition)) {
     decomposeConvOps(graph->block());
   }
   GRAPH_DEBUG("After decompose decompose Conv Ops by nvfuser: ", *graph);
