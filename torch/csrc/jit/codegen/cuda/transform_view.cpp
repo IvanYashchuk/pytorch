@@ -514,9 +514,9 @@ class AnalyzeViewTransformation {
           original_view_index + 1 < original_view_.size() &&
           original_view_[original_view_index + 1] == 1 &&
           !isImplicitBroadcast(original_view_index + 1)) {
-        // Next index in original_view is runtime size 1 and next next new view
-        // is not, merge the size 1 into the current view before moving on. Even
-        // if the current size and new view size match we could have a trailing
+        // Next index in original_view is runtime size 1 and next new view is
+        // not, merge the size 1 into the current view before moving on. Even if
+        // the current size and new view size match we could have a trailing
         // size 1 dimension on the input that needs to be merged in.
         view_transforms_.push_back(
             std::make_shared<MergeTransform>(transform_view_index));
@@ -632,7 +632,7 @@ class AnalyzeViewTransformation {
   // If root domain isn't provided always assume size-1 dimensions are
   // compile-time dimensions. TODO: Remove runtime size-1 dimension support.
   // This should be cached higher in the stack.
-  bool root_domain_not_provided_ = true;
+  const bool root_domain_not_provided_ = true;
 
   const std::vector<IterDomain*> root_domain_;
   // Track if the root ID was transformed or kept ()

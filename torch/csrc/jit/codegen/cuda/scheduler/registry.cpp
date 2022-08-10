@@ -592,7 +592,7 @@ size_t SchedulerRuntimeInfo::getMaxVectorizableWidth(TensorView* tv) {
     }
 
     // Still contiguous
-    numel *= dim_size.value();
+    numel *= dim_size.value().as<int64_t>();
   }
 
   // Assuming intermediate tensors have friendly alignment, and

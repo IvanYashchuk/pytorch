@@ -787,6 +787,19 @@ kir::ExpressionEvaluator bindKernelInputs(
               dim,
               " but found stride ",
               aten_tensor.strides()[dim]);
+          // Could support dynamic size on expanded dimension, so may not have
+          // an inferable expanded extent here. This check might be better to do
+          // once all values are bound.
+          auto maybe_expanded_size =
+              expr_eval.evaluate(root_domain[dim]->expandedExtent());
+          if (maybe_expanded_size.has_value()) {
+            TORCH_CHECK(
+                *maybe_expanded_size == aten_tensor.sizes()[dim],
+                "Expecting expanded extent of ",
+                *maybe_expanded_size,
+                " but recieved value of ",
+                aten_tensor.sizes()[dim]);
+          }
         }
 
         const auto value = root_domain[dim]->hasExpandedExtent()
@@ -838,7 +851,7 @@ ExpressionEvaluator bindFusionInputs(
       fusion->inputs().size() == aten_inputs.size(),
       "Something went wrong configuring launch. Inputs do not match.");
 
-  ExpressionEvaluator evaluator(fusion);
+  ExpressionEvaluator expr_eval(fusion);
   auto inputs = fusion->inputs();
 
   // This should probably move to EvaluationContext as we may want to bind
@@ -868,6 +881,19 @@ ExpressionEvaluator bindFusionInputs(
               dim,
               " but found stride ",
               aten_tensor.strides()[dim]);
+          // Could support dynamic size on expanded dimension, so may not have
+          // an inferable expanded extent here. This check might be better to do
+          // once all values are bound.
+          auto maybe_expanded_size =
+              expr_eval.evaluate(root_domain[dim]->expandedExtent());
+          if (maybe_expanded_size.has_value()) {
+            TORCH_CHECK(
+                *maybe_expanded_size == aten_tensor.sizes()[dim],
+                "Expecting expanded extent of ",
+                *maybe_expanded_size,
+                " but recieved value of ",
+                aten_tensor.sizes()[dim]);
+          }
         }
 
         const auto value = root_domain[dim]->hasExpandedExtent()
@@ -878,7 +904,7 @@ ExpressionEvaluator bindFusionInputs(
           continue;
         }
         TORCH_INTERNAL_ASSERT(value != 0, "Cannot handle size-0 dimensions");
-        const auto prev_value = evaluator.evaluate(extent);
+        const auto prev_value = expr_eval.evaluate(extent);
         if (prev_value.has_value()) {
           TORCH_CHECK(
               *prev_value == value,
@@ -889,7 +915,7 @@ ExpressionEvaluator bindFusionInputs(
               " but it's already set to ",
               *prev_value);
         } else {
-          evaluator.bind(extent, value);
+          expr_eval.bind(extent, value);
         }
       }
     } else if (
@@ -899,10 +925,10 @@ ExpressionEvaluator bindFusionInputs(
           aten_inputs[i].type()->kind() == c10::TypeKind::IntType,
           "fusion expected Scalar Int inputs, but found",
           aten_inputs[i].type()->str());
-      evaluator.bind(inputs[i], aten_inputs[i].toInt());
+      expr_eval.bind(inputs[i], aten_inputs[i].toInt());
     }
   }
-  return evaluator;
+  return expr_eval;
 }
 
 void initializeCudaContext() {
