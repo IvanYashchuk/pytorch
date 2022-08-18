@@ -38,7 +38,9 @@ auto parseDebugDumpOptions() {
       {DebugDumpOption::Halo, false},
       {DebugDumpOption::PerfDebugVerbose, false},
       {DebugDumpOption::TransformPropagator, false},
-      {DebugDumpOption::InlinePropagator, false}};
+      {DebugDumpOption::InlinePropagator, false},
+      {DebugDumpOption::Cubin, false},
+      {DebugDumpOption::Ptx, false}};
 
   if (const char* dump_options = std::getenv("PYTORCH_NVFUSER_DUMP")) {
     c10::string_view options_view(dump_options);
@@ -91,6 +93,10 @@ auto parseDebugDumpOptions() {
         options_map[DebugDumpOption::TransformPropagator] = true;
       } else if (token == "inline_propagator") {
         options_map[DebugDumpOption::InlinePropagator] = true;
+      } else if (token == "cubin") {
+        options_map[DebugDumpOption::Cubin] = true;
+      } else if (token == "ptx") {
+        options_map[DebugDumpOption::Ptx] = true;
       } else {
         TORCH_CHECK(
             false,
@@ -102,7 +108,7 @@ auto parseDebugDumpOptions() {
             "\tkernel_args, dump_eff_bandwidth, draw_segmented_fusion,\n",
             "\tscheduler_params, parallel_dimensions, buffer_reuse_verbose,\n",
             "\tptxas_verbose, halo, segmenter_logging, perf_debug_verbose\n",
-            "\ttransform_propagator, inline_propagator\n");
+            "\ttransform_propagator, inline_propagator, cubin, ptx\n");
       }
       options_view = (end_pos != c10::string_view::npos)
           ? options_view.substr(end_pos + 1)
@@ -120,8 +126,7 @@ auto parseDisableOptions() {
       {DisableOption::Fma, false},
       {DisableOption::IndexHoist, false},
       {DisableOption::Nvtx, false},
-      {DisableOption::PredicateElimination, false},
-      {DisableOption::UnrollWithRng, false}};
+      {DisableOption::PredicateElimination, false}};
 
   if (const char* dump_options = std::getenv("PYTORCH_NVFUSER_DISABLE")) {
     c10::string_view options_view(dump_options);
@@ -142,16 +147,13 @@ auto parseDisableOptions() {
         options_map[DisableOption::Nvtx] = true;
       } else if (token == "predicate_elimination") {
         options_map[DisableOption::PredicateElimination] = true;
-      } else if (token == "unroll_with_rng") {
-        options_map[DisableOption::UnrollWithRng] = true;
       } else {
         TORCH_CHECK(
             false,
             "Invalid disable option: '",
             token,
             "'\nAvailable options:\n",
-            "\tarch_check, fallback, fma, index_hoist, nvtx, predicate_elimination\n",
-            "unroll_with_rng");
+            "\tarch_check, fallback, fma, index_hoist, nvtx, predicate_elimination\n");
       }
       options_view = (end_pos != c10::string_view::npos)
           ? options_view.substr(end_pos + 1)
