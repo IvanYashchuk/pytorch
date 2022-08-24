@@ -25474,6 +25474,84 @@ TEST_F(NVFuserTest, FusionSizeDependentData_CUDA) {
       executor_cache.fusion(), cg_outputs, {a}, {a + 123}, __LINE__, __FILE__);
 }
 
+TEST_F(NVFuserTest, FusionReorderAsRFactor_CUDA) {
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  int a=1, b=2, c=3, d=4;
+
+  TensorView* tv0 = makeConcreteTensor({a, b, c, d});
+  fusion.addInput(tv0);
+  fusion.addOutput(tv0);
+
+  // [a, b, c, d]
+  tv0->merge(0, 2);
+  // [a*c, b, d]
+  tv0->split(2, 2);
+  // [a*c, bo, bi, d]
+  tv0->split(3, 3);
+  // [a*c, bo, bi, do, di]
+  tv0->reorder({{1, 4}, {2, 1}, {3, 3}, {4, 2}});
+  // [a*c, bi, di, do, bo]
+  tv0->merge(3);
+  tv0->merge(1);
+  // [a*c, bi*di, do*bo]
+  tv0->reorder({{0, 2}});
+  // [bi*di, do*bo, a*c]
+  // Order we want is:
+  // [a*c, do*bo, bi*di]
+  auto old2new = scheduler_utils::domainReorderAsRfactorMap(tv0);
+  TORCH_CHECK(old2new[0]==2);
+  TORCH_CHECK(old2new[1]==1);
+  TORCH_CHECK(old2new[2]==0);
+}
+
+TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  TensorView* tv0 = makeSymbolicTensor(1);
+  TensorView* tv1 = makeSymbolicTensor(1);
+  TensorView* tv2 = makeSymbolicTensor(1);
+  TensorView* tv3 = makeSymbolicTensor(1);
+
+  auto tv4 = add(tv0, tv1);
+  auto tv5 = add(tv0, tv2);
+  auto tv6 = add(tv0, tv3);
+
+  auto tv7 = add(tv1, tv2);
+  auto tv8 = add(tv1, tv3);
+  
+  auto tv9 = add(tv2, tv3);
+
+  {
+    auto all_vals = DependencyCheck::getAllValsBetween(
+        {tv0, tv1}, {tv4, tv5, tv6, tv7, tv8, tv9});
+    std::unordered_set<Val*> all_vals_set(all_vals.begin(), all_vals.end());
+    std::vector<Val*> results({tv0, tv1, tv4, tv5, tv6, tv7, tv8});
+    for (auto result : results) {
+     TORCH_CHECK(all_vals_set.count(result) > 0);
+     all_vals_set.erase(result);
+    }
+    TORCH_CHECK(all_vals_set.empty());
+  }
+
+  auto tv10 = add(tv6, tv7);
+  {
+    auto all_vals = DependencyCheck::getAllValsBetween(
+        {tv0, tv1}, {tv10});
+    std::unordered_set<Val*> all_vals_set(all_vals.begin(), all_vals.end());
+    std::vector<Val*> results({tv0, tv1, tv6, tv7, tv10});
+    for (auto result : results) {
+      TORCH_CHECK(all_vals_set.count(result) > 0);
+      all_vals_set.erase(result);
+    }
+    TORCH_CHECK(all_vals_set.empty());
+  }
+}
+
 } // namespace jit
 } // namespace torch
 #endif // #if defined(USE_CUDA)

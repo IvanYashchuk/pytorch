@@ -359,28 +359,20 @@ class SchedulerTopologyChecker {
     return true;
   }
 
-  // View is generically supported as long as it's before any reference since
-  // all our schedulers propagate and inline based on the reference tensor. If
-  // the reference is a consumer of all views, when we trasnform propagate the
-  // view transformations are all preserved, so we don't have to worry about
-  // special view handling.
-  //
-  // TODO: This could be improved as schedulers could have multiple tensor views
-  // that could be used as a reference. When that's the case it might be best to
-  // pick one that has all views as producers if possible.
-  static bool hasUnsupportedViewOps(
+  // Returns if any non-trivial views are a dependency of the expression
+  // producing the reference. This could be important as transform propagation
+  // from a reference backwards through a view should always work, but transform
+  // propagation form a reference forward through a view could interfere with
+  // the view transforms.
+  static bool hasViewNotDependentOnRef(
       Fusion* fusion,
       std::vector<TensorView*> reference_tvs) {
-        std::cout<<"Check!"<<std::endl;
-        fusion->printMath();
     std::vector<TensorView*> view_tvs;
-    auto all_vals = fusion->usedMathVals();
-    for (auto expr : fusion->exprs()) {
-      if (auto view_op = dynamic_cast<ViewOp*>(expr)) {
-        auto tv_outs = ir_utils::filterByType<TensorView>(view_op->outputs());
-        for(auto entry : tv_outs){
-          view_tvs.push_back(entry);
-        }
+    auto view_ops = ir_utils::getViewOps(fusion);
+    if (auto view_op : view_ops) {
+      auto tv_outs = ir_utils::filterByType<TensorView>(view_op->outputs());
+      for (auto entry : tv_outs) {
+        view_tvs.push_back(entry);
       }
     }
 
@@ -388,10 +380,10 @@ class SchedulerTopologyChecker {
       return false;
     }
 
-    // Terrible complexity, TODO: improve complexity
+    // Terrible complexity, may be worth improving, but is a comapile time
+    // check.
     for (auto ref_tv : reference_tvs) {
       for (auto view_tv : view_tvs) {
-        std::cout<<ref_tv->toString()<<"  vs  "<<view_tv->toString()<<std::endl;
         if (!DependencyCheck::isDependencyOf(view_tv, ref_tv)) {
           return true;
         }
@@ -910,9 +902,10 @@ class ReductionScheduler : public SchedulerEntry {
     }
 
     // Persistent scheduler simply uses reduction_tvs[0] as the reference, if
-    // that changes, this needs to be changed.
-    if (SchedulerTopologyChecker::hasUnsupportedViewOps(
-            fusion, {reduction_tvs[0]})) {
+    // that changes, this needs to be changed. Second check here may be overly
+    // conservative.
+    if (SchedulerTopologyChecker::hasViewNotDependentOnRef(
+            fusion, {reduction_tvs[0]}) || !scheduler_utils::allMatchingViews(fusion)) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::Reduction, "Unsupported view fusion.");
     }
@@ -1036,10 +1029,12 @@ class PointWiseScheduler : public SchedulerEntry {
       return false;
     }
 
-    if (SchedulerTopologyChecker::hasUnsupportedViewOps(
+    if (!scheduler_utils::allMatchingViews(fusion) &&
+        SchedulerTopologyChecker::hasViewNotDependentOnRef(
             fusion, {getReferenceTensorView(fusion)})) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::PointWise, "Unsupported view fusion.");
+      return false;
     }
 
     auto reduction_ops =
@@ -1133,9 +1128,11 @@ class PersistentKernelScheduler : public SchedulerEntry {
     }
 
     // Persistent scheduler simply uses reduction_tvs[0] as the reference, if
-    // that changes, this needs to be changed.
-    if (SchedulerTopologyChecker::hasUnsupportedViewOps(
-            fusion, {reduction_tvs[0]})) {
+    // that changes, this needs to be changed. Second check here may be overly
+    // conservative.
+    if (SchedulerTopologyChecker::hasViewNotDependentOnRef(
+            fusion, {reduction_tvs[0]}) ||
+        !scheduler_utils::allMatchingViews(fusion)) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::Persistent, "Unsupported view fusion.");
     }
