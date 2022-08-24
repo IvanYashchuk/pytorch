@@ -4238,12 +4238,6 @@ TEST_F(NVFuserTest, FusionUnaryOps_CUDA) {
           /*Inputs Tuple*/
           std::make_tuple(std::make_pair(ValType::TensorView, dtype)));
     });
-
-    // TODO: why the rand_like test is failing for complex? Is it because each
-    // complex needs to draw 2 random numbers from the RNG? We need to enable
-    // this
-    // TODO:
-    //  Randlike testing is moved to test_gpu_rng.cu
   }
 
   dtypes = {DataType::Int, DataType::Int32, DataType::Bool};
@@ -13145,6 +13139,50 @@ TEST_F(NVFuserTest, FusionWelfordShmoo_CUDA) {
           }
           testWelford(dtype, axis, odim, rdim);
         }
+      }
+    }
+  }
+}
+
+namespace {
+void testVarMean(at::ScalarType dtype, int correction, bool keepdim) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  int M = 64, N = 128;
+
+  auto tv0 = makeSymbolicTensor(2, aten_to_data_type(dtype));
+  fusion->addInput(tv0);
+  auto tvs = variance_mean(tv0, {1}, correction, keepdim);
+  auto tv_mean = tvs.mean;
+  auto tv_var = tvs.var;
+  fusion->addOutput(tv_var);
+  fusion->addOutput(tv_mean);
+
+  auto options = at::TensorOptions().dtype(dtype).device(at::kCUDA, 0);
+  at::manual_seed(0);
+  at::Tensor t0 = at::randn({M, N}, options);
+
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto outputs = executor_cache.runFusionWithInputs({t0});
+
+  auto at_var_mean = at::var_mean(t0, {1}, correction, keepdim);
+  std::vector<at::Tensor> aten_outputs = {
+      std::get<0>(at_var_mean), std::get<1>(at_var_mean)};
+
+  testValidate(
+      executor_cache.fusion(), outputs, {t0}, aten_outputs, __LINE__, __FILE__);
+}
+} // namespace
+
+TEST_F(NVFuserTest, FusionVarMean_CUDA) {
+  std::vector<at::ScalarType> dtypes = {at::kFloat, at::kDouble};
+  std::vector<int> corrections = {0, 1};
+  std::vector<bool> keepdims = {false, true};
+  for (auto correction : corrections) {
+    for (auto keepdim : keepdims) {
+      for (auto dtype : dtypes) {
+        testVarMean(dtype, correction, keepdim);
       }
     }
   }
@@ -25550,6 +25588,49 @@ TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
     }
     TORCH_CHECK(all_vals_set.empty());
   }
+}
+
+TEST_F(NVFuserTest, FusionPredicateUnshare_CUDA) {
+  // https://github.com/csarofeen/pytorch/issues/1926
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = makeSymbolicTensor(2);
+  fusion->addInput(tv0);
+  auto tv1 = set(tv0);
+  auto tv2 = set(tv1);
+  fusion->addOutput(tv2);
+
+  tv1->setMemoryType(MemoryType::Shared);
+  for (auto tv : {tv1, tv2}) {
+    tv->split(0, 4);
+    tv->reorder({{1, -1}});
+    tv->split(1, 8);
+    tv->merge(0);
+    tv->split(0, 1);
+    tv->axis(0)->parallelize(ParallelType::BIDx);
+    tv->axis(1)->parallelize(ParallelType::Unswitch);
+  }
+  tv1->merge(2);
+  tv2->reorder({{2, 3}});
+  tv2->merge(2);
+  for (auto tv : {tv1, tv2}) {
+    tv->axis(-1)->parallelize(ParallelType::TIDx);
+  }
+
+  InlinePropagator propagator(tv2, -1, ComputeAtMode::MostInlined);
+  MaxRootDomainInfoSpanningTree(tv2).traverse(&propagator);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({5, 5}, options);
+
+  FusionExecutor fe;
+  fe.compileFusion(fusion, {t0});
+  auto cg_outputs = fe.runFusion({t0});
+  auto out = cg_outputs[0];
+
+  testValidate(fusion, {out}, {t0}, {t0}, __LINE__, __FILE__);
 }
 
 } // namespace jit

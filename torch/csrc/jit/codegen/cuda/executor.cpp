@@ -860,7 +860,13 @@ std::vector<at::Tensor> FusionExecutor::runFusion(
           "what can be resident on the GPU at once. Need: ",
           launch_params_.gdimx() * launch_params_.gdimy() *
               launch_params_.gdimz(),
-          " but limited to ",
+          " (",
+          launch_params_.gdimx(),
+          " * ",
+          launch_params_.gdimy(),
+          " * ",
+          launch_params_.gdimz(),
+          ") but limited to ",
           num_blocks_per_SM,
           " * ",
           at::cuda::getDeviceProperties(options_.device.index())
@@ -974,14 +980,16 @@ std::vector<at::Tensor> FusionExecutor::runFusion(
         const auto& input_tensor = input.toTensor();
         std::cout << "  " << input_tensor.scalar_type() << " "
                   << input.toTensor().sizes()
-                  << " (strides = " << input.toTensor().strides() << ")"
+                  << " (strides = " << input.toTensor().strides()
+                  << ", address = " << input.toTensor().data_ptr() << ")"
                   << std::endl;
       }
     }
     std::cout << "Outputs:" << std::endl;
     for (const auto& output : allocated_outputs) {
       std::cout << "  " << output.scalar_type() << " " << output.sizes()
-                << " (strides = " << output.strides() << ")" << std::endl;
+                << " (strides = " << output.strides()
+                << ", address = " << output.data_ptr() << ")" << std::endl;
     }
     std::cout << "Reduction and semaphore buffers:" << std::endl;
     TORCH_INTERNAL_ASSERT(
