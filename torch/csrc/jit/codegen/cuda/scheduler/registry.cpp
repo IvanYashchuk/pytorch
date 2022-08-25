@@ -369,7 +369,7 @@ class SchedulerTopologyChecker {
       std::vector<TensorView*> reference_tvs) {
     std::vector<TensorView*> view_tvs;
     auto view_ops = ir_utils::getViewOps(fusion);
-    if (auto view_op : view_ops) {
+    for (auto view_op : view_ops) {
       auto tv_outs = ir_utils::filterByType<TensorView>(view_op->outputs());
       for (auto entry : tv_outs) {
         view_tvs.push_back(entry);

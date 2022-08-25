@@ -495,7 +495,7 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
   // scheduling the reference tv. Since view ops have to be identical, if any
   // path from reference tv through producers goes through a view, all paths
   // from reference tv's to views should be through producers.
-  bool needs_view_prop = !std::any_of(
+  bool needs_view_prop = view_ops.size() > 0 && !std::any_of(
       view_ops.begin(), view_ops.end(), [&reference_tv](ViewOp* view) {
         return DependencyCheck::isDependencyOf(view->out(), reference_tv) ||
             view->out()->sameAs(reference_tv);
