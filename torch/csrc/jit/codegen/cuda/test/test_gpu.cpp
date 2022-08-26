@@ -13785,8 +13785,8 @@ TEST_F(NVFuserTest, FusionMultipleVectorize_CUDA) {
 
   auto outputs = executor_cache.runFusionWithInputs({t0, t1});
   auto runtime1 = executor_cache.getMostRecentKernelRuntime();
-  auto log1 = std::dynamic_pointer_cast<PointwiseParams>(
-      executor_cache.getMostRecentExecutorInfo().params);
+  auto log1 =
+      executor_cache.getMostRecentExecutorInfo().params->as<PointwiseParams>();
   TORCH_CHECK(log1 != nullptr);
   TORCH_CHECK(log1->vectorize);
 
@@ -13799,8 +13799,8 @@ TEST_F(NVFuserTest, FusionMultipleVectorize_CUDA) {
 
   outputs = executor_cache.runFusionWithInputs({t0, t1});
   auto runtime2 = executor_cache.getMostRecentKernelRuntime();
-  auto log2 = std::dynamic_pointer_cast<PointwiseParams>(
-      executor_cache.getMostRecentExecutorInfo().params);
+  auto log2 =
+      executor_cache.getMostRecentExecutorInfo().params->as<PointwiseParams>();
   TORCH_CHECK(log2 != nullptr);
   TORCH_CHECK(log2->vectorize);
 
@@ -13813,8 +13813,8 @@ TEST_F(NVFuserTest, FusionMultipleVectorize_CUDA) {
 
   outputs = executor_cache.runFusionWithInputs({t0, t1});
   auto runtime3 = executor_cache.getMostRecentKernelRuntime();
-  auto log3 = std::dynamic_pointer_cast<PointwiseParams>(
-      executor_cache.getMostRecentExecutorInfo().params);
+  auto log3 =
+      executor_cache.getMostRecentExecutorInfo().params->as<PointwiseParams>();
   TORCH_CHECK(log3 != nullptr);
   TORCH_CHECK(log3->vectorize);
 
@@ -25513,11 +25513,10 @@ TEST_F(NVFuserTest, FusionSizeDependentData_CUDA) {
 }
 
 TEST_F(NVFuserTest, FusionReorderAsRFactor_CUDA) {
-
   Fusion fusion;
   FusionGuard fg(&fusion);
 
-  int a=1, b=2, c=3, d=4;
+  int a = 1, b = 2, c = 3, d = 4;
 
   TensorView* tv0 = makeConcreteTensor({a, b, c, d});
   fusion.addInput(tv0);
@@ -25540,13 +25539,12 @@ TEST_F(NVFuserTest, FusionReorderAsRFactor_CUDA) {
   // Order we want is:
   // [a*c, do*bo, bi*di]
   auto old2new = scheduler_utils::domainReorderAsRfactorMap(tv0);
-  TORCH_CHECK(old2new[0]==2);
-  TORCH_CHECK(old2new[1]==1);
-  TORCH_CHECK(old2new[2]==0);
+  TORCH_CHECK(old2new[0] == 2);
+  TORCH_CHECK(old2new[1] == 1);
+  TORCH_CHECK(old2new[2] == 0);
 }
 
 TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
-
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25561,7 +25559,7 @@ TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
 
   auto tv7 = add(tv1, tv2);
   auto tv8 = add(tv1, tv3);
-  
+
   auto tv9 = add(tv2, tv3);
 
   {
@@ -25570,16 +25568,15 @@ TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
     std::unordered_set<Val*> all_vals_set(all_vals.begin(), all_vals.end());
     std::vector<Val*> results({tv0, tv1, tv4, tv5, tv6, tv7, tv8});
     for (auto result : results) {
-     TORCH_CHECK(all_vals_set.count(result) > 0);
-     all_vals_set.erase(result);
+      TORCH_CHECK(all_vals_set.count(result) > 0);
+      all_vals_set.erase(result);
     }
     TORCH_CHECK(all_vals_set.empty());
   }
 
   auto tv10 = add(tv6, tv7);
   {
-    auto all_vals = DependencyCheck::getAllValsBetween(
-        {tv0, tv1}, {tv10});
+    auto all_vals = DependencyCheck::getAllValsBetween({tv0, tv1}, {tv10});
     std::unordered_set<Val*> all_vals_set(all_vals.begin(), all_vals.end());
     std::vector<Val*> results({tv0, tv1, tv6, tv7, tv10});
     for (auto result : results) {
