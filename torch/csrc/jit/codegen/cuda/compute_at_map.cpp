@@ -82,25 +82,51 @@ bool IterDomainGraph::exprsMap(Expr* first, Expr* second, bool forward) {
     // one, so if etype is the same number of input id's hsould be the same.
     return false;
   }
+  {
+    std::vector<std::pair<IterDomain*, IterDomain*>> zipped_ids;
 
-  std::vector<std::pair<IterDomain*, IterDomain*>> zipped_ids;
+    std::transform(
+        first_ids.begin(),
+        first_ids.end(),
+        second_ids.begin(),
+        std::back_inserter(zipped_ids),
+        [](IterDomain* first, IterDomain* second) {
+          return std::make_pair(first, second);
+        });
 
-  std::transform(
-      first_ids.begin(),
-      first_ids.end(),
-      second_ids.begin(),
-      std::back_inserter(zipped_ids),
-      [](IterDomain* first, IterDomain* second) {
-        return std::make_pair(first, second);
-      });
+    if (std::any_of(
+            zipped_ids.begin(),
+            zipped_ids.end(),
+            [&](std::pair<IterDomain*, IterDomain*> id_pair) {
+              return !exact_nodes_.strictAreMapped(
+                  id_pair.first, id_pair.second);
+            })) {
+      return false;
+    }
+  }
 
-  if (std::any_of(
-          zipped_ids.begin(),
-          zipped_ids.end(),
-          [&](std::pair<IterDomain*, IterDomain*> id_pair) {
-            return !exact_nodes_.strictAreMapped(id_pair.first, id_pair.second);
-          })) {
-    return false;
+  if (first->isA<Merge>() && !forward) {
+    // Can't back prop through merge without making sure one dimension actually
+    // is identical extents.
+    auto merge0 = first->as<Merge>();
+    auto merge1 = second->as<Merge>();
+
+    auto extent_0o = merge0->outer()->extent();
+    auto extent_0i = merge0->inner()->extent();
+    auto extent_1o = merge1->outer()->extent();
+    auto extent_1i = merge1->inner()->extent();
+
+    auto extent_0_match = extent_0o->sameAs(extent_1o) ||
+        (extent_0o->isConstInt() && extent_1o->isConstInt() &&
+         extent_0o->evaluateInt() == extent_1o->evaluateInt());
+
+    auto extent_1_match = extent_0i->sameAs(extent1i) ||
+        (extent_0i->isConstInt() && extent_1i->isConstInt() &&
+         extent_0i->evaluateInt() == extent_1i->evaluateInt());
+
+    if (!(extent_0_match || extent_1_match)) {
+      return false;
+    }
   }
 
   if (first->isA<Split>()) {
@@ -145,6 +171,8 @@ void IterDomainGraph::mapThroughExpr(Expr* first, Expr* second, bool forward) {
 }
 
 void IterDomainGraph::build(Fusion* fusion) {
+  FusionGuard fg(fusion);
+
   // Initialize a node for every iteration domain
   for (auto tv : ir_utils::allTvs(fusion)) {
     const auto& root_domain = tv->getRootDomain();
@@ -462,9 +490,15 @@ void IterDomainGraph::build(Fusion* fusion) {
         if (exact_map_rf_id == first_rfactor_id) {
           continue;
         }
-
-        auto other_expr = prop_forward ? rfactor_id_uses.at(exact_map_rf_id)
-                                       : exact_map_rf_id->definition();
+        // If there's an input with an rfactor domain we could have an exact
+        // mapped rfactor id that's on the input meaning it wouldn't have an
+        // entry in rfactor_id_uses
+        auto other_use =
+            rfactor_id_uses.find(exact_map_rf_id) == rfactor_id_uses.end()
+            ? nullptr
+            : rfactor_id_uses.at(exact_map_rf_id);
+        auto other_expr =
+            prop_forward ? other_use : exact_map_rf_id->definition();
 
         if (other_expr == nullptr) {
           continue;
