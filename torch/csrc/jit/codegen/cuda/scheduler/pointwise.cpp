@@ -246,7 +246,8 @@ std::shared_ptr<PointwiseParams> getPointwiseHeuristics(
 
       for (const auto break_point_i : c10::irange(ref_root.size())) {
         // If break point is incoherent with view, don't consider breaking here.
-        if(!scheduler_utils::breakIsDisjoint(view_disjoint_sets, break_point_i)){
+        if (!scheduler_utils::breakIsDisjoint(
+                view_disjoint_sets, break_point_i)) {
           continue;
         }
 
@@ -495,14 +496,27 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
   // scheduling the reference tv. Since view ops have to be identical, if any
   // path from reference tv through producers goes through a view, all paths
   // from reference tv's to views should be through producers.
-  bool needs_view_prop = view_ops.size() > 0 && !std::any_of(
-      view_ops.begin(), view_ops.end(), [&reference_tv](ViewOp* view) {
-        return DependencyCheck::isDependencyOf(view->out(), reference_tv) ||
-            view->out()->sameAs(reference_tv);
-      });
+  bool needs_view_prop =
+      view_ops.size() > 0 &&
+      !std::any_of(
+          view_ops.begin(), view_ops.end(), [&reference_tv](ViewOp* view) {
+            return DependencyCheck::isDependencyOf(view->out(), reference_tv) ||
+                view->out()->sameAs(reference_tv);
+          });
 
-  if(needs_view_prop){
+  if (needs_view_prop) {
     auto first_view_op = *view_ops.begin();
+
+    // Propagate the view transformations
+    TransformPropagator propagator(first_view_op->out());
+    MaxRootDomainInfoSpanningTree spanning_tree(first_view_op->out());
+    spanning_tree.traverse(&propagator);
+
+    // Reorder reference_tv after propagating the view operation. This will
+    // reorder for better merging.
+    reference_tv->reorder(
+        scheduler_utils::domainReorderAsRfactorMap(reference_tv));
+
     // Break point is relative to rfactor domain, find the leaf domain ID's in
     // the left/right side, we really need the values in domain, but easiest way
     // to do this is with Dependency check which will grab all intermediate
@@ -518,7 +532,7 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
 
     auto rhs_all_vals = DependencyCheck::getAllValsBetween(
         {reference_tv->getMaybeRFactorDomain().begin() + params.break_point,
-        reference_tv->getMaybeRFactorDomain().end()},
+         reference_tv->getMaybeRFactorDomain().end()},
         {reference_tv->domain()->domain().begin(),
          reference_tv->domain()->domain().end()});
 
@@ -526,20 +540,11 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
         rhs_all_vals.begin(), rhs_all_vals.end());
 
     // Make sure lhs and rhs groups are disjoint.
-    for(auto lhs_val : lhs_all_vals){
+    for (auto lhs_val : lhs_all_vals) {
       TORCH_INTERNAL_ASSERT(
           rhs_all_vals_set.count(lhs_val) == 0,
           "Error in pointwise scheduler. LHS and RHS of the 2D scheduler are not disjoint.");
     }
-
-    // Propagate the view transformations
-    TransformPropagator propagator(first_view_op->out());
-    MaxRootDomainInfoSpanningTree spanning_tree(first_view_op->out());
-    spanning_tree.traverse(&propagator);
-
-    // Reorder reference_tv after propagating the view operation. This will
-    // reorder for better merging.
-    reference_tv->reorder(scheduler_utils::domainReorderAsRfactorMap(reference_tv));
 
     // Merge rhs, then lhs.
     IterDomain* rhs_id = nullptr;
@@ -555,7 +560,7 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
         } else {
           reference_tv->merge(pos, lhs_i);
           lhs_i = pos;
-          if(rhs_i > lhs_i){
+          if (rhs_i > lhs_i) {
             rhs_i--;
           }
         }
@@ -566,7 +571,7 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
         } else {
           reference_tv->merge(pos, rhs_i);
           rhs_i = pos;
-          if(lhs_i > rhs_i){
+          if (lhs_i > rhs_i) {
             lhs_i--;
           }
         }
@@ -603,8 +608,6 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
       }
     }
   }
-
-  auto all_tvs = ir_utils::allTvs(fusion);
 
   int64_t unswitch_pos;
   IterDomain* vectorize_id = nullptr;
@@ -800,6 +803,8 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
   InlinePropagator inline_unswitch(
       reference_tv, unswitch_pos, ComputeAtMode::BestEffort);
   spanning_tree.traverse(&inline_unswitch);
+
+  auto all_tvs = ir_utils::allTvs(fusion);
 
   // Inline at the inner most position. The CA position of all tensors except
   // inputs, cached inputs and outputs will be updated.
