@@ -905,7 +905,8 @@ class ReductionScheduler : public SchedulerEntry {
     // that changes, this needs to be changed. Second check here may be overly
     // conservative.
     if (SchedulerTopologyChecker::hasViewNotDependentOnRef(
-            fusion, {reduction_tvs[0]}) || !scheduler_utils::allMatchingViews(fusion)) {
+            fusion, {reduction_tvs[0]}) ||
+        !scheduler_utils::allMatchingViews(fusion)) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::Reduction, "Unsupported view fusion.");
     }

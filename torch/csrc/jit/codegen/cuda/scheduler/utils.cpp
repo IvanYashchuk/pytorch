@@ -2501,7 +2501,7 @@ TORCH_CUDA_CU_API bool allMatchingViews(Fusion* fusion) {
   }
 
   TORCH_INTERNAL_ASSERT(
-      all_view_outs.size() > 1,
+      all_view_outs.size() > 0,
       "Found view operations but can't find any output tensor views.");
 
   auto first_out_tv = *all_view_outs.begin();
@@ -2635,11 +2635,10 @@ bool hasDependentViews(Fusion* fusion) {
   return DependentViewCheck::hasDependentViews(fusion);
 }
 
-
-TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos){
+TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
   //  a, b, c
-  if(pos < 0){
-    pos+=group_ids.size();
+  if (pos < 0) {
+    pos += group_ids.size();
   }
   TORCH_INTERNAL_ASSERT(
       pos >= 0 && pos <= group_ids.size(),
@@ -2648,17 +2647,17 @@ TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos){
       " but position is ",
       pos);
 
-  if(pos == 0 || pos == group_ids.size()){
+  if (pos == 0 || pos == group_ids.size()) {
     return true;
   }
 
   std::unordered_set<int> left_ints;
-  for(auto i : c10::irange(pos)){
+  for (auto i : c10::irange(pos)) {
     left_ints.emplace(group_ids[i]);
   }
 
-  for(auto i=pos; i<group_ids.size(); i++){
-    if(left_ints.count(group_ids[i])>0){
+  for (auto i = pos; i < group_ids.size(); i++) {
+    if (left_ints.count(group_ids[i]) > 0) {
       return false;
     }
   }
@@ -2668,7 +2667,8 @@ TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos){
 std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
   FusionGuard fg(tv->fusion());
   auto transform_exprs = StmtSort::getExprs(
-      tv->fusion(), {tv->domain()->domain().begin(), tv->domain()->domain().end()});
+      tv->fusion(),
+      {tv->domain()->domain().begin(), tv->domain()->domain().end()});
   // simply update this vector of id's as progressing through the transformation
   // expressions. We'll always insert the result of split in the location of the
   // input, and insert the merge result in the position of the inner dimension.
