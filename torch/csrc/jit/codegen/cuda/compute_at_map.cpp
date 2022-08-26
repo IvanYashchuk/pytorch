@@ -120,7 +120,7 @@ bool IterDomainGraph::exprsMap(Expr* first, Expr* second, bool forward) {
         (extent_0o->isConstInt() && extent_1o->isConstInt() &&
          extent_0o->evaluateInt() == extent_1o->evaluateInt());
 
-    auto extent_1_match = extent_0i->sameAs(extent1i) ||
+    auto extent_1_match = extent_0i->sameAs(extent_1i) ||
         (extent_0i->isConstInt() && extent_1i->isConstInt() &&
          extent_0i->evaluateInt() == extent_1i->evaluateInt());
 
