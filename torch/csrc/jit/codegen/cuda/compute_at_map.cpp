@@ -77,11 +77,14 @@ bool IterDomainGraph::exprsMap(Expr* first, Expr* second, bool forward) {
                         forward ? second->inputs() : second->outputs())
                         .vector();
 
-  if (first_ids.size() != second_ids.size()) {
-    // This shouldn't happen as merge always has two input id's and split always
-    // one, so if etype is the same number of input id's hsould be the same.
-    return false;
-  }
+  TORCH_INTERNAL_ASSERT(
+      first_ids.size() == second_ids.size(),
+      "Expected number of ",
+      (forward ? "inputs" : "outputs"),
+      " to match for\n",
+      first->toString(),
+      second->toString());
+
   {
     std::vector<std::pair<IterDomain*, IterDomain*>> zipped_ids;
 

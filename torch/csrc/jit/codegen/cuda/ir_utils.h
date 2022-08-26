@@ -106,7 +106,7 @@ class FilteredView {
     return begin() == end();
   }
 
-  std::vector<value_type> vector() {
+  std::vector<value_type> vector() const {
     return std::vector<value_type>(begin(), end());
   }
 
