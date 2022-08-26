@@ -91,9 +91,11 @@ bool isTvOp(const Expr* expr) {
       (expr->getExprType().value() == ExprType::UnaryOp ||
        expr->getExprType().value() == ExprType::BinaryOp ||
        expr->getExprType().value() == ExprType::TernaryOp ||
+       expr->getExprType().value() == ExprType::RNGOp ||
        expr->getExprType().value() == ExprType::ReductionOp ||
        expr->getExprType().value() == ExprType::GroupedReductionOp ||
        expr->getExprType().value() == ExprType::WelfordOp ||
+       expr->getExprType().value() == ExprType::GroupedWelfordOp ||
        expr->getExprType().value() == ExprType::LoadStoreOp ||
        expr->getExprType().value() == ExprType::MmaOp ||
        expr->getExprType().value() == ExprType::BroadcastOp ||
@@ -104,8 +106,10 @@ bool isTvOp(const Expr* expr) {
        expr->getExprType().value() == ExprType::ViewAsScalar ||
        expr->getExprType().value() == ExprType::ViewOp ||
        expr->getExprType().value() == ExprType::GridReduction ||
+       expr->getExprType().value() == ExprType::GroupedGridReduction ||
        expr->getExprType().value() == ExprType::GridBroadcast ||
-       expr->getExprType().value() == ExprType::GridWelford)) {
+       expr->getExprType().value() == ExprType::GridWelford ||
+       expr->getExprType().value() == ExprType::GroupedGridWelford)) {
     return true;
   }
   return false;
@@ -200,6 +204,10 @@ bool isScalarOp(const Expr* expr) {
 }
 
 bool hasBlockSync(const Expr* expr, const ThreadPredicateMap& pred_map) {
+  if (expr->isA<kir::BlockSync>()) {
+    return true;
+  }
+
   if (!isTvOp(expr)) {
     return false;
   }
@@ -566,8 +574,7 @@ class ReplaceExprInput : private kir::ExprMutator {
       auto replacement = IrBuilder::create<UnaryOp>(
           node->getUnaryOpType(),
           node->out(),
-          replaced_inputs.value().at(node->in()),
-          node->getRNGOffset());
+          replaced_inputs.value().at(node->in()));
       registerReplaceWithPredicate(node, replacement);
     }
   }
@@ -595,6 +602,11 @@ class ReplaceExprInput : private kir::ExprMutator {
           replaced_inputs.value().at(node->in3()));
       registerReplaceWithPredicate(node, replacement);
     }
+  }
+
+  void handle(RNGOp* node) final {
+    // RNGOp has no input
+    return;
   }
 
   void handle(ReductionOp* node) final {

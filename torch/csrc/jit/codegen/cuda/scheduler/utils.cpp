@@ -135,6 +135,64 @@ size_t merge_3d(
   }
 }
 
+void splitDims(
+    TensorView* tv,
+    std::vector<std::pair<size_t, size_t>> to_split, // (dim, size)
+    std::vector<size_t>& to_update) {
+  std::stable_sort(
+      to_split.begin(),
+      to_split.end(),
+      [](const std::pair<size_t, size_t>& p1,
+         const std::pair<size_t, size_t>& p2) { return p1.first < p2.first; });
+  size_t dim_offset = 0;
+  size_t pending_dim_offset = 0;
+  int64_t prev_dim = -1;
+  for (auto entry : to_split) {
+    size_t dim = entry.first;
+    size_t size = entry.second;
+    if (dim != prev_dim) {
+      dim_offset += pending_dim_offset;
+      pending_dim_offset = 0;
+    }
+    size_t actual_dim = dim_offset + dim;
+    tv->split(actual_dim, size);
+    pending_dim_offset++;
+    for (auto& i : to_update) {
+      if (i > actual_dim) {
+        i++;
+      }
+    }
+    prev_dim = dim;
+  }
+}
+
+c10::optional<size_t> mergeDims(
+    TensorView* tv,
+    std::vector<size_t> to_merge,
+    std::vector<size_t>& to_update) {
+  if (to_merge.empty()) {
+    return c10::nullopt;
+  }
+  if (to_merge.size() == 1) {
+    return to_merge[0];
+  }
+  std::sort(to_merge.begin(), to_merge.end());
+  size_t left = to_merge[0];
+  int64_t offset = 0;
+  for (auto right = to_merge.begin() + 1; right != to_merge.end(); right++) {
+    auto actual_right = offset-- + *right;
+    tv->merge(left, actual_right);
+    for (auto& i : to_update) {
+      if (i == actual_right) {
+        i = left;
+      } else if (i > actual_right) {
+        i--;
+      }
+    }
+  }
+  return left;
+}
+
 size_t mergeReduction(
     TensorView* tv,
     const std::unordered_set<IterDomain*>& dont_merge) {
@@ -1332,17 +1390,19 @@ std::vector<TensorView*> getInputsOutputsWithInnerDim(
 
   std::vector<TensorView*> vectorizable_tensors;
 
-  for (auto input_tv :
-       ir_utils::filterByType<TensorView>(reference_tv->fusion()->inputs())) {
-    if (hasInnerDim(input_tv, vectorizable_dims, vectorize_pass)) {
-      vectorizable_tensors.push_back(input_tv);
-    }
-  }
-
+  // We put outputs in front of inputs because this would make the transpose
+  // scheduler prefer to use output instead of input as reference tensor.
   for (auto output_tv :
        ir_utils::filterByType<TensorView>(reference_tv->fusion()->outputs())) {
     if (hasInnerDim(output_tv, vectorizable_dims, vectorize_pass)) {
       vectorizable_tensors.push_back(output_tv);
+    }
+  }
+
+  for (auto input_tv :
+       ir_utils::filterByType<TensorView>(reference_tv->fusion()->inputs())) {
+    if (hasInnerDim(input_tv, vectorizable_dims, vectorize_pass)) {
+      vectorizable_tensors.push_back(input_tv);
     }
   }
 
@@ -1786,7 +1846,7 @@ TORCH_CUDA_CU_API void orderTiledConcreteIdAsRoot(TensorView* tv) {
   //  neither an inner tile nor reduction/broadcast is found, and would
   //  not re-order any iterdomain beyond that point to keep the
   //  outer loop structure unchanged.
-  for (auto i = ndims - 1; i >= 0; i--) {
+  for (int64_t i = static_cast<int64_t>(ndims) - 1; i >= 0; i--) {
     auto leaf_id = tv->axis(i);
     if (leaf_id->isBroadcast() || leaf_id->isReduction()) {
       // Register this reduction or broadcast axis

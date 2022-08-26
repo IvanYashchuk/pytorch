@@ -85,9 +85,11 @@ class TORCH_CUDA_CU_API IrPrinter : public OptInConstDispatch {
   void handle(const UnaryOp*) final;
   void handle(const BinaryOp*) final;
   void handle(const TernaryOp*) final;
+  void handle(const RNGOp*) final;
   void handle(const ReductionOp*) final;
   void handle(const GroupedReductionOp*) final;
   void handle(const WelfordOp*) final;
+  void handle(const GroupedWelfordOp*) final;
   void handle(const LoadStoreOp*) final;
   void handle(const MmaOp*) final;
   void handle(const BroadcastOp*) final;
@@ -106,6 +108,7 @@ class TORCH_CUDA_CU_API IrPrinter : public OptInConstDispatch {
   void handle(const kir::GridReduction*) final;
   void handle(const kir::GroupedGridReduction*) final;
   void handle(const kir::GridWelford*) final;
+  void handle(const kir::GroupedGridWelford*) final;
   void handle(const kir::ForLoop*) final;
   void handle(const kir::IfThenElse*) final;
   void handle(const kir::Allocate*) final;
