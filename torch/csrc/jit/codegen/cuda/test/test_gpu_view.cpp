@@ -1840,9 +1840,56 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule4_CUDA) {
       &fusion, cg_outputs, {t0, t3, t4}, {t2, t6, t7}, __LINE__, __FILE__);
 }
 
+
 // Make sure different views that are consumed by the reference are segmented
 // into a single kernel.
-TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
+TEST_F(NVFuserTest, FusionViewSchedule5_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int w = 15, x = 31, y = 49, z = 65;
+
+  auto tv0 = makeConcreteTensor({w, x, y * z});
+  fusion.addInput(tv0);
+  auto tv1 = sin(tv0);
+  auto tv2 = view(tv1, {w, x, y * z}, {z, y, x, w});
+
+  auto tv3 = makeConcreteTensor({w, x * y, z});
+  fusion.addInput(tv3);
+  auto tv4 = cos(tv3);
+  auto tv5 = view(tv4, {w, x * y, z}, {z, y, x, w});
+
+  auto tv6 = add(tv2, tv5);
+  fusion.addOutput(tv6);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  at::Tensor t0 = at::randn({w, x, y * z}, options);
+  auto t1 = sin(t0);
+  auto t2 = at::native::view(t1, {z, y, x, w});
+  at::Tensor t3 = at::randn({w, x * y, z}, options);
+  auto t4 = cos(t3);
+  auto t5 = at::native::view(t4, {z, y, x, w});
+  auto t6 = add(t2, t5);
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  // Collect the heuristic params
+  executor_cache.profile(true);
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t3});
+
+  // TODO: Fix ref handling int pointwise scheduler to accept this program as
+  // one segment.
+  // TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  TORCH_CHECK(executor_cache.getMostRecentExecutorInfo()
+                  .params->isA<PointwiseParams>());
+
+  testValidate(&fusion, cg_outputs, {t0, t3}, {t6}, __LINE__, __FILE__);
+}
+
+// Make sure different views that are consumed by the reference are segmented
+// into a single kernel.
+TEST_F(NVFuserTest, FusionViewMapping_CUDA) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();
   FusionGuard fg(&fusion);
@@ -1871,6 +1918,15 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
   tv6->axis(1)->parallelize(ParallelType::Unroll);
   tv6->axis(2)->parallelize(ParallelType::TIDx);
 
+  TransformPropagator propagator(tv6);
+  MaxRootDomainInfoSpanningTree spanning_tree(tv6);
+  spanning_tree.traverse(&propagator);
+  scheduler_utils::parallelizeAllLike(tv6);
+
+  // Inline the schedule
+  InlinePropagator inline_propagator(tv6, -1, ComputeAtMode::MostInlined);
+  spanning_tree.traverse(&inline_propagator);
+
   auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
 
   at::Tensor t0 = at::randn({w, x, y * z}, options);
@@ -1881,16 +1937,9 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
   auto t5 = at::native::view(t4, {z, y, x, w});
   auto t6 = add(t2, t5);
 
-  FusionExecutorCache executor_cache(std::move(fusion_ptr));
-  // Collect the heuristic params
-  executor_cache.profile(true);
-  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t3});
-
-  // TODO: Fix ref handling int pointwise scheduler to accept this program as
-  // one segment.
-  // TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
-  TORCH_CHECK(executor_cache.getMostRecentExecutorInfo()
-                  .params->isA<PointwiseParams>());
+  FusionExecutor fe;
+  fe.compileFusion(&fusion, {t0, t3});
+  auto cg_outputs = fe.runFusion({t0, t3});
 
   testValidate(&fusion, cg_outputs, {t0, t3}, {t6}, __LINE__, __FILE__);
 }
