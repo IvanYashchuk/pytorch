@@ -53,6 +53,13 @@ namespace cuda {
 // IdMappingMode::EXACT
 //   Don't map any broadcast axes to non-broadcast axes
 //   Do not forward through any broadcast IDs
+// IdMappingMode::AlmostExact
+//   Forward through broadcast axes, but not through to a non-broadcast axis
+//     i.e. id{b1*i0}, id{i0} are mapped
+//          id{i1*i0}, id{i0} are not mapped (this part is the difference from
+//          PERMISSIVE)
+//   Forward through split one axes, i.e. id{ceilDiv(i0, 1)}, id{i0} are mapped
+//
 class TORCH_CUDA_CU_API IterDomainGraph {
  public:
   IterDomainGraph(Fusion* fusion, bool allow_self_mapping = false);
@@ -62,6 +69,9 @@ class TORCH_CUDA_CU_API IterDomainGraph {
   }
   const DisjointSets<IterDomain*>& exactNodes() const {
     return exact_nodes_;
+  }
+  const DisjointSets<IterDomain*>& almostExactNodes() const {
+    return almost_exact_nodes_;
   }
   const DisjointSets<IterDomain*>& loopNodes() const {
     return loop_nodes_;
@@ -114,6 +124,7 @@ class TORCH_CUDA_CU_API IterDomainGraph {
 
   DisjointSets<IterDomain*> permissive_nodes_;
   DisjointSets<IterDomain*> exact_nodes_;
+  DisjointSets<IterDomain*> almost_exact_nodes_;
   DisjointSets<IterDomain*> loop_nodes_;
 
   // Consumers and producers is not symmetric like the other sets

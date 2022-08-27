@@ -134,7 +134,7 @@ struct ProducerConsumerIndexingInfoCache {
                 ca_map.getConcreteMappedID(
                     consumer_leaf_id, IdMappingMode::LOOP),
                 consumer_leaf_id,
-                IdMappingMode::EXACT);
+                IdMappingMode::ALMOSTEXACT);
           });
       consumer_only_permissive_leaf_ids_ =
           std::move(consumer_only_permissive_leaf_ids);

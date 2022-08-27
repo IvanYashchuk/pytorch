@@ -34,7 +34,7 @@ bool idIsALeafDomain(IterDomain* id, TensorView* tv) {
 IterDomainGraph::IterDomainGraph(Fusion* fusion, bool allow_self_mapping) {
   build(fusion);
 
-  if (!allow_self_mapping) {
+  if (false && !allow_self_mapping) {
     TORCH_INTERNAL_ASSERT(
         !hasSelfMapping(),
         "Unsupported domain mapping detected in ",
@@ -657,6 +657,38 @@ void IterDomainGraph::build(Fusion* fusion) {
       }
     }
   }
+  
+  // Build almost exact map by forwarding through broadcast axes
+  almost_exact_nodes_ = exact_nodes_;
+  std::unordered_set<Expr*> visited;
+  auto all_elements = exact_nodes_.getAllElements();
+  for(auto entry : all_elements.vector()){
+    if(entry->definition() == nullptr){
+      continue;
+    }
+    auto def = entry->definition();
+    if(!visited.emplace(def).second){
+      continue;
+    }
+    if(auto merge = dynamic_cast<Merge*>(def)) {
+      if(merge->inner()->extent()->isOneInt()){
+        almost_exact_nodes_.mapEntries(merge->outer(), merge->out());
+      }
+      if(merge->outer()->extent()->isOneInt()){
+        almost_exact_nodes_.mapEntries(merge->inner(), merge->out());
+      }
+    } else if(auto split = dynamic_cast<Split*>(def)) {
+      if (split->factor()->isOneInt() && split->startOffset()->isZeroInt() &&
+          split->stopOffset()->isZeroInt()) {
+        if (split->innerSplit()) {
+          almost_exact_nodes_.mapEntries(split->in(), split->outer());
+        } else {
+          almost_exact_nodes_.mapEntries(split->in(), split->inner());
+        }
+      }
+    }
+  }
+
   self_mapping_info_ = findFirstSelfMapping(fusion, *this);
 }
 
@@ -1089,6 +1121,17 @@ void ComputeAtMap::buildConcreteIds() {
     concrete_id_cache_[disjoint_set_shared_ptr] = concrete_id;
   }
 
+  // Same as exact computation
+  for (const auto& disjoint_set_shared_ptr :
+       id_graph_.almostExactNodes().disjointSets()) {
+    TORCH_INTERNAL_ASSERT(
+        disjoint_set_shared_ptr->vector().size(),
+        "Cannot compute concrete id of empty set.");
+    auto first_id = disjoint_set_shared_ptr->vector().front();
+    auto concrete_id = computeConcreteId(first_id, IdMappingMode::ALMOSTEXACT);
+    concrete_id_cache_[disjoint_set_shared_ptr] = concrete_id;
+  }
+
   for (const auto& disjoint_set_shared_ptr :
        id_graph_.loopNodes().disjointSets()) {
     TORCH_INTERNAL_ASSERT(
@@ -1275,10 +1318,12 @@ std::string idGraphNodesToString(
 std::string ComputeAtMap::toString() const {
   std::stringstream ss;
   ss << "Compute at map { \n";
+  ss << "Exact map:\n" << idGraphNodesToString(*this, IdMappingMode::EXACT);
+  ss << "Almost Exact map:\n"
+     << idGraphNodesToString(*this, IdMappingMode::ALMOSTEXACT);
+  ss << "Loop map:\n" << idGraphNodesToString(*this, IdMappingMode::LOOP);
   ss << "Permissive map:\n"
      << idGraphNodesToString(*this, IdMappingMode::PERMISSIVE);
-  ss << "Exact map:\n" << idGraphNodesToString(*this, IdMappingMode::EXACT);
-  ss << "Loop map:\n" << idGraphNodesToString(*this, IdMappingMode::LOOP);
   ss << "Consumer maps:\n";
   for (auto entry : id_graph_.consumers()) {
     ss << "  " << entry.first->toString() << " :: " << entry.second.toString()
@@ -1328,12 +1373,14 @@ const std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>& ComputeAtMap::
 const DisjointSets<IterDomain*>& ComputeAtMap::getIdSets(
     IdMappingMode mode) const {
   switch (mode) {
-    case IdMappingMode::PERMISSIVE:
-      return id_graph_.permissiveNodes();
     case IdMappingMode::EXACT:
       return id_graph_.exactNodes();
+    case IdMappingMode::ALMOSTEXACT:
+      return id_graph_.almostExactNodes();
     case IdMappingMode::LOOP:
       return id_graph_.loopNodes();
+    case IdMappingMode::PERMISSIVE:
+      return id_graph_.permissiveNodes();
   }
   TORCH_INTERNAL_ASSERT(false, "Error with mapping mode provided.");
 }
