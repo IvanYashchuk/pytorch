@@ -1840,10 +1840,9 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule4_CUDA) {
       &fusion, cg_outputs, {t0, t3, t4}, {t2, t6, t7}, __LINE__, __FILE__);
 }
 
-
 // Make sure different views that are consumed by the reference are segmented
 // into a single kernel.
-TEST_F(NVFuserTest, FusionViewSchedule5_CUDA) {
+TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();
   FusionGuard fg(&fusion);

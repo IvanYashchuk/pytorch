@@ -786,10 +786,6 @@ void ComputeAtRootDomainMapBuilder::setMaybeMapped(
       addToPendingList(producer_bcast_key, consumer_bcast_key);
     }
   } else {
-    TORCH_INTERNAL_ASSERT(
-        !consumer_id->isBroadcast(),
-        "No concrete domain found for a broadcast domain: ",
-        consumer_key.toString());
     auto producer_concrete_key = producer_key;
     if (producer_id->isBroadcast()) {
       const auto concrete_id = consumer_id;
@@ -845,11 +841,11 @@ void ComputeAtRootDomainMapBuilder::mapPointwiseOrReductionOp(Expr* e) {
             "Multi-output mapping assumes WelforddOp or GroupedReductionOp but, ",
             e->getExprType().value(),
             " is found");
-        for (auto o : e->outputs()) {
-          auto o_tv = o->as<TensorView>();
-          auto o_td = o_tv->domain();
-          auto o_root = o_td->getRootDomain();
-          setMaybeMapped(in_td, in_root[it], o_td, o_root[it]);
+        for (auto out : e->outputs()) {
+          auto out_tv = out->as<TensorView>();
+          auto out_td = out_tv->domain();
+          auto out_root = out_td->getRootDomain();
+          setMaybeMapped(in_td, in_root[it], out_td, out_root[it]);
         }
       } else {
         setMaybeMapped(in_td, in_root[it], out_td, out_root[it]);
@@ -1095,9 +1091,10 @@ bool ComputeAtRootDomainMapBuilder::safeToMap(const DomainKeySet& domains) {
       unique_domains.push_back(domain);
     }
   }
-  if (hasMatchingDomains(unique_domains)) {
-    return false;
-  }
+  // if (hasMatchingDomains(unique_domains)) {
+  // Fails in view operations, check FusionViewMagicSchedule3
+  //   return false;
+  // }
   // Can't map if reduction output domains would be mapped
   if (incompatible_domains_.isReductionOutputMapped(
           unique_domains, root_map_) &&

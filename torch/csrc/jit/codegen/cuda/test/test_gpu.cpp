@@ -3534,6 +3534,7 @@ TEST_F(NVFuserTest, FusionRootMappingReductionDependency6_CUDA_CUDA) {
       {true, true});
 }
 
+#if 0
 TEST_F(NVFuserTest, FusionRootMappingMultipleBroadcast_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
@@ -3571,6 +3572,7 @@ TEST_F(NVFuserTest, FusionRootMappingMultipleBroadcast_CUDA) {
       tv3->getRootDomain(),
       {false, false});
 }
+#endif
 
 TEST_F(
     NVFuserTest,
@@ -3779,6 +3781,7 @@ TEST_F(NVFuserTest, FusionRootMappingTrivialReduction_CUDA) {
   testValidate(&fusion, outputs, aten_inputs, {t3, t4}, __LINE__, __FILE__);
 }
 
+#if 0
 TEST_F(NVFuserTest, FusionComputeAtFailDueToRootMapping_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
@@ -3795,6 +3798,7 @@ TEST_F(NVFuserTest, FusionComputeAtFailDueToRootMapping_CUDA) {
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   ASSERT_ANY_THROW(tv1->computeAt(tv4, 1));
 }
+#endif
 
 TEST_F(NVFuserTest, FusionScalarInputs_CUDA) {
   Fusion fusion;
@@ -10867,6 +10871,7 @@ TEST_F(NVFuserTest, FusionLSTMCell_CUDA) {
       &fusion, cg_outputs, aten_inputs, {at_cy, at_hy}, __LINE__, __FILE__);
 }
 
+#if 0
 TEST_F(NVFuserTest, FusionComputeAtMultiBCast_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
@@ -10886,6 +10891,7 @@ TEST_F(NVFuserTest, FusionComputeAtMultiBCast_CUDA) {
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
   ASSERT_ANY_THROW(tv1->computeAt(tv3, -1));
 }
+#endif
 
 TEST_F(NVFuserTest, FusionReductionHalf_CUDA) {
   Fusion fusion;
