@@ -55,7 +55,7 @@ namespace cuda {
  * i2. This is because when we map [i0, i1 | i2] to [BIDy, TIDy| BIDx, TIDx]
  * BIDx, and TIDx will access the same elements of T1, and TIDy will likely
  * access the same elements of T0 (as long as i1 > BDIMy). Even if i1 on the
- * order of BDIMy we'll only use two unique elemen*ts per increment of BIDx or
+ * order of BDIMy we'll only use two unique elements per increment of BIDx or
  * TIDx. This means we'll still reuse many of the same values and limit the
  * amount we need to reread values in T0 and T1.
  *
