@@ -102,7 +102,7 @@ namespace cuda {
  * T0[i0, i1, b2] float
  * T1[i0, b1, i2] half
  * T2[i0, b1, i2] = cast(T1, float)
- * T4[i0, i1, i2] float = T0 + T1
+ * T4[i0, i1, i2] float = T0 + T2
  * With values of 10, 100, 1000 as [i0, i1, i2]
  * Our break point analysis for positions 0, 1, 2, 3 will be:
  *
