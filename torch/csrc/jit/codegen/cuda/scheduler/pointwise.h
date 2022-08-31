@@ -55,7 +55,7 @@ namespace cuda {
  * i2. This is because when we map [i0, i1 | i2] to [BIDy, TIDy| BIDx, TIDx]
  * BIDx, and TIDx will access the same elements of T1, and TIDy will likely
  * access the same elements of T0 (as long as i1 > BDIMy). Even if i1 on the
- * order of BDIMy we'll only use two unique elemen*ts per increment of BIDx or
+ * order of BDIMy we'll only use two unique elements per increment of BIDx or
  * TIDx. This means we'll still reuse many of the same values and limit the
  * amount we need to reread values in T0 and T1.
  *
@@ -102,7 +102,7 @@ namespace cuda {
  * T0[i0, i1, b2] float
  * T1[i0, b1, i2] half
  * T2[i0, b1, i2] = cast(T1, float)
- * T4[i0, i1, i2] float = T0 + T1
+ * T4[i0, i1, i2] float = T0 + T2
  * With values of 10, 100, 1000 as [i0, i1, i2]
  * Our break point analysis for positions 0, 1, 2, 3 will be:
  *
