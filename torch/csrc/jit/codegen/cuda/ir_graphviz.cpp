@@ -407,6 +407,26 @@ void IrGraphGenerator::handle(const TensorView* tv) {
   tensor_views_.push_back(tv);
 }
 
+void IrGraphGenerator::handle(const FullOp* fop) {
+  // node
+  printExpr(fop, "full");
+
+  // inputs & outputs
+  addArc(fop->getFillValue(), fop);
+  addArc(fop, fop->output(0));
+}
+
+void IrGraphGenerator::handle(const ARangeOp* aop) {
+  // node
+  printExpr(aop, "arange");
+
+  // inputs & outputs
+  addArc(aop->start(), aop);
+  addArc(aop->end(), aop);
+  addArc(aop->step(), aop);
+  addArc(aop, aop->output(0));
+}
+
 void IrGraphGenerator::handle(const UnaryOp* uop) {
   // node
   std::stringstream label;

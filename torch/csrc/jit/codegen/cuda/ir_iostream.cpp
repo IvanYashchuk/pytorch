@@ -248,6 +248,60 @@ void IrPrinter::handle(const NamedScalar* ns) {
   os_ << ns->name();
 }
 
+void IrPrinter::handle(const FullOp* fop) {
+  if (!print_inline_) {
+    indent();
+    os_ << fop->output(0) << "\n";
+    indent_size_++;
+    indent();
+    os_ << " = ";
+  } else {
+    checkInlineable(fop);
+  }
+
+  os_ << "full({";
+  for (auto i : c10::irange(fop->inputs().size())) {
+    if (i == fop->inputs().size() - 1) {
+      os_ << "}";
+    }
+    if (i >= 0) {
+      os_ << ", ";
+    }
+    handle(fop->input(i));
+  }
+  os_ << ", " << fop->dtype() << ")";
+
+  indent_size_--;
+
+  if (!print_inline_)
+    os_ << ";\n";
+}
+
+void IrPrinter::handle(const ARangeOp* aop) {
+  if (!print_inline_) {
+    indent() << aop->output(0);
+    os_ << "\n";
+    indent_size_++;
+    indent();
+    os_ << " = ";
+  } else {
+    checkInlineable(aop);
+  }
+
+  os_ << "arange(";
+  handle(aop->start());
+  os_ << ", ";
+  handle(aop->end());
+  os_ << ", ";
+  handle(aop->step());
+  os_ << ", " << aop->dtype() << ")";
+
+  indent_size_--;
+
+  if (!print_inline_)
+    os_ << ";\n";
+}
+
 void IrPrinter::handle(const UnaryOp* uop) {
   bool istvop = ir_utils::isTvOp(uop);
   if (!print_inline_) {
@@ -394,30 +448,32 @@ void IrPrinter::handle(const TernaryOp* top) {
 }
 
 void IrPrinter::handle(const RNGOp* rop) {
-  bool istvop = ir_utils::isTvOp(rop);
   if (!print_inline_) {
     indent();
-    os_ << rop->output(0);
-
-    // tensor operations tend to be long, break them up into multiple lines
-    if (istvop) {
-      os_ << "\n";
-      indent_size_++;
-      indent();
-    }
-
+    os_ << rop->output(0) << "\n";
+    indent_size_++;
+    indent();
     os_ << " = ";
   } else {
     checkInlineable(rop);
   }
 
-  os_ << rop->getRNGOpType() << "()";
+  os_ << rop->getRNGOpType() << "({";
+  bool first = true;
+  for (auto i : rop->inputs()) {
+    if (!first) {
+      os_ << ", ";
+    }
+    handle(i);
+    first = false;
+  }
+  os_ << "}, " << rop->dtype() << ")";
 
-  if (istvop)
-    indent_size_--;
+  indent_size_--;
 
-  if (!print_inline_)
+  if (!print_inline_) {
     os_ << ";\n";
+  }
 }
 
 void IrPrinter::handle(const ReductionOp* rop) {

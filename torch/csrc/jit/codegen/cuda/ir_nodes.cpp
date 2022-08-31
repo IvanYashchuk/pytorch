@@ -182,6 +182,96 @@ bool ComplexDouble::sameAs(const Statement* other) const {
   return false;
 }
 
+FullOp::FullOp(
+    IrBuilderPasskey passkey,
+    Val* out,
+    Val* fill_value,
+    DataType dtype)
+    : Expr(passkey, ExprType::FullOp), dtype_(dtype), fill_value_(fill_value) {
+  if (out->isA<TensorView>()) {
+    addInput(out->as<TensorView>()->getRootDomain()[0]->extent());
+  }
+  addInput(fill_value);
+  addOutput(out);
+}
+
+FullOp::FullOp(const FullOp* src, IrCloner* ir_cloner)
+    : Expr(src, ir_cloner),
+      dtype_(src->dtype()),
+      fill_value_(ir_cloner->clone(src->fill_value_)) {}
+
+bool FullOp::sameAs(const Statement* other) const {
+  if (this == other) {
+    return true;
+  }
+  if (!other->isA<FullOp>()) {
+    return false;
+  }
+  const auto other_op = other->as<FullOp>();
+  if (dtype_ != other_op->dtype_) {
+    return false;
+  }
+  return Expr::sameAs(other);
+}
+
+ARangeOp::ARangeOp(
+    IrBuilderPasskey passkey,
+    Val* out,
+    Val* start,
+    Val* end,
+    Val* step,
+    DataType dtype,
+    Val* linear_index)
+    : Expr(passkey, ExprType::ARangeOp),
+      dtype_(dtype),
+      start_(start),
+      end_(end),
+      step_(step),
+      linear_index_(linear_index) {
+  addInput(start);
+  addInput(end);
+  addInput(step);
+  addOutput(out);
+}
+
+ARangeOp::ARangeOp(const ARangeOp* src, IrCloner* ir_cloner)
+    : Expr(src, ir_cloner),
+      dtype_(src->dtype()),
+      start_(ir_cloner->clone(src->start_)),
+      end_(ir_cloner->clone(src->end_)),
+      step_(ir_cloner->clone(src->step_)),
+      linear_index_(ir_cloner->clone(src->linear_index_)) {}
+
+bool ARangeOp::sameAs(const Statement* other) const {
+  if (this == other) {
+    return true;
+  }
+  if (!other->isA<ARangeOp>()) {
+    return false;
+  }
+  const auto other_op = other->as<ARangeOp>();
+  if (dtype_ != other_op->dtype_) {
+    return false;
+  }
+  if (!start_->sameAs(other_op->start_)) {
+    return false;
+  }
+  if (!end_->sameAs(other_op->end_)) {
+    return false;
+  }
+  if (!step_->sameAs(other_op->step_)) {
+    return false;
+  }
+  if ((linear_index_ == nullptr) != (other_op->linear_index_ == nullptr)) {
+    return false;
+  }
+  if ((linear_index_ != nullptr) &&
+      !linear_index_->sameAs(other_op->linear_index_)) {
+    return false;
+  }
+  return Expr::sameAs(other);
+}
+
 UnaryOp::UnaryOp(
     IrBuilderPasskey passkey,
     UnaryOpType type,
@@ -295,19 +385,28 @@ RNGOp::RNGOp(
     IrBuilderPasskey passkey,
     RNGOpType type,
     Val* out,
+    DataType dtype,
     int rng_offset,
     Val* philox_index)
     : Expr(passkey, ExprType::RNGOp),
       rng_op_type_(type),
+      dtype_(dtype),
       rng_offset_(rng_offset),
       philox_index_(philox_index) {
+  if (out->isA<TensorView>()) {
+    for (auto id : out->as<TensorView>()->getRootDomain()) {
+      addInput(id->extent());
+    }
+  }
   addOutput(out);
 }
 
 RNGOp::RNGOp(const RNGOp* src, IrCloner* ir_cloner)
     : Expr(src, ir_cloner),
       rng_op_type_(src->rng_op_type_),
-      rng_offset_(src->rng_offset_) {}
+      dtype_(src->dtype()),
+      rng_offset_(src->rng_offset_),
+      philox_index_(ir_cloner->clone(src->philox_index_)) {}
 
 bool RNGOp::sameAs(const Statement* other) const {
   if (this == other) {
@@ -318,6 +417,9 @@ bool RNGOp::sameAs(const Statement* other) const {
   }
   const auto other_op = other->as<RNGOp>();
   if (getRNGOpType() != other_op->getRNGOpType()) {
+    return false;
+  }
+  if (dtype_ != other_op->dtype_) {
     return false;
   }
   if (getRNGOffset() != other_op->getRNGOffset()) {
@@ -1434,13 +1536,17 @@ IterDomain* IterDomain::merge(IterDomain* outer, IterDomain* inner) {
       "Merging IterDomains with ending values that are 0 is not supported at this time.");
   TORCH_CHECK(
       outer->isReduction() == inner->isReduction() ||
-          (!outer->isReduction() && inner->extent()->isOneInt()) ||
-          (outer->extent()->isOneInt() && !inner->isReduction()),
+          (!outer->isReduction() && inner->isTrivialReduction()) ||
+          (outer->isTrivialReduction() && !inner->isReduction()),
       "Merging IterDomains requires that their iteration types match.");
   TORCH_CHECK(
       (outer->isGather() && inner->isGather()) ||
           (!outer->isGather() && !inner->isGather()),
       "Merging gather and non-gather domains is not supported.");
+
+  TORCH_CHECK(
+      !outer->isStride() && !inner->isStride(),
+      "No support for merging stride domains");
 
   Val* merged_id_size = mul(outer->extent(), inner->extent());
 
@@ -1448,8 +1554,27 @@ IterDomain* IterDomain::merge(IterDomain* outer, IterDomain* inner) {
 
   if (outer->isBroadcast() && inner->isBroadcast()) {
     itype = IterType::Broadcast;
-  } else if (outer->isBroadcast() || inner->isBroadcast()) {
+  }
+
+  if ((outer->isBroadcast() || inner->isBroadcast()) &&
+      (outer->getIterType() == IterType::Iteration ||
+       inner->getIterType() == IterType::Iteration)) {
     itype = IterType::Iteration;
+  }
+
+  // Merging trivial reduction with iter domain, that's fine, just make it an
+  // iter domain.
+  if ((outer->isTrivialReduction() || inner->isTrivialReduction()) &&
+      (outer->getIterType() == IterType::Iteration ||
+       inner->getIterType() == IterType::Iteration)) {
+    itype = IterType::Iteration;
+  }
+
+  // Merging trivial reduction with broadcasting, that's fine, just make it a
+  // broadcasting.
+  if ((outer->isTrivialReduction() || inner->isTrivialReduction()) &&
+      (outer->isBroadcast() || inner->isBroadcast())) {
+    itype = IterType::Broadcast;
   }
 
   Val* expanded_extent = nullptr;
@@ -1469,13 +1594,6 @@ IterDomain* IterDomain::merge(IterDomain* outer, IterDomain* inner) {
         expanded_extent = mul(outer->extent(), inner->expandedExtent());
       }
     }
-  }
-
-  // Merging trivial reduction with iter domain, that's fine, just make it an
-  // iter domain.
-  if ((outer->isReduction() || inner->isReduction()) &&
-      (!outer->isReduction() || !inner->isReduction())) {
-    itype = IterType::Iteration;
   }
 
   IterDomain* merged_id =

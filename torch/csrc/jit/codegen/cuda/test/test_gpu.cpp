@@ -3534,46 +3534,6 @@ TEST_F(NVFuserTest, FusionRootMappingReductionDependency6_CUDA_CUDA) {
       {true, true});
 }
 
-#if 0
-TEST_F(NVFuserTest, FusionRootMappingMultipleBroadcast_CUDA) {
-  Fusion fusion;
-  FusionGuard fg(&fusion);
-
-  TensorView* tv0 = makeSymbolicTensor(1);
-  auto tv1 = broadcast(tv0, {false, true});
-  auto tv2 = broadcast(tv0, {true, false});
-  auto tv3 = add(tv1, tv2);
-  fusion.addOutput(tv3);
-
-  // tv0 cannot be mapped with the consumers as it would mean its only
-  // domain would be mapped to both the first and second domains of
-  // the two consumers, thus computing tv0 at both corresponding loops.
-  checkIdMapped(
-      tv0,
-      tv0->getRootDomain(),
-      {false},
-      tv1,
-      tv1->getRootDomain(),
-      {false, false});
-  checkIdMapped(
-      tv0,
-      tv0->getRootDomain(),
-      {false},
-      tv2,
-      tv2->getRootDomain(),
-      {false, false});
-  checkIdMapped(tv1, tv1->getRootDomain(), tv3, tv3->getRootDomain());
-  checkIdMapped(tv2, tv2->getRootDomain(), tv3, tv3->getRootDomain());
-  checkIdMapped(
-      tv0,
-      tv0->getRootDomain(),
-      {false},
-      tv3,
-      tv3->getRootDomain(),
-      {false, false});
-}
-#endif
-
 TEST_F(
     NVFuserTest,
     FusionRootMappingMultipleBroadcastWithNoCommonConsumer_CUDA) {
@@ -3781,24 +3741,31 @@ TEST_F(NVFuserTest, FusionRootMappingTrivialReduction_CUDA) {
   testValidate(&fusion, outputs, aten_inputs, {t3, t4}, __LINE__, __FILE__);
 }
 
-#if 0
-TEST_F(NVFuserTest, FusionComputeAtFailDueToRootMapping_CUDA) {
+TEST_F(NVFuserTest, FusionDetectSelfMappedDomains_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
   auto tv0 = makeSymbolicTensor(1);
   fusion.addInput(tv0);
+  // [I1]
   auto tv1 = add(tv0, IrBuilder::create<Double>(1));
+  // [B2, I2]
   auto tv2 = broadcast(tv1, {true, false});
+  // [I3, B3]
   auto tv3 = broadcast(tv1, {false, true});
+  // [I4, I5]
   auto tv4 = add(tv2, tv3);
   fusion.addOutput(tv4);
 
-  // computeAt should fail as there is no valid root mapping.
+  // IterDomainGraph maps B2, I3 and I4 together, and similarly I2,
+  // B3 and I5. The problem is I1 is mapped with both of the ID
+  // groups, so eventually all of the IDs are mapped
+  // together. IterDomainGraph should throw an exception as this
+  // pattern of domain mappings is not supported.
+
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
-  ASSERT_ANY_THROW(tv1->computeAt(tv4, 1));
+  ASSERT_ANY_THROW({ IterDomainGraph id_graph(&fusion); });
 }
-#endif
 
 TEST_F(NVFuserTest, FusionScalarInputs_CUDA) {
   Fusion fusion;
@@ -10870,28 +10837,6 @@ TEST_F(NVFuserTest, FusionLSTMCell_CUDA) {
   testValidate(
       &fusion, cg_outputs, aten_inputs, {at_cy, at_hy}, __LINE__, __FILE__);
 }
-
-#if 0
-TEST_F(NVFuserTest, FusionComputeAtMultiBCast_CUDA) {
-  Fusion fusion;
-  FusionGuard fg(&fusion);
-
-  // Set up your input tensor views
-  TensorView* tv0 = makeSymbolicTensor(1);
-  fusion.addInput(tv0);
-
-  TensorView* tv1 = mul(tv0, IrBuilder::create<Double>(0.5));
-  TensorView* tv2 = broadcast(tv1, {true, false});
-  TensorView* tv3 = broadcast(tv1, {false, true});
-  TensorView* tv4 = add(tv2, tv3);
-  fusion.addOutput(tv4);
-
-  // Not possible to do computeAt at position -1 as recomputation
-  // would be required. An exception should be thrown.
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
-  ASSERT_ANY_THROW(tv1->computeAt(tv3, -1));
-}
-#endif
 
 TEST_F(NVFuserTest, FusionReductionHalf_CUDA) {
   Fusion fusion;
@@ -24878,7 +24823,7 @@ TEST_F(NVFuserTest, FusionInsertMagicZero1_CUDA) {
   tv2->reorder({{1, 2}, {2, 1}});
   tv2->merge(0);
 
-  TransformPropagator propagator(tv2);
+  TransformPropagatorWithCheck propagator(tv2);
   MaxRootDomainInfoSpanningTree(tv2).traverse(&propagator);
 
   tv0->computeAt(tv2, 1);
@@ -24998,7 +24943,7 @@ TEST_F(NVFuserTest, FusionExpandReduce2_CUDA) {
   // [iBIDx, iTIDx, rTIDy, rBIDy, rO]
   auto tv3 = tv2->rFactor({-1});
 
-  TransformPropagator propagator(tv3);
+  TransformPropagatorWithCheck propagator(tv3);
   MaxRootDomainInfoSpanningTree(tv3).traverse(&propagator);
   scheduler_utils::parallelizeAllLike(tv3);
   tv0->computeAt(tv3, -1, ComputeAtMode::MostInlined);
@@ -25772,6 +25717,77 @@ TEST_F(NVFuserTest, AsyncCompilation_CUDA) {
 
   testValidate(
       executor_cache.fusion(), outputs, aten_inputs, {t6}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionMergeBroadcastingTrivialReduction1_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = makeConcreteTensor({1, 1});
+  TensorView* tv1 = makeConcreteTensor({-1});
+  fusion->addInput(tv0);
+  fusion->addInput(tv1);
+  auto tv2 = sum(tv0, {1});
+  auto tv3 = add(tv2, tv1);
+  fusion->addOutput(tv3);
+
+  tv0->merge(0);
+
+  MaxRootDomainInfoSpanningTree tree(tv0);
+  TransformPropagatorWithCheck tp(tv0);
+  tree.traverse(&tp);
+
+  InlinePropagator ip(tv0, -1, ComputeAtMode::MostInlined);
+  tree.traverse(&ip);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({1, 1}, options);
+  at::Tensor t1 = at::randn({10}, options);
+
+  FusionExecutor fe;
+  fe.compileFusion(fusion, {t0, t1});
+  auto cg_outputs = fe.runFusion({t0, t1});
+  auto out = cg_outputs[0];
+
+  testValidate(
+      fusion, {out}, {t0, t1}, {t1 + t0.flatten()}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionMergeBroadcastingTrivialReduction2_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = makeConcreteTensor({-1, 1, 1});
+  TensorView* tv1 = makeConcreteTensor({-1, -1});
+  fusion->addInput(tv0);
+  fusion->addInput(tv1);
+  auto tv2 = sum(tv0, {1});
+  auto tv3 = add(tv2, tv1);
+  fusion->addOutput(tv3);
+
+  tv2->merge(1);
+  tv2->merge(0);
+
+  MaxRootDomainInfoSpanningTree tree(tv0);
+  TransformPropagatorWithCheck tp(tv0);
+  tree.traverse(&tp);
+
+  InlinePropagator ip(tv0, -1, ComputeAtMode::MostInlined);
+  tree.traverse(&ip);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({10, 1, 1}, options);
+  at::Tensor t1 = at::randn({10, 10}, options);
+
+  FusionExecutor fe;
+  fe.compileFusion(fusion, {t0, t1});
+  auto cg_outputs = fe.runFusion({t0, t1});
+  auto out = cg_outputs[0];
+
+  testValidate(
+      fusion, {out}, {t0, t1}, {t1 + t0.squeeze(-1)}, __LINE__, __FILE__);
 }
 
 } // namespace jit

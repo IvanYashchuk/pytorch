@@ -125,7 +125,36 @@ void OptOutMutator::mutate(kir::TensorIndex*) {
   TORCH_INTERNAL_ASSERT(false, "Not implemented yet.");
 }
 
-// MUTATE FUNCTIONS FOR EXPRESSIONS.
+void OptOutMutator::mutate(FullOp* fop) {
+  Val* out = maybeMutated(fop->output(0));
+  Val* fill_value = maybeMutated(fop->getFillValue());
+
+  if (out->sameAs(fop->output(0))) {
+    return;
+  }
+  auto container = fop->container();
+  container->removeExpr(fop);
+  IrBuilder::create<FullOp>(container, out, fill_value, fop->dtype());
+}
+
+void OptOutMutator::mutate(ARangeOp* aop) {
+  Val* out = maybeMutated(aop->output(0));
+
+  if (out->sameAs(aop->output(0))) {
+    return;
+  }
+  auto container = aop->container();
+  container->removeExpr(aop);
+  IrBuilder::create<ARangeOp>(
+      container,
+      out,
+      aop->start(),
+      aop->end(),
+      aop->step(),
+      aop->dtype(),
+      aop->getLinearIndex());
+}
+
 void OptOutMutator::mutate(UnaryOp* uop) {
   Val* out = maybeMutated(uop->out());
   Val* in = maybeMutated(uop->in());
@@ -182,7 +211,12 @@ void OptOutMutator::mutate(RNGOp* rop) {
   auto rop_type = rop->getRNGOpType();
   container->removeExpr(rop);
   IrBuilder::create<RNGOp>(
-      container, rop_type, out, rop->getRNGOffset(), rop->getPhiloxIndex());
+      container,
+      rop_type,
+      out,
+      rop->dtype(),
+      rop->getRNGOffset(),
+      rop->getPhiloxIndex());
 }
 
 void OptOutMutator::mutate(ReductionOp* rop) {

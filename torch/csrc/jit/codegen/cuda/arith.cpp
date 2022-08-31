@@ -362,19 +362,6 @@ Val* getMaximumValue(DataType v) {
 
 } // namespace
 
-// TENSOR FACTORIES
-TensorView* rand(const std::vector<Val*>& shape, DataType dtype) {
-  auto n = shape.size();
-  auto out = TensorViewBuilder()
-                 .ndims(n)
-                 .dtype(dtype)
-                 .contiguity(std::vector<bool>(n, true))
-                 .shape(shape)
-                 .build();
-  IrBuilder::create<RNGOp>(RNGOpType::Uniform, out);
-  return out;
-}
-
 Val* castOp(DataType dtype, Val* v1) {
   if (v1->getDataType().value() == dtype) {
     return set(v1);
@@ -453,6 +440,119 @@ TensorView* unaryOp(
   return unaryOp(type, cast_v1)->as<TensorView>();
 }
 
+// TENSOR FACTORIES
+TensorView* rand(const std::vector<Val*>& shape, DataType dtype) {
+  auto n = shape.size();
+  auto out = TensorViewBuilder()
+                 .ndims(n)
+                 .dtype(dtype)
+                 .contiguity(std::vector<bool>(n, true))
+                 .shape(shape)
+                 .build();
+  IrBuilder::create<RNGOp>(RNGOpType::Uniform, out, dtype);
+  return out;
+}
+
+TensorView* rand_like(TensorView* v) {
+  TORCH_CHECK(
+      isFloatingPointType(v->dtype()),
+      "input must have floating point type, but got ",
+      v->dtype());
+  std::vector<Val*> shape;
+  shape.reserve(v->getMaybeRFactorDomain().size());
+  for (auto id : v->getMaybeRFactorDomain()) {
+    shape.emplace_back(id->getMaybeExpandedExtent());
+  }
+  return rand(shape, v->dtype());
+}
+
+Val* rand_like(Val* v) {
+  return rand_like(v->as<TensorView>());
+}
+
+TensorView* full(
+    const std::vector<Val*>& shape,
+    Val* fill_value,
+    DataType dtype) {
+  auto n = shape.size();
+  auto out = TensorViewBuilder()
+                 .ndims(n)
+                 .dtype(dtype)
+                 .contiguity(std::vector<bool>(n, true))
+                 .shape(shape)
+                 .build();
+  IrBuilder::create<FullOp>(out, fill_value, dtype);
+  return out;
+}
+
+TensorView* full_like(TensorView* tv, Val* fill_value) {
+  std::vector<Val*> shape;
+  shape.reserve(tv->getMaybeRFactorDomain().size());
+  for (auto id : tv->getMaybeRFactorDomain()) {
+    shape.emplace_back(id->getMaybeExpandedExtent());
+  }
+  return full(shape, fill_value, tv->dtype());
+}
+
+Val* full_like(Val* v, Val* fill_value) {
+  return full_like(v->as<TensorView>(), fill_value);
+}
+
+TensorView* zeros(const std::vector<Val*>& shape, DataType dtype) {
+  return full(shape, FusionGuard::getCurFusion()->zeroVal(), dtype);
+}
+
+TensorView* zeros_like(TensorView* tv) {
+  return full_like(tv, FusionGuard::getCurFusion()->zeroVal());
+}
+
+Val* zeros_like(Val* v) {
+  return zeros_like(v->as<TensorView>());
+}
+
+TensorView* ones(const std::vector<Val*>& shape, DataType dtype) {
+  return full(shape, FusionGuard::getCurFusion()->oneVal(), dtype);
+}
+
+TensorView* ones_like(TensorView* tv) {
+  return full_like(tv, FusionGuard::getCurFusion()->oneVal());
+}
+
+Val* ones_like(Val* v) {
+  return ones_like(v->as<TensorView>());
+}
+
+TensorView* arange(Val* end, DataType dtype) {
+  return arange(FusionGuard::getCurFusion()->zeroVal(), end, dtype);
+}
+
+TensorView* arange(Val* start, Val* end, DataType dtype) {
+  return arange(start, end, FusionGuard::getCurFusion()->oneVal(), dtype);
+}
+
+TensorView* arange(Val* start, Val* end, Val* step, DataType dtype) {
+  if (isIntegralType(dtype)) {
+    start = castOp(DataType::Int, start);
+    end = castOp(DataType::Int, end);
+    step = castOp(DataType::Int, step);
+  } else if (isFloatingPointType(dtype)) {
+    start = castOp(DataType::Double, start);
+    end = castOp(DataType::Double, end);
+    step = castOp(DataType::Double, step);
+  }
+  // Make sure no negative value is passed to ceilDiv as the device
+  // implementation of ceilDiv assumes positive inputs
+  auto size = castOp(DataType::Int, ceilDiv(abs(sub(end, start)), abs(step)));
+  auto out = TensorViewBuilder()
+                 .ndims(1)
+                 .dtype(dtype)
+                 .contiguity({true})
+                 .shape({size})
+                 .build();
+  IrBuilder::create<ARangeOp>(out, start, end, step, dtype);
+  return out;
+}
+
 // UNARY OPERATIONS
 
 #define NVFUSER_DEFINE_UNARY_OP(op_name, op_type) \
@@ -474,23 +574,6 @@ NVFUSER_DEFINE_UNARY_OP(silu, Silu)
 NVFUSER_DEFINE_UNARY_OP(trunc, Trunc)
 NVFUSER_DEFINE_UNARY_OP(print, Print)
 #undef NVFUSER_DEFINE_UNARY_OP
-
-TensorView* randlike(TensorView* v) {
-  TORCH_CHECK(
-      isFloatingPointType(v->dtype()),
-      "input must have floating point type, but got ",
-      v->dtype());
-  std::vector<Val*> shape;
-  shape.reserve(v->getMaybeRFactorDomain().size());
-  for (auto id : v->getMaybeRFactorDomain()) {
-    shape.emplace_back(id->getMaybeExpandedExtent());
-  }
-  return rand(shape, v->dtype());
-}
-
-Val* randlike(Val* v) {
-  return randlike(v->as<TensorView>());
-}
 
 Val* bitwise_not(Val* v) {
   TORCH_CHECK(

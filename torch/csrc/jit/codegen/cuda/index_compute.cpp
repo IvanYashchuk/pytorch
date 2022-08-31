@@ -307,7 +307,8 @@ Val* getProducerIndexWithPartialSplit(
   }
 
   return SimplifyingIrBuilder::addExpr(
-      producer_index, SimplifyingIrBuilder::create<Int>(diff_eval.value()));
+      producer_index,
+      SimplifyingIrBuilder::create<Int>(diff_eval->as<int64_t>()));
 }
 
 } // namespace
@@ -1936,7 +1937,7 @@ std::vector<Val*> Index::getNonGlobalProducerStridedIndices(
   return strided_inds;
 }
 
-std::vector<Val*> Index::getRandomTensorStridedIndices(
+std::vector<Val*> Index::getLinearIndex(
     TensorView* consumer_tv,
     const std::vector<kir::ForLoop*>& loops) {
   // Use domain guard to ignore the contiguity of

@@ -92,6 +92,8 @@ bool isTvOp(const Expr* expr) {
        expr->getExprType().value() == ExprType::BinaryOp ||
        expr->getExprType().value() == ExprType::TernaryOp ||
        expr->getExprType().value() == ExprType::RNGOp ||
+       expr->getExprType().value() == ExprType::FullOp ||
+       expr->getExprType().value() == ExprType::ARangeOp ||
        expr->getExprType().value() == ExprType::ReductionOp ||
        expr->getExprType().value() == ExprType::GroupedReductionOp ||
        expr->getExprType().value() == ExprType::WelfordOp ||
@@ -572,9 +574,7 @@ class ReplaceExprInput : private kir::ExprMutator {
     auto replaced_inputs = getMaybeInputReplacementMap(node);
     if (replaced_inputs.has_value()) {
       auto replacement = IrBuilder::create<UnaryOp>(
-          node->getUnaryOpType(),
-          node->out(),
-          replaced_inputs.value().at(node->in()));
+          node->getUnaryOpType(), node->out(), replaced_inputs->at(node->in()));
       registerReplaceWithPredicate(node, replacement);
     }
   }
@@ -585,8 +585,8 @@ class ReplaceExprInput : private kir::ExprMutator {
       auto replacement = IrBuilder::create<BinaryOp>(
           node->getBinaryOpType(),
           node->out(),
-          replaced_inputs.value().at(node->lhs()),
-          replaced_inputs.value().at(node->rhs()));
+          replaced_inputs->at(node->lhs()),
+          replaced_inputs->at(node->rhs()));
       registerReplaceWithPredicate(node, replacement);
     }
   }
@@ -597,9 +597,9 @@ class ReplaceExprInput : private kir::ExprMutator {
       auto replacement = IrBuilder::create<TernaryOp>(
           node->getTernaryOpType(),
           node->out(),
-          replaced_inputs.value().at(node->in1()),
-          replaced_inputs.value().at(node->in2()),
-          replaced_inputs.value().at(node->in3()));
+          replaced_inputs->at(node->in1()),
+          replaced_inputs->at(node->in2()),
+          replaced_inputs->at(node->in3()));
       registerReplaceWithPredicate(node, replacement);
     }
   }
@@ -616,7 +616,7 @@ class ReplaceExprInput : private kir::ExprMutator {
           node->getReductionOpType(),
           node->init(),
           node->out(),
-          replaced_inputs.value().at(node->in()),
+          replaced_inputs->at(node->in()),
           node->isAllreduce());
       registerReplaceWithPredicate(node, replacement);
     }
@@ -647,7 +647,7 @@ class ReplaceExprInput : private kir::ExprMutator {
     if (replaced_inputs.has_value()) {
       auto replacement = IrBuilder::create<BroadcastOp>(
           node->out(),
-          replaced_inputs.value().at(node->in()),
+          replaced_inputs->at(node->in()),
           node->getBroadcastDimFlags());
       registerReplaceWithPredicate(node, replacement);
     }
@@ -663,9 +663,9 @@ class ReplaceExprInput : private kir::ExprMutator {
           node->initAvg(),
           node->initVar(),
           node->initN(),
-          replaced_inputs.value().at(node->inAvg()),
-          replaced_inputs.value().at(node->inVar()),
-          replaced_inputs.value().at(node->inN()));
+          replaced_inputs->at(node->inAvg()),
+          replaced_inputs->at(node->inVar()),
+          replaced_inputs->at(node->inN()));
       registerReplaceWithPredicate(node, replacement);
     }
   }
@@ -675,8 +675,8 @@ class ReplaceExprInput : private kir::ExprMutator {
     if (replaced_inputs.has_value()) {
       auto replacement = IrBuilder::create<MmaOp>(
           node->out(),
-          replaced_inputs.value().at(node->inA()),
-          replaced_inputs.value().at(node->inB()),
+          replaced_inputs->at(node->inA()),
+          replaced_inputs->at(node->inB()),
           node->init(),
           node->options());
       registerReplaceWithPredicate(node, replacement);

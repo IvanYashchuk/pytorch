@@ -411,7 +411,7 @@ bool isConnectedFusionGraph(Fusion* fusion) {
     // Each expr maps all its inputs and
     //  outputs to the same component
     auto output0 = expr->output(0);
-    for (auto input : expr->inputs()) {
+    for (auto input : ir_utils::filterByType<TensorView>(expr->inputs())) {
       component_sets.mapEntries(output0, input);
     }
     for (auto output : expr->outputs()) {
@@ -604,7 +604,7 @@ size_t SchedulerRuntimeInfo::getMaxVectorizableWidth(TensorView* tv) {
     }
 
     // Still contiguous
-    numel *= dim_size.value().as<int64_t>();
+    numel *= dim_size->as<int64_t>();
   }
 
   // Assuming intermediate tensors have friendly alignment, and
@@ -704,7 +704,7 @@ size_t SchedulerRuntimeInfo::getInnerDimVectorizableWidth(TensorView* tv) {
   auto maybe_inner_dimension_size =
       expression_evaluator_->evaluate(inner_most_dim->extent());
   TORCH_INTERNAL_ASSERT(maybe_inner_dimension_size.has_value());
-  size_t inner_dimension_size = maybe_inner_dimension_size.value();
+  size_t inner_dimension_size = maybe_inner_dimension_size->as<int64_t>();
 
   while (next_vector_size <= max_vector_size &&
          next_vector_size <= inner_dimension_size &&
