@@ -4524,6 +4524,35 @@ TEST_F(NVFuserTest, FusionCastOps_CUDA) {
       "\n");
 }
 
+TEST_F(NVFuserTest, FusionCastOpsInt_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  TensorView* tv0 = makeSymbolicTensor(2, DataType::Half);
+  TensorView* intrm1 = castOp(DataType::Int, tv0);
+  TensorView* out = castOp(DataType::Half, intrm1);
+
+  fusion->addInput(tv0);
+  fusion->addOutput(out);
+
+  auto options_half = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto options_int = at::TensorOptions().dtype(at::kInt).device(at::kCUDA, 0);
+
+  at::Tensor input1 = at::randn({1, 4}, options_half);
+  at::Tensor ref_output = input1.to(options_int).to(options_half);
+
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto outputs = executor_cache.runFusionWithInputs({input1});
+
+  testValidate(
+      executor_cache.fusion(),
+      outputs,
+      {input1},
+      {ref_output},
+      __LINE__,
+      __FILE__);
+}
+
 // Start off simple, block on the outer dim
 // block stride + thread all reduce + unrolling on inner dim
 TEST_F(NVFuserTest, FusionReduction1_CUDA) {

@@ -367,6 +367,15 @@ Val* castOp(DataType dtype, Val* v1) {
     return set(v1);
   }
 
+  // There are no direct cast for some combinations of dtypes
+  // for example integers to fp16, bfloat16 and back
+  // so we need to try doing a conversion to float first.
+  if (dtype != DataType::Float &&
+      cast_func_str(std::make_pair(v1->getDataType().value(), dtype)) ==
+          c10::nullopt) {
+    return castOp(dtype, castOp(DataType::Float, v1));
+  }
+
   if (cast_func_str(std::make_pair(v1->getDataType().value(), dtype)) ==
       c10::nullopt) {
     TORCH_CHECK(
