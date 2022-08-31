@@ -2636,7 +2636,6 @@ bool hasDependentViews(Fusion* fusion) {
 }
 
 TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
-  //  a, b, c
   if (pos < 0) {
     pos += group_ids.size();
   }
