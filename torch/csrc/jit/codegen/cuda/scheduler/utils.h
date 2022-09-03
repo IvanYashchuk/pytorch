@@ -313,26 +313,26 @@ struct BroadcastMultiple {
   int64_t lhs_multiple = 0;
 };
 
-
-struct BroadcastMultipleInformation{
-    std::vector<int> view_disjoint_set_ids;
-    std::vector<BroadcastMultiple> broadcast_multiples;
+struct BroadcastMultipleInformation {
+  std::vector<int> view_disjoint_set_ids;
+  std::vector<BroadcastMultiple> broadcast_multiples;
 };
 
 // Returns a vector of size reference_tv->getMaybeRFactorDomain().size() which
 // is a view disjoint set id of each of those iter domains. If entries share the
-// same value, they undergo view transformations in the fusion together. Counts
-// are also of size reference_tv->getMaybeRFactorDomain().size(), each entry [i]
-// is the number of inputs/outputs that have a non-broadcast dimension mapped to
-// the corresponding dimension in reference_tv. Count includes reference_tv if
-// reference_tv is an input or output. Count is multiplied by data type size. In
-// the case of view operations the count is the full multiple size if any domain
-// in the group maps to a non-broadcast dimension in the given input/output.
-// Otherwise if all dimensions are broadcast that input/output will not
-// contribute to the multiple.
-TORCH_CUDA_CU_API BroadcastMultipleInformation getBroadcastMultiples(
-    TensorView* reference_tv,
-    DataType index_type);
+// same value, they undergo view transformations in the fusion together.
+// Broadcast multiples are also of size
+// reference_tv->getMaybeRFactorDomain().size(), each entry [i] is the number of
+// inputs/outputs that have a non-broadcast dimension mapped to the
+// corresponding dimension in reference_tv. Broadcast multiples includes
+// reference_tv if reference_tv is an input or output. Broadcast multiples is
+// multiplied by data type size. In the case of view operations the broadcast
+// multiple is the full multiple size if any domain in the group maps to a
+// non-broadcast dimension in the given input/output. Otherwise if all
+// dimensions are broadcast that input/output will not contribute to the
+// multiple.
+TORCH_CUDA_CU_API BroadcastMultipleInformation
+getBroadcastMultiples(TensorView* reference_tv, DataType index_type);
 
 //! Collect maximum vectorization word size of a tensor whose
 //! innermost domain is leaf_merged_domain. Contig merging is taken
@@ -530,10 +530,6 @@ TORCH_CUDA_CU_API DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion);
 // TODO: Should this be moved to registry.cpp/.h?
 // Warning: This pass generates the IdGraphs, not intended for use at runtime.
 TORCH_CUDA_CU_API bool allMatchingViews(Fusion* fusion);
-
-// Return if there are any view's that have dependencies on other view
-// operations.
-TORCH_CUDA_CU_API bool hasDependentViews(Fusion* fusion);
 
 // Makes sure that there are no group id's left of pos that match right of pos.
 // e.g.

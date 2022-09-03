@@ -390,7 +390,7 @@ class SchedulerTopologyChecker {
       }
     }
 
-    return true;
+    return false;
   }
 };
 

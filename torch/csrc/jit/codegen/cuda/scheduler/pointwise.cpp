@@ -52,12 +52,6 @@ class DomainMap : public pointwise_utils::DomainMap {
     return result;
   }
 
-  static bool hasReferenceTensorView(Fusion* fusion) {
-    FusionGuard fg(fusion);
-    DomainMap domain_map(fusion);
-    return domain_map.findReferenceTensorView() != nullptr;
-  }
-
  private:
   bool hasMinimumSize(TensorView* tv, int num_axes) const {
     TORCH_INTERNAL_ASSERT(tv != nullptr);
@@ -347,6 +341,8 @@ std::shared_ptr<PointwiseParams> getPointwiseHeuristics(
   }
 
   // Try expanding vectorization to contig merged domains
+  // TODO: This is an expensive function that shouldn't be in heuristics without
+  // caching.
   auto expanded_vector_word_size =
       scheduler_utils::expandVectorizationToContigMergedDomains(
           fusion,
@@ -491,11 +487,19 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
 
   auto view_ops = ir_utils::getViewOps(fusion);
 
-  // If there's no path from reference through producer paths only to a view, we
-  // need to propagate the view transformations to the reference tv before
-  // scheduling the reference tv. Since view ops have to be identical, if any
-  // path from reference tv through producers goes through a view, all paths
-  // from reference tv's to views should be through producers.
+  /*
+   * If there's no path from reference through producer paths only to a view,
+   * e.g.: input
+   *      /  \
+   *   view reference
+   *    /
+   * output
+   *
+   * we need to propagate the view transformations to the reference tv before
+   * scheduling the reference tv. Since view ops have to be identical, if any
+   * path from reference tv through producers goes through a view, all paths
+   * from reference tv's to views should be through producers.
+   */
   bool needs_view_prop =
       view_ops.size() > 0 &&
       !std::any_of(

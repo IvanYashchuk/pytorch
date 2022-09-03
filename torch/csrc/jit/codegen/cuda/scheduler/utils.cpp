@@ -2574,67 +2574,6 @@ TORCH_CUDA_CU_API bool allMatchingViews(Fusion* fusion) {
   return true;
 }
 
-class DependentViewCheck : public IterVisitor {
- private:
-  bool dep_views_ = false;
-  // All values that are dependent on a view expression
-  std::unordered_set<Val*> dep_on_view_;
-
-  std::vector<Statement*> next(Val* v) final {
-    if (dep_views_) {
-      return {};
-    }
-    return IterVisitor::next(v);
-  }
-
-  std::vector<Statement*> next(Expr* expr) final {
-    if (dep_views_) {
-      return {};
-    }
-    return IterVisitor::next(expr);
-  }
-
-  void handle(Expr* e) final {
-    // Check if any inputs have a dependency on a view operation
-    bool has_view_dep_input =
-        std::any_of(e->inputs().begin(), e->inputs().end(), [&](Val* v) {
-          return dep_on_view_.count(v);
-        });
-
-    auto out_tvs = ir_utils::filterByType<TensorView>(e->outputs());
-
-    bool is_view_op = e->isA<ViewOp>() &&
-        std::any_of(out_tvs.begin(), out_tvs.end(), [](TensorView* out_tv) {
-                        return out_tv->hasRFactor();
-                      });
-
-    // Forward dependencies on views, assume if any input is dependent on a
-    // view all outputs are (not necessarily true with grouped reductions.)
-    if (has_view_dep_input || is_view_op) {
-      dep_on_view_.insert(e->outputs().begin(), e->outputs().end());
-    }
-
-    if (has_view_dep_input && is_view_op) {
-      // Inputs are dependent on a view, and this operation is a view so
-      // there's views that are dependent on views.
-      dep_views_ = true;
-    }
-  }
-
- public:
-  // Return if there are any view's that have dependencies on other view
-  // operations.
-  static bool hasDependentViews(Fusion* fusion) {
-    DependentViewCheck view_check;
-    view_check.traverse(fusion);
-    return view_check.dep_views_;
-  }
-};
-
-bool hasDependentViews(Fusion* fusion) {
-  return DependentViewCheck::hasDependentViews(fusion);
-}
-
 TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
   if (pos < 0) {
     pos += group_ids.size();
@@ -2690,11 +2629,16 @@ std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
           std::find(reordered_ids.begin(), reordered_ids.end(), merge->outer());
       auto find_it_1 =
           std::find(reordered_ids.begin(), reordered_ids.end(), merge->inner());
-      if (find_it_0 == reordered_ids.end() ||
+      if (find_it_0 == reordered_ids.end() &&
           find_it_1 == reordered_ids.end()) {
         // Transformations before rfactor, ignore those.
         continue;
       }
+      TORCH_INTERNAL_ASSERT(
+          find_it_0 != reordered_ids.end() && find_it_1 != reordered_ids.end(),
+          "Error in transformations of ",
+          tv->toString(),
+          "\nTransformations before rfactor should not mix with transformations after rfactor.");
       auto pos0 = std::distance(reordered_ids.begin(), find_it_0);
       auto pos1 = std::distance(reordered_ids.begin(), find_it_1);
       if (pos0 > pos1) {

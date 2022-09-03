@@ -25479,38 +25479,6 @@ TEST_F(NVFuserTest, FusionSizeDependentData_CUDA) {
       executor_cache.fusion(), cg_outputs, {a}, {a + 123}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionReorderAsRFactor_CUDA) {
-  Fusion fusion;
-  FusionGuard fg(&fusion);
-
-  int a = 1, b = 2, c = 3, d = 4;
-
-  TensorView* tv0 = makeConcreteTensor({a, b, c, d});
-  fusion.addInput(tv0);
-  fusion.addOutput(tv0);
-
-  // [a, b, c, d]
-  tv0->merge(0, 2);
-  // [a*c, b, d]
-  tv0->split(2, 2);
-  // [a*c, bo, bi, d]
-  tv0->split(3, 3);
-  // [a*c, bo, bi, do, di]
-  tv0->reorder({{1, 4}, {2, 1}, {3, 3}, {4, 2}});
-  // [a*c, bi, di, do, bo]
-  tv0->merge(3);
-  tv0->merge(1);
-  // [a*c, bi*di, do*bo]
-  tv0->reorder({{0, 2}});
-  // [bi*di, do*bo, a*c]
-  // Order we want is:
-  // [a*c, do*bo, bi*di]
-  auto old2new = scheduler_utils::domainReorderAsRfactorMap(tv0);
-  TORCH_CHECK(old2new[0] == 2);
-  TORCH_CHECK(old2new[1] == 1);
-  TORCH_CHECK(old2new[2] == 0);
-}
-
 TEST_F(NVFuserTest, FusionDependencyCheck_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
