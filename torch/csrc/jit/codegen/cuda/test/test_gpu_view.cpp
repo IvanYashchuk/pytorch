@@ -1727,6 +1727,47 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
   testValidate(&fusion, cg_outputs, {t0, t3}, {t6}, __LINE__, __FILE__);
 }
 
+// Test view/transpose and its impact on vectorization
+TEST_F(NVFuserTest, FusionViewMagicSchedule6_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int x = 128, y = 128;
+
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {x, y}, {x, y / 2, 2});
+  auto tv2 = transpose(tv1, 0, 1);
+
+  auto tv3 = makeContigTensor(3);
+  fusion.addInput(tv3);
+  auto tv4 = add(tv2, tv3);
+  fusion.addOutput(tv4);
+  fusion.printMath();
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  at::Tensor t0 = at::randn({x, y}, options);
+  auto t1 = at::native::view(t0, {x, y / 2, 2});
+
+  auto t2 = t1.transpose(0, 1);
+  at::Tensor t3 = at::randn({y / 2, x, 2}, options);
+  auto t4 = add(t2, t3);
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  // Collect the heuristic params
+  executor_cache.profile(true);
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t3});
+
+  // TODO: Fix ref handling int pointwise scheduler to accept this program as
+  // one segment.
+  TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  TORCH_CHECK(executor_cache.getMostRecentExecutorInfo()
+                  .params->isA<PointwiseParams>());
+
+  testValidate(&fusion, cg_outputs, {t0, t3}, {t4}, __LINE__, __FILE__);
+}
+
 // Make sure different views that are consumed by the reference are segmented
 // into a single kernel.
 TEST_F(NVFuserTest, FusionViewMapping_CUDA) {

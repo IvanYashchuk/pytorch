@@ -3,7 +3,10 @@
 #include <torch/csrc/jit/codegen/cuda/compute_at_map.h>
 #include <torch/csrc/jit/codegen/cuda/contiguity.h>
 #include <torch/csrc/jit/codegen/cuda/expr_evaluator.h>
+#include <torch/csrc/jit/codegen/cuda/ir_builder.h>
+#include <torch/csrc/jit/codegen/cuda/ir_iostream.h>
 #include <torch/csrc/jit/codegen/cuda/iter_visitor.h>
+#include <torch/csrc/jit/codegen/cuda/root_domain_map.h>
 #include <torch/csrc/jit/codegen/cuda/scheduler/registry.h>
 
 #include <c10/util/irange.h>
@@ -274,6 +277,569 @@ size_t expandVectorizationToContigMergedDomains(
   }
 
   return word_size;
+}
+
+ContiguousInnerDimensionsMapper::ContiguousInnerDimensionsMapper(
+    TensorView* reference,
+    std::vector<IterDomain*> ids) {
+  FusionGuard fg(reference->fusion());
+
+  // Check all ids are in reference's rfactor or root domain.
+  auto unmatched_ids = ids;
+
+  unmatched_ids.erase(
+      std::remove_if(
+          unmatched_ids.begin(),
+          unmatched_ids.end(),
+          [reference](IterDomain* id) {
+            if (std::find(
+                    reference->getRootDomain().begin(),
+                    reference->getRootDomain().end(),
+                    id) != reference->getRootDomain().end()) {
+              return true;
+            }
+            if (!reference->hasRFactor()) {
+              return false;
+            }
+            if (std::find(
+                    reference->getMaybeRFactorDomain().begin(),
+                    reference->getMaybeRFactorDomain().end(),
+                    id) != reference->getMaybeRFactorDomain().end()) {
+              return true;
+            }
+            return false;
+          }),
+      unmatched_ids.end());
+
+  TORCH_INTERNAL_ASSERT(
+      unmatched_ids.empty(),
+      "Cannot project dimensions that don't exist in root or rfactor of tensor view.\n",
+      "Recieved ",
+      reference->toString(),
+      " with ids which are not in either: ",
+      unmatched_ids);
+
+  // Project reference in both directions
+  projectIdToRoot(reference, ids);
+  projectIdToRFactor(reference, ids);
+
+  // Ordering of dimensions is important in this analysis, if an ordering is
+  // contiguous in the reference, but not the target tensor views, then we
+  // cannot consider that a contiguous merge dimension for vectorization.
+
+  // Make sure the order of the mapped dimensions are in the ordering of the
+  // reference.
+  std::vector<IterDomain*> reordered_root;
+  auto mapped_root_ids = mapped_root_ids_.at(reference);
+  for (auto id : reference->getRootDomain()) {
+    if (std::find(mapped_root_ids.begin(), mapped_root_ids.end(), id) !=
+        mapped_root_ids.end()) {
+      reordered_root.push_back(id);
+    }
+  }
+  mapped_root_ids_[reference] = reordered_root;
+
+  std::vector<IterDomain*> reordered_rfactor;
+  auto mapped_rfactor_ids = mapped_rfactor_ids_.at(reference);
+  for (auto id : reference->getMaybeRFactorDomain()) {
+    if (std::find(mapped_rfactor_ids.begin(), mapped_rfactor_ids.end(), id) !=
+        mapped_rfactor_ids.end()) {
+      reordered_rfactor.push_back(id);
+    }
+  }
+  mapped_rfactor_ids_[reference] = reordered_rfactor;
+}
+
+namespace {
+// Removes IterDomain* in to_remove_in if they don't exist in present_in
+void removeIfNotPresent(
+    std::vector<IterDomain*>& to_remove_in,
+    const std::vector<IterDomain*>& present_in) {
+  to_remove_in.erase(
+      std::remove_if(
+          to_remove_in.begin(),
+          to_remove_in.end(),
+          [&present_in](IterDomain* id_maybe_to_remove) {
+            return std::find(
+                       present_in.begin(), present_in.end(), id_maybe_to_remove) ==
+                present_in.end();
+          }),
+      to_remove_in.end());
+}
+} // namespace
+
+std::unordered_map<TensorView*, std::vector<IterDomain*>>::iterator
+ContiguousInnerDimensionsMapper::projectIdToRoot(
+    TensorView* ref,
+    std::vector<IterDomain*> ids) {
+  auto transform_exprs = StmtSort::getExprs(
+      ref->fusion(),
+      {ref->getRFactorDomain().begin(), ref->getRFactorDomain().end()});
+
+  // Mapping from rfactor to root, reverse expressions
+  std::reverse(transform_exprs.begin(), transform_exprs.end());
+
+  for (const auto* expr : transform_exprs) {
+    if (const Split* split = dynamic_cast<const Split*>(expr)) {
+      auto find_outer_it = std::find(ids.begin(), ids.end(), split->outer());
+      auto find_inner_it = std::find(ids.begin(), ids.end(), split->inner());
+      if (find_inner_it == ids.end()) {
+        // If inner dimension isn't mapped, we don't partial map outer
+        // dimension.
+        continue;
+      }
+
+      auto inner_pos = std::distance(ids.begin(), find_inner_it);
+      auto outer_pos = find_outer_it == ids.end()
+          ? inner_pos
+          : std::distance(ids.begin(), find_outer_it);
+      if (outer_pos > inner_pos) {
+        std::swap(outer_pos, inner_pos);
+      }
+
+      if (find_outer_it != ids.end() && find_inner_it != ids.end() &&
+          !hasPartialExtent(split->inner())) {
+        // Both dimensions map, inner dimension maps fully. For more context see
+        // the comment:
+        //  projectIdToRFactor
+        //    if (find_outer_it != ids.end() && find_inner_it != ids.end() &&
+        //      !hasPartialExtent(merge->inner())) {
+        //      Comment here.
+
+        ids[inner_pos--] = split->in();
+        ids.erase(ids.begin() + outer_pos);
+        if (hasPartialExtent(split->outer())) {
+          // Outer dimension has a partial map, but inner dimension is full,
+          // split->in should be partially mapped.
+          partial_mapped_extent_[split->in()] = SimplifyingIrBuilder::mulExpr(
+              getMaybePartialMappedExtent(split->outer()),
+              split->inner()->extent());
+        }
+      } else {
+        // Only inner matches, mark a partial match
+        ids[inner_pos--] = split->in();
+        // Mark the partial match, inner could already be a partial match
+        partial_mapped_extent_[split->in()] =
+            getMaybePartialMappedExtent(split->inner());
+      }
+    } else if (const Merge* merge = dynamic_cast<const Merge*>(expr)) {
+      auto find_out_it = std::find(ids.begin(), ids.end(), merge->out());
+      if (find_out_it == ids.end()) {
+        continue;
+      }
+
+      auto out_pos = std::distance(ids.begin(), find_out_it);
+      if (!hasPartialExtent(merge->out())) {
+        // No partial map in output, so simply map through to inputs.
+        ids[out_pos] = merge->outer();
+        ids.insert(ids.begin() + out_pos + 1, merge->inner());
+      } else {
+        // This could be done completely symbolically by adding more expressions
+        // into the graph, for example the inner patial extent could be:
+        //   auto inner_partial_extent =
+        //   SimplifyingIrBuilder::minExpr(getMaybePartialMappedExtent(merge->out()),
+        //   merge->inner()->extent());
+        // and outer partial extent:
+        //   auto outer_partial_extent =
+        //   SimplifyingIrBuilder::divExpr(getMaybePartialMappedExtent(merge->out()),
+        //   merge->inner()->extent())
+        //
+        // However, for right now we'll assume no partial outer dimension maps
+        // unless the extent of merge->out and merge->inner are compile time
+        // constant. If not compile time constant we'll take:
+        //   min(merge->inner()->extent(), the partial extent of merge->out())
+        // for the inner partial map, and assume outer doesn't partially map.
+        //
+        // TODO: Improve to do the above. The only challenge here is reducing
+        // the if (out_extent > inner_extent) to something that can be
+        // evaluated with expr evaluator.
+        if (!getMaybePartialMappedExtent(merge->out())->isConstInt() ||
+            !merge->inner()->extent()->isConstInt()) {
+          // We don't know at compile time if the partial extent of merge->out
+          // is bigger than merge->inner or not, so generate an expressions we
+          // can evaluate at runtime for the inner partial mapping extent. Don't
+          // attempt to map merge->outer, just assume it doesn't partially map.
+          ids[out_pos] = merge->inner();
+          partial_mapped_extent_[merge->inner()] =
+              SimplifyingIrBuilder::minExpr(
+                  getMaybePartialMappedExtent(merge->out()),
+                  merge->inner()->extent());
+        } else {
+          // Compile time constant analysis
+          auto partial_out_extent =
+              getMaybePartialMappedExtent(merge->out())->evaluateInt();
+          auto inner_extent = merge->inner()->extent()->evaluateInt();
+          if (partial_out_extent > inner_extent) {
+            // Partial mapping on out is bigger than inner, so extend partial
+            // mapping to outer and mark inner as fully mapped.
+            //
+            // TODO: Should this be ceilDiv? Normal div is more conservative, so
+            // sticking with that for now.
+            partial_mapped_extent_[merge->outer()] =
+                SimplifyingIrBuilder::divExpr(
+                    getMaybePartialMappedExtent(merge->out()),
+                    merge->inner()->extent());
+            // Map inner and outer dimensions
+            ids[out_pos] = merge->outer();
+            ids.insert(ids.begin() + out_pos + 1, merge->inner());
+          } else if (partial_out_extent == inner_extent) {
+            // Only map inner dimension, but since it's the same extent as the
+            // partial out extent, map all of it.
+            ids[out_pos] = merge->inner();
+          } else {
+            // Partially map inner dimension
+            ids[out_pos] = merge->inner();
+            partial_mapped_extent_[merge->inner()] =
+                getMaybePartialMappedExtent(merge->out());
+          }
+        }
+      }
+    } else {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "ProjectDimensions does not support expr type: ",
+          expr->toString());
+    } // switch on expr type
+  } // For loop on the transform expressions
+
+  // Remove any iteration domain that's not in the root.
+  removeIfNotPresent(ids, ref->getRootDomain());
+  // Add to our tracking and return the iterator to the inserted entry
+  return mapped_root_ids_.emplace(ref, ids).first;
+}
+
+// This function is very similar to projectIdToRoot, we just generally swap the
+// logic of split and merge as the reverse mapping of merge looks a lot like
+// split and vice versa.
+std::unordered_map<TensorView*, std::vector<IterDomain*>>::iterator
+ContiguousInnerDimensionsMapper::projectIdToRFactor(
+    TensorView* ref,
+    std::vector<IterDomain*> ids) {
+  auto transform_exprs = StmtSort::getExprs(
+      ref->fusion(),
+      {ref->getRFactorDomain().begin(), ref->getRFactorDomain().end()});
+
+  // Map forward through transforms since we're going from root to rfactor
+  for (const auto* expr : transform_exprs) {
+    if (const Merge* merge = dynamic_cast<const Merge*>(expr)) {
+      auto find_outer_it = std::find(ids.begin(), ids.end(), merge->outer());
+      auto find_inner_it = std::find(ids.begin(), ids.end(), merge->inner());
+      if (find_inner_it == ids.end()) {
+        // If inner dimension isn't mapped, we don't partial map outer
+        // dimension.
+        continue;
+      }
+
+      auto inner_pos = std::distance(ids.begin(), find_inner_it);
+      auto outer_pos = find_outer_it == ids.end()
+          ? inner_pos
+          : std::distance(ids.begin(), find_outer_it);
+      if (outer_pos > inner_pos) {
+        std::swap(outer_pos, inner_pos);
+      }
+
+      if (find_outer_it != ids.end() && find_inner_it != ids.end() &&
+          !hasPartialExtent(merge->inner())) {
+        // Both dimensions map, inner dimension maps fully. We don't map the
+        // outer dimension through if the inner dimension maps partially as we'd
+        // have to support mapping a non-contiguous dimension. i.e.:
+        //
+        // merge(I0*I1, I2*I3) -> I0*I1*I2*I3
+        //
+        // With partial mapping bing I1 and I3, then there'd be I2 between them
+        // so it wouldn't be a contiguous segment that we map through this
+        // merge. Therefore we'd only consider I3 partialy mapping through this
+        // operation.
+        //
+        // If we have the same merge
+        // merge(I0*I1, I2*I3) -> I0*I1*I2*I3
+        // However, I2*I3 completely maps, and I1 partially maps, then we can
+        // forward a partially mapped domain to the output of size I1*I2*I3
+
+        ids[inner_pos--] = merge->out();
+        ids.erase(ids.begin() + outer_pos);
+        if (hasPartialExtent(merge->outer())) {
+          // Outer dimension has a partial map, but inner dimension is full,
+          // merge->out should be partially mapped.
+          partial_mapped_extent_[merge->out()] = SimplifyingIrBuilder::mulExpr(
+              getMaybePartialMappedExtent(merge->outer()),
+              merge->inner()->extent());
+        }
+      } else {
+        // Only inner matches, mark a partial match
+        ids[inner_pos--] = merge->out();
+        // Mark the partial match
+        partial_mapped_extent_[merge->out()] =
+            getMaybePartialMappedExtent(merge->inner());
+      }
+    } else if (const Split* split = dynamic_cast<const Split*>(expr)) {
+      auto find_in_it = std::find(ids.begin(), ids.end(), split->in());
+      if (find_in_it == ids.end()) {
+        continue;
+      }
+
+      auto in_pos = std::distance(ids.begin(), find_in_it);
+      if (!hasPartialExtent(split->in())) {
+        // No partial map in output, so simply map through to inputs.
+        ids[in_pos] = split->outer();
+        ids.insert(ids.begin() + in_pos + 1, split->inner());
+      } else {
+        // See comment in
+        //   projectIdToRoot
+        //     if (!hasPartialExtent(merge->out())) {
+        //       ...
+        //     } else {
+        //   here
+        if (!getMaybePartialMappedExtent(split->in())->isConstInt() ||
+            !split->inner()->extent()->isConstInt()) {
+          // We don't know at compile time if the partial extent of split->in is
+          // bigger than split->inner or not, so generate an expressions we can
+          // evaluate at runtime for the inner partial mapping extent. Don't
+          // attempt to map split->outer, just assume it doesn't partially map.
+          ids[in_pos] = split->inner();
+          partial_mapped_extent_[split->inner()] =
+              SimplifyingIrBuilder::minExpr(
+                  getMaybePartialMappedExtent(split->in()),
+                  split->inner()->extent());
+        } else {
+          // Compile time constant analysis
+          auto partial_in_extent =
+              getMaybePartialMappedExtent(split->in())->evaluateInt();
+          auto inner_extent = split->inner()->extent()->evaluateInt();
+          if (partial_in_extent > inner_extent) {
+            // Partial mapping on in is bigger than inner, so extend partial
+            // mapping to outer and mark inner as fully mapped.
+            //
+            // TODO: Should this be ceilDiv? Normal div is more conservative, so
+            // sticking with that for now.
+            partial_mapped_extent_[split->outer()] =
+                SimplifyingIrBuilder::divExpr(
+                    getMaybePartialMappedExtent(split->in()),
+                    split->inner()->extent());
+            // Map inner and outer dimensions
+            ids[in_pos] = split->outer();
+            ids.insert(ids.begin() + in_pos + 1, split->inner());
+          } else if (partial_in_extent == inner_extent) {
+            // Only map inner dimension, but since it's the same extent as the
+            // partial out extent, map all of it.
+            ids[in_pos] = split->inner();
+          } else {
+            // Partially map inner dimension
+            ids[in_pos] = split->inner();
+            partial_mapped_extent_[split->inner()] =
+                getMaybePartialMappedExtent(split->in());
+          }
+        }
+      }
+    } else {
+      TORCH_INTERNAL_ASSERT(
+          false,
+          "ProjectDimensions does not support expr type: ",
+          expr->toString());
+    } // switch on expr type
+  } // For loop on the transform expressions
+
+  // Remove any iteration domain that's not in the root.
+  removeIfNotPresent(ids, ref->getMaybeRFactorDomain());
+  // Add to our tracking and return the iterator to the inserted entry
+  return mapped_rfactor_ids_.emplace(ref, ids).first;
+}
+
+void ContiguousInnerDimensionsMapper::propagateC2P(TensorView* from, TensorView* to) {
+  // If we have a case where we have a concretized broadcast that's being
+  // tracked in a consumer but not concretized in thep roducer we should break
+  // off the dimensions connected to the left of that dimension. So if we have:
+  // T0[i0, i2]
+  // T1[i0, b1, i2] = broadcast(T0)
+  // T2[i0, i1, i2]
+  // T3[i0, i1, i2] = T1 + T2
+  // and we're propogating from T3 with {i0, i1, i2}
+  // When we go from T3 to T0, we don't have any mechanism to understand that i0
+  // and i2 are not contiguous in the original domain of T3. It's not ideal with
+  // transpose, but when this happens we'll clear all dimensions mapped left of
+  // the concretized broadcast.
+  // So if we have:
+  // T0[i1, i2]
+  // T1[b0, i1, i2] = broadcast(T0)
+  // T2[i1, b0, i2] = transpose(T1)
+  // T3[i1, i0, i2]
+  // T4[i1, i0, i2] = T2 + T3
+  // T5[i0, i1, i2] = transpose(T4)
+  // Then i1 and i2 are contiguous in both T0 and T5, but due to the realization
+  // of the broadcast on T4 we will have removed i1 from the mapped set.
+  auto from_ids = mapped_root_ids_.at(from);
+  PairwiseRootDomainMap root_map(to, from);
+  auto c2p_map = root_map.mapConsumerToProducer(from->domain(), to->domain());
+  
+  // Id's in consumer to clear from the mapped set due to broadcast concretization.
+  std::unordered_set<IterDomain*> consumer_ids_to_clear;
+  if (to->hasBroadcast()) {
+    // Find the last broadcast dimension resolved in consumers root domain
+    int clear_pos = -1;
+    for (auto i : c10::irange(from->getRootDomain().size())) {
+      auto c_id = from->getRootDomain()[i];
+      auto c_it = c2p_map.find(c_id);
+      if(c_it == c2p_map.end()){
+        continue;
+      }
+      auto p_id = c_it->second;
+      if ((!c_id->isBroadcast() && !c_id->isTrivialReduction()) &&
+          p_id->isBroadcast()) {
+        clear_pos = i;
+      }
+    }
+    // Clear everything to the left of the inner most reduction dimension.
+    if (clear_pos >= 0) {
+      consumer_ids_to_clear.insert(
+          from->getRootDomain().begin(),
+          from->getRootDomain().begin() + clear_pos + 1);
+    }
+  }
+
+  std::vector<IterDomain*> producer_rfactor_ids;
+  for (auto from_id : from_ids) {
+    auto c2p_it = c2p_map.find(from_id);
+    if (c2p_it != c2p_map.end() &&
+        consumer_ids_to_clear.find(c2p_it->first) ==
+            consumer_ids_to_clear.end()) {
+      producer_rfactor_ids.push_back(c2p_it->second);
+      if(hasPartialExtent(c2p_it->first)){
+        partial_mapped_extent_[c2p_it->second] =
+            partial_mapped_extent_.at(c2p_it->first);
+      }
+    }
+  }
+  mapped_rfactor_ids_[to] = producer_rfactor_ids;
+  projectIdToRoot(to, producer_rfactor_ids);
+}
+
+void ContiguousInnerDimensionsMapper::propagateP2C(TensorView* from, TensorView* to) {
+  // If we have a case where we have a reduction that's being tracked in a
+  // producer but not a consumer we should break off the dimensions connected to
+  // the left of that reduction. So if we have:
+  // T0[i0, i1, i2]
+  // T1[i0, r1, i2] = sum(T0)
+  // T2[i0, i2] = T1
+  // and we're propogating from T0 with {i0, i1, i2}
+  // When we go from T1 to T2, we don't have any mechanism to understand that i0
+  // and i2 are not contiguous in the original domain of T0. It's not ideal with
+  // transpose, but when this happens we'll clear all dimensions mapped left of
+  // the reduction.
+  // So if we have:
+  // T0[i0, i1, i2]
+  // T1[i1, i0, i2] = transpose(T0)
+  // T2[i1, r0, i2] = sum(T1)
+  // T3[i1, i2] = T2
+  // Then i1 and i2 are contiguous in both T0 and T3, but due to the sum on T1
+  // we will have removed i1.
+  auto from_ids = mapped_rfactor_ids_.at(from);
+  PairwiseRootDomainMap root_map(from, to);
+  auto p2c_map = root_map.mapProducerToConsumer(from->domain(), to->domain());
+  std::vector<IterDomain*> consumer_root_ids;
+
+  // Id's in producer to clear from the mapped set due to reductions.
+  std::unordered_set<IterDomain*> producer_ids_to_clear;
+  if(from->hasReduction()){
+    // Find the last reduction dimension in the rfactor domain.
+    int clear_pos = -1;
+    for (auto i : c10::irange(from->getMaybeRFactorDomain().size())) {
+      if (from->getMaybeRFactorDomain()[i]->isReduction() &&
+          !from->getMaybeRFactorDomain()[i]->isTrivialReduction()) {
+        clear_pos = i;
+      }
+    }
+    // Clear everything to the left of the inner most reduction dimension.
+    if (clear_pos >= 0) {
+      producer_ids_to_clear.insert(
+          from->getMaybeRFactorDomain().begin(),
+          from->getMaybeRFactorDomain().begin() + clear_pos + 1);
+    }
+  }
+
+  for (auto from_id : from_ids) {
+    auto p2c_it = p2c_map.find(from_id);
+    if (p2c_it != p2c_map.end() &&
+        producer_ids_to_clear.find(p2c_it->first) ==
+            producer_ids_to_clear.end()) {
+      consumer_root_ids.push_back(p2c_it->second);
+
+      if (hasPartialExtent(p2c_it->first)) {
+        partial_mapped_extent_[p2c_it->second] =
+            partial_mapped_extent_.at(p2c_it->first);
+      }
+    }
+  }
+  mapped_root_ids_[to] = consumer_root_ids;
+  projectIdToRFactor(to, consumer_root_ids);
+}
+
+void ContiguousInnerDimensionsMapper::propagateSibling(TensorView* from, TensorView* to) {
+  TORCH_INTERNAL_ASSERT(
+      from->getRootDomain().size() == to->getRootDomain().size(),
+      "Siblings of different root sizes not supported, but found:\n  ",
+      from->toString(),
+      "\n  and\n  ",
+      to->toString(),
+      "\nhave root sizes of ",
+      from->getRootDomain().size(),
+      " and ",
+      to->getRootDomain().size());
+
+  auto from_root_ids = mapped_root_ids_.at(from);
+  std::vector<IterDomain*> sibling_root_ids;
+
+  for (auto from_root_id : from_root_ids) {
+    auto from_it = std::find(
+        from->getRootDomain().begin(),
+        from->getRootDomain().end(),
+        from_root_id);
+    TORCH_INTERNAL_ASSERT(
+        from_it != from->getRootDomain().end(),
+        "Expected ",
+        from_root_id->toString(),
+        " to be in the root of ",
+        from->toString());
+    auto pos = std::distance(from->getRootDomain().begin(), from_it);
+    sibling_root_ids.push_back(to->getRootDomain()[pos]);
+  }
+  
+  mapped_root_ids_[to] = sibling_root_ids;
+
+  if(!from->hasRFactor()){
+    return;
+  }
+
+
+  TORCH_INTERNAL_ASSERT(
+      from->getRFactorDomain().size() == to->getRFactorDomain().size(),
+      "Siblings of different rfactor sizes not supported, but found:\n  ",
+      from->toString(),
+      "\n  and\n  ",
+      to->toString(),
+      "\nhave rfactor sizes of ",
+      from->getRFactorDomain().size(),
+      " and ",
+      to->getRFactorDomain().size());
+
+  auto from_rfactor_ids = mapped_rfactor_ids_.at(from);
+  std::vector<IterDomain*> sibling_rfactor_ids;
+
+  for (auto from_rfactor_id : from_rfactor_ids) {
+    auto from_it = std::find(
+        from->getRFactorDomain().begin(),
+        from->getRFactorDomain().end(),
+        from_rfactor_id);
+    TORCH_INTERNAL_ASSERT(
+        from_it != from->getRFactorDomain().end(),
+        "Expected ",
+        from_rfactor_id->toString(),
+        " to be in the rfactor of ",
+        from->toString());
+    auto pos = std::distance(from->getRFactorDomain().begin(), from_it);
+    sibling_rfactor_ids.push_back(to->getRFactorDomain()[pos]);
+  }
+  
+  mapped_rfactor_ids_[to] = sibling_rfactor_ids;
 }
 
 } // namespace vectorize_helper

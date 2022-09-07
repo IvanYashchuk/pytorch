@@ -6,6 +6,7 @@
 #include <torch/csrc/jit/codegen/cuda/lower_utils.h>
 #include <torch/csrc/jit/codegen/cuda/ops/all_ops.h>
 #include <torch/csrc/jit/codegen/cuda/scheduler/utils.h>
+#include <torch/csrc/jit/codegen/cuda/scheduler/vectorize_helper.h>
 #include <torch/csrc/jit/codegen/cuda/test/test_gpu_validator.h>
 #include <torch/csrc/jit/codegen/cuda/test/test_utils.h>
 
@@ -266,6 +267,60 @@ TEST_F(NVFuserTest, FusionTVDomainGuard_CUDA) {
     TORCH_CHECK(tv->domain()->contiguity() == all_true);
   }
   TORCH_CHECK(tv->domain()->contiguity() == false_true);
+}
+
+
+// Test view/transpose and its impact on vectorization
+TEST_F(NVFuserTest, FusionVectorizeHelper1_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int x = 128, y = 128;
+
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {x, y}, {x, y / 2, 2});
+  auto tv2 = transpose(tv1, 0, 1);
+
+  auto tv3 = makeContigTensor(3);
+  fusion.addInput(tv3);
+  auto tv4 = add(tv2, tv3);
+  fusion.addOutput(tv4);
+fusion.printMath();
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv4, {tv4->axis(1), tv4->axis(2)});
+
+  auto root_of_tv0 = mapper.mappedRootIds().at(tv0);
+  std::cout<<root_of_tv0<<std::endl;
+  for(auto root_id : root_of_tv0){
+    std::cout<<mapper.getMaybePartialMappedExtent(root_id)->toInlineString()<<", ";
+  }
+  std::cout << std::endl;
+
+  // fusion.printMath();
+  // auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  // at::Tensor t0 = at::randn({x, y}, options);
+  // auto t1 = at::native::view(t0, {x, y / 2, 2});
+
+  // auto t2 = t1.transpose(0, 1);
+  // at::Tensor t3 = at::randn({y / 2, x, 2}, options);
+  // auto t4 = add(t2, t3);
+
+  // FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  // // Collect the heuristic params
+  // executor_cache.profile(true);
+  // auto cg_outputs = executor_cache.runFusionWithInputs({t0, t3});
+
+  // // TODO: Fix ref handling int pointwise scheduler to accept this program as
+  // // one segment.
+  // TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  // TORCH_CHECK(executor_cache.getMostRecentExecutorInfo()
+  //                 .params->isA<PointwiseParams>());
+
+  // testValidate(&fusion, cg_outputs, {t0, t3}, {t4}, __LINE__, __FILE__);
 }
 
 } // namespace jit

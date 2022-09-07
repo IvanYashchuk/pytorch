@@ -2346,8 +2346,7 @@ std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
         continue;
       }
       auto pos = std::distance(reordered_ids.begin(), find_it);
-      reordered_ids.erase(reordered_ids.begin() + pos);
-      reordered_ids.insert(reordered_ids.begin() + pos, split->inner());
+      reordered_ids[pos] = split->inner();
       reordered_ids.insert(reordered_ids.begin() + pos, split->outer());
     } else if (const Merge* merge = dynamic_cast<const Merge*>(expr)) {
       auto find_it_0 =
@@ -2376,9 +2375,7 @@ std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
           merge->toString());
 
       reordered_ids.erase(reordered_ids.begin() + pos0);
-      pos1--;
-      reordered_ids.erase(reordered_ids.begin() + pos1);
-      reordered_ids.insert(reordered_ids.begin() + pos1, merge->out());
+      reordered_ids[--pos1] = merge->out();
     }
   }
 
