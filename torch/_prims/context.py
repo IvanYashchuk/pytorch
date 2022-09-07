@@ -338,6 +338,18 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
             and "aten.var_mean" in str(func)
         )
 
+    def _is_view_or_reshape(self, func):
+        allowed_ops = [
+            "torch.Tensor.view",
+            "torch.Tensor.reshape",
+            "torch.view_copy",
+            "torch.reshape",
+            "aten.view.default",
+            "aten._unsafe_view.default",
+            "aten.view_copy.default",
+        ]
+        return torch.overrides.resolve_name(func) in allowed_ops
+
     def _is_native_batch_norm(self, func):
         return "torch.native_batch_norm" == torch.overrides.resolve_name(func) or (
             func == torch.ops.aten.native_batch_norm.default
@@ -379,12 +391,15 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
             with self:
                 return self._cudnn_batch_norm_backward(*args, **kwargs)
 
+        if self._is_view_or_reshape(orig_func):
+            return torch.ops.nvprims.view(*args, **kwargs)
+
         if self._is_native_batch_norm(orig_func):
             return torch.ops.nvprims.native_batch_norm(*args, **kwargs)
 
         if self._is_rand_like(orig_func):
             if len(kwargs) > 0:
-                warn("rand_like has ignored kwars!")
+                warn("rand_like has ignored kwargs!")
             return torch.ops.nvprims.rand_like(*args)
 
         # Then we use TorchRefsMode to interpret the rest
