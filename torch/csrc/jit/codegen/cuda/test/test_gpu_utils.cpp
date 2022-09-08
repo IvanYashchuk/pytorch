@@ -841,6 +841,61 @@ TEST_F(NVFuserTest, FusionVectorizeForwardMapper8_CUDA) {
   TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
 }
 
+// Test propogation doesn't proceed across missing dimensions
+TEST_F(NVFuserTest, FusionVectorizeMapperAdvanced_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  // For broadcast we can't back propogate mapped axes to the left of bcast
+  // axis.
+  // For reduction we can't forward propogate mapped axes to the left of the
+  // reduce axis.
+
+  auto tv0 = makeContigConcreteTensor({3, 4 * 6});
+  fusion.addInput(tv0);
+
+  auto tv1 = view(tv0, {3, 4 * 6}, {3, 4, 6});
+  auto tv2 = broadcast(tv1, {false, false, true, false});
+
+  auto tv3 = makeContigConcreteTensor({3, 4, 5, 6});
+  fusion.addInput(tv3);
+  auto tv4 = add(tv3, tv2);
+
+  auto tv5 = view(tv4, {3, 4, 5, 6}, {3 * 4 * 5, 6});
+
+  // Broadcast path from tv0->tv5
+  fusion.addOutput(tv5);
+
+  // Sum path from tv3->tv6
+  auto tv6 = sum(tv3, {2});
+  auto tv7 = view(tv6, {3, 4, 6}, {3, 4 * 6});
+  fusion.addOutput(tv7);
+  {
+    // tv5[3*4*5, 6]
+    // tv0[3, 4*6]
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv5, {tv5->axis(0), tv5->axis(1)});
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(1)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv0->axis(1))->evaluateInt() == 6);
+  }
+
+  {
+    // tv3[3, 4, 5, 6]
+    // tv7[3, 4*6]
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv3, {tv3->axis(0), tv3->axis(1), tv3->axis(2), tv3->axis(3)});
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv7).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv7)[0]->sameAs(tv7->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv7->axis(1)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv7->axis(1))->evaluateInt() == 6);
+  }
+}
+
 } // namespace jit
 } // namespace torch
 // #endif // #if defined(USE_CUDA)
