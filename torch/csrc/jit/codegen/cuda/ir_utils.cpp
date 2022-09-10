@@ -874,8 +874,7 @@ bool isReductionTvOp(const Expr* expr) {
   return ir_utils::isTvOp(expr) && isReductionOp(expr);
 }
 
-
-TORCH_CUDA_CU_API std::vector<ViewOp*> getViewOps(Fusion* fusion){
+TORCH_CUDA_CU_API std::vector<ViewOp*> getViewOps(Fusion* fusion) {
   auto all_exprs = fusion->exprs();
 
   auto all_view_ops = ir_utils::filterByType<ViewOp>(all_exprs);

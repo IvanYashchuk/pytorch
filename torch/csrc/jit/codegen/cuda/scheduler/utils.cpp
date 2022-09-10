@@ -1851,7 +1851,7 @@ c10::optional<IterDomain*> getMaybeRootIfInnermostTiled(
 
 } // namespace
 
-TORCH_CUDA_CU_API void orderTiledConcreteIdAsRoot(TensorView* tv) {
+void orderTiledConcreteIdAsRoot(TensorView* tv) {
   auto ndims = tv->nDims();
 
   // Keep track of the left most position where we will
@@ -1951,9 +1951,7 @@ TORCH_CUDA_CU_API void orderTiledConcreteIdAsRoot(TensorView* tv) {
 } // namespace matmul_utils
 
 //! Propagate current transformations on from_tv to all graphs
-TORCH_CUDA_CU_API void transformPropagateToAllFrom(
-    TensorView* from_tv,
-    int pos) {
+void transformPropagateToAllFrom(TensorView* from_tv, int pos) {
   TransformPropagator propagator(from_tv, pos);
   MaxRootDomainInfoSpanningTree(from_tv, nullptr).traverse(&propagator);
 }
@@ -2179,7 +2177,7 @@ void BoundedDirectionalTransformPropagator::bothWays(
   propagate(from, pos, included_tvs, *options);
 }
 
-TORCH_CUDA_CU_API DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion) {
+DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion) {
   // Start from the exact iter domain graph of the fusion
   IterDomainGraph id_graph(fusion);
   auto disjoint_view_ids = id_graph.exactNodes();
@@ -2208,7 +2206,7 @@ TORCH_CUDA_CU_API DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion) {
   return disjoint_view_ids;
 }
 
-TORCH_CUDA_CU_API bool allMatchingViews(Fusion* fusion) {
+bool allMatchingViews(Fusion* fusion) {
   // Start from the exact iter domain graph of the fusion
   IterDomainGraph id_graph(fusion);
   auto exact_disjoint_set = id_graph.exactNodes();
@@ -2299,7 +2297,7 @@ TORCH_CUDA_CU_API bool allMatchingViews(Fusion* fusion) {
   return true;
 }
 
-TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
+bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
   if (pos < 0) {
     pos += group_ids.size();
   }
@@ -2314,10 +2312,7 @@ TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
     return true;
   }
 
-  std::unordered_set<int> left_ints;
-  for (auto i : c10::irange(pos)) {
-    left_ints.emplace(group_ids[i]);
-  }
+  std::unordered_set<int> left_ints(group_ids.begin(), group_ids.begin() + pos);
 
   for (auto i = pos; i < group_ids.size(); i++) {
     if (left_ints.count(group_ids[i]) > 0) {

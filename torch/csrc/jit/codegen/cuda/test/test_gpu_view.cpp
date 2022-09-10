@@ -1718,9 +1718,7 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule5_CUDA) {
   executor_cache.profile(true);
   auto cg_outputs = executor_cache.runFusionWithInputs({t0, t3});
 
-  // TODO: Fix ref handling int pointwise scheduler to accept this program as
-  // one segment.
-  // TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  TORCH_CHECK(!executor_cache.getMostRecentKernelRuntime()->isSegmented());
   TORCH_CHECK(executor_cache.getMostRecentExecutorInfo()
                   .params->isA<PointwiseParams>());
 

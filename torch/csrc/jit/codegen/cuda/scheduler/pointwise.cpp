@@ -553,10 +553,11 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
     // Merge rhs, then lhs.
     IterDomain* rhs_id = nullptr;
     IterDomain* lhs_id = nullptr;
-    for (auto i : c10::irange(reference_tv->nDims())) {
+    auto ndims = reference_tv->nDims();
+    for (auto i : c10::irange(ndims)) {
       // Merge from right to left
-      auto pos = reference_tv->nDims() - 1 - i;
-      auto id = reference_tv->axis(i);
+      auto pos = ndims - 1 - i;
+      auto id = reference_tv->axis(pos);
       if (lhs_all_vals_set.count(id) > 0) {
         if (lhs_id == nullptr) {
           lhs_id = id;
