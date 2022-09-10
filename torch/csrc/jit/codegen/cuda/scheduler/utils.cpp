@@ -1851,7 +1851,7 @@ c10::optional<IterDomain*> getMaybeRootIfInnermostTiled(
 
 } // namespace
 
-TORCH_CUDA_CU_API void orderTiledConcreteIdAsRoot(TensorView* tv) {
+void orderTiledConcreteIdAsRoot(TensorView* tv) {
   auto ndims = tv->nDims();
 
   // Keep track of the left most position where we will
@@ -1951,9 +1951,7 @@ TORCH_CUDA_CU_API void orderTiledConcreteIdAsRoot(TensorView* tv) {
 } // namespace matmul_utils
 
 //! Propagate current transformations on from_tv to all graphs
-TORCH_CUDA_CU_API void transformPropagateToAllFrom(
-    TensorView* from_tv,
-    int pos) {
+void transformPropagateToAllFrom(TensorView* from_tv, int pos) {
   TransformPropagator propagator(from_tv, pos);
   MaxRootDomainInfoSpanningTree(from_tv, nullptr).traverse(&propagator);
 }
@@ -2379,6 +2377,220 @@ std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
       pos1--;
       reordered_ids.erase(reordered_ids.begin() + pos1);
       reordered_ids.insert(reordered_ids.begin() + pos1, merge->out());
+    }
+  }
+
+  std::unordered_map<int, int> old2new;
+  for (auto id_i : c10::irange(tv->domain()->domain().size())) {
+    auto leaf_id = tv->axis(id_i);
+    auto find_it =
+        std::find(reordered_ids.begin(), reordered_ids.end(), leaf_id);
+    TORCH_INTERNAL_ASSERT(
+        find_it != reordered_ids.end(),
+        "Reordering map creation failed, uninitialized iterdomain,",
+        " likely something is wrong with the transformations between the rfactor domain and the leaves.");
+    int new_pos = (int)std::distance(reordered_ids.begin(), find_it);
+    int old_pos = (int)id_i;
+    old2new[old_pos] = new_pos;
+  }
+  return old2new;
+}
+
+DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion) {
+  // Start from the exact iter domain graph of the fusion
+  IterDomainGraph id_graph(fusion);
+  auto disjoint_view_ids = id_graph.exactNodes();
+
+  // If iter domains are involved in any transformation from root domains to
+  // rfactor domains they should be considered "contaminated".
+  for (auto tv : ir_utils::allTvs(fusion)) {
+    for (auto expr : StmtSort::getExprs(
+             fusion,
+             {tv->getMaybeRFactorDomain().begin(),
+              tv->getMaybeRFactorDomain().end()})) {
+      if (expr->isA<Merge>()) {
+        auto merge = expr->as<Merge>();
+        disjoint_view_ids.mapEntries(merge->inner(), merge->out());
+        disjoint_view_ids.mapEntries(merge->outer(), merge->out());
+      } else if (expr->isA<Split>()) {
+        auto split = expr->as<Split>();
+        disjoint_view_ids.mapEntries(split->in(), split->inner());
+        disjoint_view_ids.mapEntries(split->in(), split->outer());
+      } else {
+        TORCH_INTERNAL_ASSERT(
+            false, "Expression type: ", expr->toString(), " not supported.");
+      }
+    }
+  }
+  return disjoint_view_ids;
+}
+
+bool allMatchingViews(Fusion* fusion) {
+  // Start from the exact iter domain graph of the fusion
+  IterDomainGraph id_graph(fusion);
+  auto exact_disjoint_set = id_graph.exactNodes();
+
+  auto view_exprs = ir_utils::getViewOps(fusion);
+  if (view_exprs.empty()) {
+    return true;
+  }
+
+  std::vector<TensorView*> all_view_outs;
+
+  for (auto view_expr : view_exprs) {
+    auto outs = ir_utils::filterByType<TensorView>(view_expr->outputs());
+    all_view_outs.insert(all_view_outs.end(), outs.begin(), outs.end());
+  }
+
+  TORCH_INTERNAL_ASSERT(
+      all_view_outs.size() > 0,
+      "Found view operations but can't find any output tensor views.");
+
+  auto first_out_tv = *all_view_outs.begin();
+  auto first_root_dom =
+      TensorDomain::noReductions(first_out_tv->getRootDomain());
+  auto first_rfactor_dom =
+      TensorDomain::noReductions(first_out_tv->getRFactorDomain());
+
+  for (auto other_out_tv : all_view_outs) {
+    if (other_out_tv == first_out_tv) {
+      continue;
+    }
+
+    auto other_root_dom =
+        TensorDomain::noReductions(other_out_tv->getRootDomain());
+    auto other_rfactor_dom =
+        TensorDomain::noReductions(other_out_tv->getRFactorDomain());
+
+    if (first_root_dom.size() != other_root_dom.size() ||
+        first_rfactor_dom.size() != other_rfactor_dom.size()) {
+      return false;
+    }
+    {
+      std::vector<std::pair<IterDomain*, IterDomain*>> zipped_ids;
+
+      std::transform(
+          first_root_dom.begin(),
+          first_root_dom.end(),
+          other_root_dom.begin(),
+          std::back_inserter(zipped_ids),
+          [](IterDomain* first, IterDomain* second) {
+            return std::make_pair(first, second);
+          });
+
+      if (std::any_of(
+              zipped_ids.begin(),
+              zipped_ids.end(),
+              [&exact_disjoint_set](
+                  std::pair<IterDomain*, IterDomain*> id_pair) {
+                return !exact_disjoint_set.strictAreMapped(
+                    id_pair.first, id_pair.second);
+              })) {
+        return false;
+      }
+    }
+    {
+      std::vector<std::pair<IterDomain*, IterDomain*>> zipped_ids;
+
+      std::transform(
+          first_rfactor_dom.begin(),
+          first_rfactor_dom.end(),
+          other_rfactor_dom.begin(),
+          std::back_inserter(zipped_ids),
+          [](IterDomain* first, IterDomain* second) {
+            return std::make_pair(first, second);
+          });
+
+      if (std::any_of(
+              zipped_ids.begin(),
+              zipped_ids.end(),
+              [&exact_disjoint_set](
+                  std::pair<IterDomain*, IterDomain*> id_pair) {
+                return !exact_disjoint_set.strictAreMapped(
+                    id_pair.first, id_pair.second);
+              })) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool breakIsDisjoint(std::vector<int> group_ids, int pos) {
+  if (pos < 0) {
+    pos += group_ids.size();
+  }
+  TORCH_INTERNAL_ASSERT(
+      pos >= 0 && pos <= group_ids.size(),
+      "Invalid position, size of vec is ",
+      group_ids.size(),
+      " but position is ",
+      pos);
+
+  if (pos == 0 || pos == group_ids.size()) {
+    return true;
+  }
+
+  std::unordered_set<int> left_ints(group_ids.begin(), group_ids.begin() + pos);
+
+  for (auto i = pos; i < group_ids.size(); i++) {
+    if (left_ints.count(group_ids[i]) > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
+  FusionGuard fg(tv->fusion());
+  auto transform_exprs = StmtSort::getExprs(
+      tv->fusion(),
+      {tv->domain()->domain().begin(), tv->domain()->domain().end()});
+  // simply update this vector of id's as progressing through the transformation
+  // expressions. We'll always insert the result of split in the location of the
+  // input, and insert the merge result in the position of the inner dimension.
+
+  auto reordered_ids = tv->getMaybeRFactorDomain();
+  for (const auto* expr : transform_exprs) {
+    if (const Split* split = dynamic_cast<const Split*>(expr)) {
+      auto find_it =
+          std::find(reordered_ids.begin(), reordered_ids.end(), split->in());
+      if (find_it == reordered_ids.end()) {
+        // Transformations before rfactor, ignore those.
+        continue;
+      }
+      auto pos = std::distance(reordered_ids.begin(), find_it);
+      reordered_ids[pos] = split->inner();
+      reordered_ids.insert(reordered_ids.begin() + pos, split->outer());
+    } else if (const Merge* merge = dynamic_cast<const Merge*>(expr)) {
+      auto find_it_0 =
+          std::find(reordered_ids.begin(), reordered_ids.end(), merge->outer());
+      auto find_it_1 =
+          std::find(reordered_ids.begin(), reordered_ids.end(), merge->inner());
+      if (find_it_0 == reordered_ids.end() &&
+          find_it_1 == reordered_ids.end()) {
+        // Transformations before rfactor, ignore those.
+        continue;
+      }
+      TORCH_INTERNAL_ASSERT(
+          find_it_0 != reordered_ids.end() && find_it_1 != reordered_ids.end(),
+          "Error in transformations of ",
+          tv->toString(),
+          "\nTransformations before rfactor should not mix with transformations after rfactor.");
+      auto pos0 = std::distance(reordered_ids.begin(), find_it_0);
+      auto pos1 = std::distance(reordered_ids.begin(), find_it_1);
+      if (pos0 > pos1) {
+        std::swap(pos0, pos1);
+      }
+      // Should be impossible.
+      TORCH_INTERNAL_ASSERT(
+          pos0 != pos1,
+          "Didn't expect merge inputs to be the same iteratrion domain:\n",
+          merge->toString());
+
+      reordered_ids.erase(reordered_ids.begin() + pos0);
+      pos1--;
+      reordered_ids[pos1] = merge->out();
     }
   }
 
