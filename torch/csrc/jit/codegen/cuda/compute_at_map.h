@@ -88,14 +88,20 @@ class TORCH_CUDA_CU_API IterDomainGraph {
     return view_rfactor_ids_;
   }
 
+  // Returns if first and second are expressions through which the provided
+  // id_map have matching inputs (if forward), or outputs (if not forward).
+  // Returning true means the expressions are "the same", in terms they modify
+  // matching original extents, by the same amount.
+  static bool exprsMap(
+      Expr* first,
+      Expr* second,
+      bool forward,
+      const DisjointSets<IterDomain*>& id_map);
+
  private:
   void build(Fusion* fusion);
 
   void initializeId(IterDomain* id, bool is_view_rfactor_id, bool is_leaf_id);
-
-  // Returns if first and second are expressions with inputs match through exact
-  // map (if forward), or outputs match (if not forward).
-  bool exprsMap(Expr* first, Expr* second, bool forward);
 
   // Checks if exprsMap then if forward will map outputs else inputs in exact
   // and permissive map.
