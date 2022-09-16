@@ -112,7 +112,8 @@ IndexingParameters getLinearIndexParameters(
 
   for (auto loop_idx : c10::irange(loops.size())) {
     auto loop = loops[loop_idx];
-    auto index_domain = ir_utils::caMapExactConcreteId(loop_domain[loop_idx]);
+    auto index_domain = GpuLower::current()->caMap()->getConcreteMappedID(
+        loop_domain[loop_idx], IdMappingMode::EXACT);
     if (loop->isTrivial()) {
       // This is useful information in the case of
       //  MisalignedVectorize and double buffer epilog, etc.
@@ -148,7 +149,9 @@ IndexingParameters getLinearIndexParameters(
 
         auto loop_id = loop_indexing.loopDomains()[loop_idx];
 
-        auto concrete_loop_id = ir_utils::caMapExactConcreteId(loop_id);
+        auto concrete_loop_id =
+            GpuLower::current()->caMap()->getConcreteMappedID(
+                loop_id, IdMappingMode::EXACT);
 
         auto stage_depth =
             GpuLower::current()->doubleBufferInfo().getStageDepthFor(
@@ -185,7 +188,7 @@ IndexingParameters getNonGlobalInitialIndexParameters(
   }
 
   auto alloc_tv = index_producer ? producer_tv : consumer_tv;
-  auto alloc_info = loop_utils::getAllocInformation(
+  auto alloc_info = lower_loop_utils::getAllocInformation(
       alloc_tv, loops, alloc_id_map, index_producer);
 
   std::unordered_map<kir::ForLoop*, Val*> loop_to_ind_map;
@@ -216,7 +219,9 @@ IndexingParameters getNonGlobalInitialIndexParameters(
     auto loop = loops[loop_idx];
     auto loop_domain = loop_domains[loop_idx];
 
-    auto concrete_loop_domain = ir_utils::caMapExactConcreteId(loop_domain);
+    auto concrete_loop_domain =
+        GpuLower::current()->caMap()->getConcreteMappedID(
+            loop_domain, IdMappingMode::EXACT);
 
     index_parameters.initial_concrete_id_index[concrete_loop_domain] =
         loop_to_ind_map.at(loop);
@@ -397,7 +402,8 @@ IndexingParameters getPredicateInitialIndexParameters(
   for (int loop_idx : c10::irange(loops.size())) {
     auto loop = loops.at(loop_idx);
     auto concrete_loop_domain =
-        ir_utils::caMapExactConcreteId(loop_domains.at(loop_idx));
+        GpuLower::current()->caMap()->getConcreteMappedID(
+            loop_domains.at(loop_idx), IdMappingMode::EXACT);
     index_parameters.initial_concrete_id_index[concrete_loop_domain] =
         loop_to_ind_map.at(loop);
   }
@@ -563,7 +569,10 @@ LoopIndexingAnalysis::LoopIndexingAnalysis(
   // consume each concrete id once so this map is well defined.
   for (auto expr : replayed_exprs_) {
     for (auto input_id : ir_utils::filterByType<IterDomain>(expr->inputs())) {
-      concrete_id_to_consumer_[ir_utils::caMapExactConcreteId(input_id)] = expr;
+      auto concrete_input_id =
+          GpuLower::current()->caMap()->getConcreteMappedID(
+              input_id, IdMappingMode::EXACT);
+      concrete_id_to_consumer_[concrete_input_id] = expr;
     }
   }
 
@@ -595,7 +604,8 @@ void LoopIndexingAnalysis::validateLoopStructure(
   for (auto it_i = loops.begin(); it_i != loops.end(); ++it_i) {
     // Largely duplicating original logic
     auto loop_id = (*it_i)->iter_domain();
-    auto concrete_loop_id = ir_utils::caMapExactConcreteId(loop_id);
+    auto concrete_loop_id = GpuLower::current()->caMap()->getConcreteMappedID(
+        loop_id, IdMappingMode::EXACT);
 
     TORCH_INTERNAL_ASSERT(
         !concrete_to_loop.count(concrete_loop_id),
@@ -659,12 +669,21 @@ void LoopIndexingAnalysis::traverseFromDomainVals() {
 }
 
 IterDomain* LoopIndexingAnalysis::concretizeAndVisitId(IterDomain* id) {
-  auto concrete_id = ir_utils::caMapExactConcreteId(id);
+  auto concrete_id = GpuLower::current()->caMap()->getConcreteMappedID(
+      id, IdMappingMode::EXACT);
   if (replayed_concrete_ids_.pushBack(concrete_id)) {
     concrete_to_original_id_[concrete_id] = id;
   }
   return concrete_id;
 }
+
+namespace {
+// Alias used for std::transform
+IterDomain* exactConcreteId(IterDomain* id) {
+  return GpuLower::current()->caMap()->getConcreteMappedID(
+      id, IdMappingMode::EXACT);
+}
+} // namespace
 
 void LoopIndexingAnalysis::visitExpr(Expr* expr) {
   if (auto swizzle2d = dynamic_cast<Swizzle2D*>(expr)) {
@@ -700,14 +719,14 @@ void LoopIndexingAnalysis::visitExpr(Expr* expr) {
       consumed_ids.begin(),
       consumed_ids.end(),
       std::inserter(consumed_concrete_, consumed_concrete_.end()),
-      ir_utils::caMapExactConcreteId);
+      exactConcreteId);
 
   auto produced_ids = ir_utils::filterByType<IterDomain>(expr->outputs());
   std::transform(
       produced_ids.begin(),
       produced_ids.end(),
       std::inserter(produced_concrete_, produced_concrete_.end()),
-      ir_utils::caMapExactConcreteId);
+      exactConcreteId);
 }
 
 bool LoopIndexingAnalysis::visitIdsAndCheckDuplication(
@@ -797,7 +816,8 @@ void LoopIndexingAnalysis::constructLoopDomains() {
   // will complain for not having all outputs of the traversal.
   for (auto id : ir_utils::filterByType<IterDomain>(all_ids_from_root)) {
     if (id->uses().empty()) {
-      loop_domains_.pushBack(ir_utils::caMapExactConcreteId(id));
+      loop_domains_.pushBack(GpuLower::current()->caMap()->getConcreteMappedID(
+          id, IdMappingMode::EXACT));
     }
   }
 }
@@ -877,7 +897,8 @@ IndexFromIdGraph getTensorIndexFromIdGraph(
 
     // Exact id will have to be pulled from consumer side as the
     //  producer side are replayed ids.
-    auto exact_concrete_id = ir_utils::caMapExactConcreteId(consumer_id);
+    auto exact_concrete_id = GpuLower::current()->caMap()->getConcreteMappedID(
+        consumer_id, IdMappingMode::EXACT);
 
     index_update_map[exact_concrete_id] = target_id;
 
@@ -958,7 +979,8 @@ IndexFromIdGraph getPredicateIndexingFromIdGraph(
        ir_utils::filterByType<IterDomain>(all_consumer_vals)) {
     // Track the non-concrete id we were trying to bind index
     //  to, whether from producer or consumer.
-    auto exact_concrete_id = ir_utils::caMapExactConcreteId(consumer_id);
+    auto exact_concrete_id = GpuLower::current()->caMap()->getConcreteMappedID(
+        consumer_id, IdMappingMode::EXACT);
     index_update_map[exact_concrete_id] = consumer_id;
   }
 
@@ -1037,7 +1059,8 @@ LoopIndexingTraversal::LoopIndexingTraversal(
     auto next_ids =
         ir_utils::filterByType<IterDomain>(nextValsInTraversalOrder(expr));
     for (auto id : next_ids) {
-      auto concrete_id = ir_utils::caMapExactConcreteId(id);
+      auto concrete_id = GpuLower::current()->caMap()->getConcreteMappedID(
+          id, IdMappingMode::EXACT);
       TORCH_INTERNAL_ASSERT(
           concrete_id_to_dependency_.insert(std::make_pair(concrete_id, expr))
               .second,
@@ -1105,7 +1128,8 @@ std::vector<Expr*> LoopIndexingTraversal::getExprList() {
     for (auto prev_id :
          ir_utils::filterByType<IterDomain>(prevValsInTraversalOrder(top))) {
       auto prev_expr_it = concrete_id_to_dependency_.find(
-          ir_utils::caMapExactConcreteId(prev_id));
+          GpuLower::current()->caMap()->getConcreteMappedID(
+              prev_id, IdMappingMode::EXACT));
       if (prev_expr_it != concrete_id_to_dependency_.end()) {
         auto prev_expr = prev_expr_it->second;
         if (!visited.count(prev_expr)) {
@@ -1142,7 +1166,7 @@ void LoopIndexingAnalysis::collectOutOfLineExprs() {
           consumer_tv_->getComputeAtPosition(),
       consumer_tv_->domain()->domain().end(),
       std::inserter(out_of_line_ids, out_of_line_ids.end()),
-      ir_utils::caMapExactConcreteId);
+      exactConcreteId);
 
   // Get the original selected list of index expressions
   //  in reverse topological order.
@@ -1157,7 +1181,9 @@ void LoopIndexingAnalysis::collectOutOfLineExprs() {
             id_outputs.begin(),
             id_outputs.end(),
             [&out_of_line_ids](IterDomain* id) {
-              return out_of_line_ids.count(ir_utils::caMapExactConcreteId(id));
+              return out_of_line_ids.count(
+                  GpuLower::current()->caMap()->getConcreteMappedID(
+                      id, IdMappingMode::EXACT));
             })) {
       // Record out of line expression
       out_of_line_exprs_.push_back(expr);
@@ -1168,7 +1194,7 @@ void LoopIndexingAnalysis::collectOutOfLineExprs() {
           id_inputs.begin(),
           id_inputs.end(),
           std::inserter(out_of_line_ids, out_of_line_ids.end()),
-          ir_utils::caMapExactConcreteId);
+          exactConcreteId);
     }
   }
 }
@@ -1189,14 +1215,14 @@ std::unordered_set<IterDomain*> LoopIndexing::getAllExactConcreteIdSet() const {
         out_ids.begin(),
         out_ids.end(),
         std::inserter(all_id_set, all_id_set.end()),
-        ir_utils::caMapExactConcreteId);
+        exactConcreteId);
 
     auto in_ids = ir_utils::filterByType<IterDomain>(expr->inputs());
     std::transform(
         in_ids.begin(),
         in_ids.end(),
         std::inserter(all_id_set, all_id_set.end()),
-        ir_utils::caMapExactConcreteId);
+        exactConcreteId);
   }
   return all_id_set;
 }
@@ -1241,7 +1267,9 @@ class LoopIndexingPreferredPathCompute : public IterVisitor {
         }
         mapped_id = c_id_it->second;
       }
-      auto concrete_original_id = ir_utils::caMapExactConcreteId(mapped_id);
+      auto concrete_original_id =
+          GpuLower::current()->caMap()->getConcreteMappedID(
+              mapped_id, IdMappingMode::EXACT);
       if (all_concrete_ids.count(concrete_original_id)) {
         if (original_id->isBroadcast() || original_id->isReduction() ||
             original_id->isStride()) {
@@ -1267,8 +1295,10 @@ class LoopIndexingPreferredPathCompute : public IterVisitor {
             all_iter_inputs.begin(),
             all_iter_inputs.end(),
             [&](IterDomain* inp_id) {
-              return this->preferred_path_.find(ir_utils::caMapExactConcreteId(
-                         inp_id)) != this->preferred_path_.end();
+              return this->preferred_path_.find(
+                         GpuLower::current()->caMap()->getConcreteMappedID(
+                             inp_id, IdMappingMode::EXACT)) !=
+                  this->preferred_path_.end();
             })) {
       auto all_iter_outputs = ir_utils::filterByType<IterDomain>(e->outputs());
 
@@ -1276,7 +1306,7 @@ class LoopIndexingPreferredPathCompute : public IterVisitor {
           all_iter_outputs.begin(),
           all_iter_outputs.end(),
           std::inserter(preferred_path_, preferred_path_.end()),
-          ir_utils::caMapExactConcreteId);
+          exactConcreteId);
     }
   }
 
