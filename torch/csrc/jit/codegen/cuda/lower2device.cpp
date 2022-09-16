@@ -261,7 +261,8 @@ void GpuLower::lower(Fusion* fusion, DataType index_type) {
   divisible_splits_ = getAllDivisibleSplits(fusion_, compute_at_map_.get());
 
   // Used in parallel dimension map
-  concretized_broadcast_domains_.build(fusion_);
+  concretized_broadcast_domains_ =
+      std::make_shared<const ConcretizedBroadcastDomains>(fusion_);
 
   parallelDimensionMap().build(fusion_);
   if (isDebugDumpEnabled(DebugDumpOption::ParallelDimensions)) {
