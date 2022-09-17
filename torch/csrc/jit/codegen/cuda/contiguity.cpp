@@ -406,13 +406,15 @@ ContigIDs::ContigIDs(
     std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref,
     const std::unordered_set<Split*>& divisible_splits,
     std::unordered_map<IterDomain*, IterDomain*> p2c_id_map,
-    bool ignore_indexability)
+    bool ignore_indexability,
+    bool ignore_consistent_ordering)
     : root_domain_(root_domain),
       root_contiguity_(root_contiguity),
       concrete_to_ref_(std::move(concrete_to_ref)),
       divisible_splits_(divisible_splits),
       p2c_id_map_(std::move(p2c_id_map)),
       ignore_indexability_(ignore_indexability),
+      ignore_consistent_ordering_(ignore_consistent_ordering),
       non_divisible_id_info_(ids, root_domain_, divisible_splits_) {
   if (ids.size() > 0) {
     // This constructor doesn't provide the following information so it needs to
@@ -438,7 +440,8 @@ ContigIDs::ContigIDs(
     std::shared_ptr<const HaloInfo> halo_info,
     std::shared_ptr<const ConcretizedBroadcastDomains> concrete_info,
     std::unordered_map<IterDomain*, IterDomain*> p2c_id_map,
-    bool ignore_indexability)
+    bool ignore_indexability,
+    bool ignore_consistent_ordering)
     : root_domain_(root_domain),
       root_contiguity_(root_contiguity),
       concrete_to_ref_(std::move(concrete_to_ref)),
@@ -448,6 +451,7 @@ ContigIDs::ContigIDs(
       concrete_info_(concrete_info),
       p2c_id_map_(std::move(p2c_id_map)),
       ignore_indexability_(ignore_indexability),
+      ignore_consistent_ordering_(ignore_consistent_ordering),
       consistent_transform_info_(std::make_unique<const OrderedIdInformation>(
           ids,
           root_domain,
@@ -501,12 +505,16 @@ void ContigIDs::handle(Merge* merge) {
   // If output is not consistently ordered or doesn't solely consume all root
   // domains in its dependencies, then it can't be a contiguously indexable
   // iterdomain.
-  if (!(consistent_transform_info_->isConsistentlyOrdered(merge->out()) &&
-        consistent_transform_info_->exclusivelyConsumesRoots(merge->out()))) {
+  if (!(ignore_consistent_ordering_ ||
+        consistent_transform_info_->isConsistentlyOrdered(merge->out()))) {
     return;
   }
 
-  // If output is not "directly indexable" then it'd efinitely not contiguously
+  if (!consistent_transform_info_->exclusivelyConsumesRoots(merge->out())) {
+    return;
+  }
+
+  // If output is not "directly indexable" then it's definitely not contiguously
   // indexable.
   if (!ignore_indexability_ && !isIndexable(merge->out())) {
     return;
@@ -533,9 +541,19 @@ void ContigIDs::handle(Merge* merge) {
       root_ids.erase(root_id);
       // If the last id isn't contiguous that's fine, we can use the stride of
       // the last iter domain to multiply the contig index.
-      if (!root_contiguity_[root_id_i] && !root_ids.empty()) {
-        // Otherwise this merge->out() isn't a contiguously indexable ID
-        return;
+      if (!root_contiguity_[root_id_i]) {
+        // If it's the last root, and we're indexing
+        // (!ignore_consistent_ordering) we can still consider this ID
+        // contiguously indexable since it will still be multiplied by its
+        // stride. If we're computing predicates, then we don't want to do this,
+        // as when we mark something as non-contiguous we don't want it merged
+        // with any other domains.
+        //
+        // TODO: This didn't error when I removed "!ignore_consistent_ordering_"
+        // is it really needed?
+        if (!(root_ids.empty() && !ignore_consistent_ordering_)) {
+          return;
+        }
       }
       last_root = root_id;
     }

@@ -2347,32 +2347,16 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
     return std::vector<PredicateDomainInfo>();
   }
 
-  // If root IDs are partial, i.e., start is non-zero and stop is not
-  // equal to extent, predication can't be done with merged domains as
-  // start and stop information is only available with root
-  // domains. Similarly, merged domains don't have enough information
-  // about halo to do correct predication, so they must be excluded.
-  std::unordered_set<IterDomain*> excluded_ids;
-
-  for (auto consumer_root_id : consumer_root_domain) {
-    if (gpu_lower->haloInfo()->getRootAxisInfo(consumer_root_id).hasHalo()) {
-      excluded_ids.insert(consumer_root_id);
-      continue;
-    }
-    if (consumer_root_id->maybePartial()) {
-      excluded_ids.insert(consumer_root_id);
-      continue;
-    }
-    // When consumer_root_id is a broadcast domain, do not allow contig
-    // predication as the merged output is not mapped with the
-    // reference unless the concrete domain is also a broadcast
-    // domain.
-    if (consumer_root_id->isBroadcast() &&
-        !GpuLower::current()
-             ->caMap()
-             ->getConcreteMappedID(consumer_root_id, IdMappingMode::PERMISSIVE)
-             ->isBroadcast()) {
-      excluded_ids.insert(consumer_root_id);
+  std::unordered_map<IterDomain*, IterDomain*> contig_concrete_to_ref_map;
+  for(auto entry : consumer_index_map){
+    auto c_id = gpu_lower->caMap()->getConcreteMappedID(entry.first, IdMappingMode::EXACT);
+    contig_concrete_to_ref_map[c_id] = c_id;
+  }
+  std::vector<bool> predicate_contiguity(consumer_root_domain.size(), true);
+  for (auto root_i : c10::irange(predicate_contiguity.size())) {
+    auto root_id = consumer_root_domain[root_i];
+    if (root_id->maybePartial()) {
+      // predicate_contiguity[root_i] = false;
       continue;
     }
     // Shifted or gathered axes need to be predicated at the root domain
@@ -2381,68 +2365,55 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
     if (shift_expr == nullptr && gather_expr == nullptr) {
       continue;
     }
-    auto consumer_root_pos = consumer_tv->domain()->rootPosOf(consumer_root_id);
-    if ((shift_expr && shift_expr->offset(consumer_root_pos) != 0) ||
-        (gather_expr && consumer_root_pos < gather_expr->windowShape().size() &&
-         gather_expr->windowShape().at(consumer_root_pos) != 1)) {
-      excluded_ids.insert(consumer_root_id);
+    if ((shift_expr && shift_expr->offset(root_i) != 0) ||
+        (gather_expr && root_i < gather_expr->windowShape().size() &&
+         gather_expr->windowShape().at(root_i) != 1)) {
+      // TODO: The following line commented out didn't have any failures, is it
+      // needed?
+      predicate_contiguity[root_i] = false;
     }
   }
 
-  // Run through iteration domain history
-  auto exprs = StmtSort::getExprs(
-      consumer_tv->fusion(),
-      {consumer_tv->domain()->domain().begin(),
-       consumer_tv->domain()->domain().end()});
+ContigIDs contig_finder(
+    consumer_tv->domain()->domain(),
+    consumer_root_domain,
+    predicate_contiguity,
+    contig_concrete_to_ref_map,
+    GpuLower::current()->divisbleSplitSet(),
+    GpuLower::current()->caMap(),
+    GpuLower::current()->haloInfo(),
+    GpuLower::current()->concretizedBroadcastDomains(),
+    {},
+    false,
+    true);
 
-  for (auto expr : exprs) {
-    // If not a merge, output is not contiguous
-    if (expr->isA<Merge>()) {
-      auto merge = expr->as<Merge>();
-      auto inner_contig_it = std::find(
-          contiguous_ids.begin(), contiguous_ids.end(), merge->inner());
-      auto outer_contig_it = std::find(
-          contiguous_ids.begin(), contiguous_ids.end(), merge->outer());
+std::vector<PredicateDomainInfo> contig_id_infos;
+std::unordered_set<IterDomain*> covered_roots;
 
-      if (excluded_ids.count(merge->inner()) > 0 ||
-          excluded_ids.count(merge->outer()) > 0) {
-        continue;
-      }
-
-      // Do not try to predicate the merge output domain if the output
-      // domain has not a predicate that is mapped from the reference.
-      // See FusionContigPredicate_CUDA for a concrete example.
-      if (consumer_index_map.find(merge->out()) == consumer_index_map.end()) {
-        continue;
-      }
-
-      if (inner_contig_it != contiguous_ids.end() &&
-          outer_contig_it != contiguous_ids.end()) {
-        // If inner and outer are contiguous, out must be contiguous. Remove
-        // inner and outer, and add out.
-        contiguous_ids.erase(outer_contig_it);
-        contiguous_ids.erase(std::find(
-            contiguous_ids.begin(), contiguous_ids.end(), merge->inner()));
-        contiguous_ids.emplace_back(merge->out());
-      }
-    }
+// Create entries and return them
+for (auto root_id : consumer_root_domain) {
+  if(covered_roots.count(root_id) > 0){
+    continue;
   }
 
-  std::vector<PredicateDomainInfo> contig_id_infos;
+  auto contig_id_it = contig_finder.rootToIndexedID().find(root_id);
 
-  // Create entries and return them
-  for (auto contig_id : contiguous_ids) {
-    // Pick inputs from the starting domains, i.e.,
-    // reference_predicated_root_domain.
-    auto contig_root_vals = IterVisitor::getInputsTo(
-        {contig_id},
-        {consumer_root_domain.begin(), consumer_root_domain.end()});
-    auto contig_root_ids = ir_utils::filterByType<IterDomain>(contig_root_vals);
-    PredicateDomainInfo contig_id_info;
-    contig_id_info.id = contig_id;
-    contig_id_info.covered_ids = std::unordered_set<IterDomain*>(
-        contig_root_ids.begin(), contig_root_ids.end());
-    contig_id_infos.push_back(contig_id_info);
+  TORCH_INTERNAL_ASSERT(
+      contig_id_it != contig_finder.rootToIndexedID().end(),
+      "Error in predicate contiguity analysis, missing index for root ",
+      root_id->toString());
+
+  auto contig_id = contig_id_it->second;
+
+  // Pick inputs from the starting domains, i.e.,
+  // reference_predicated_root_domain.
+  auto contig_root_ids = contig_finder.indexedRootIDs(contig_id);
+  covered_roots.insert(contig_root_ids.begin(), contig_root_ids.end());
+  PredicateDomainInfo contig_id_info;
+  contig_id_info.id = contig_id;
+  contig_id_info.covered_ids = std::unordered_set<IterDomain*>(
+      contig_root_ids.begin(), contig_root_ids.end());
+  contig_id_infos.push_back(contig_id_info);
   }
   return contig_id_infos;
 }
