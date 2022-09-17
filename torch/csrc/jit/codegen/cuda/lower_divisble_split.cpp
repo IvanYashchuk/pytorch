@@ -43,6 +43,7 @@ std::unordered_set<Split*> getAllDivisibleSplits(
     all_divisible_splits.insert(split_exprs.begin(), split_exprs.end());
   }
 
+  // Collect vectorized dimensions as they have to be divisible inner splits.
   for (auto tv : all_tvs) {
     auto vec_id_it = std::find_if(
         tv->domain()->domain().begin(),
@@ -67,6 +68,32 @@ std::unordered_set<Split*> getAllDivisibleSplits(
     auto vec_id = *vec_id_it;
     if (vec_id->definition() != nullptr && vec_id->definition()->isA<Split>()) {
       all_divisible_splits.emplace(vec_id->definition()->as<Split>());
+    }
+  }
+
+  // Collect Splits with compile time constant inputs to see if they're
+  // divisible.
+  for (auto tv : all_tvs) {
+    auto transforms = StmtSort::getExprs(
+        tv->fusion(),
+        {tv->domain()->domain().begin(), tv->domain()->domain().end()});
+    auto splits = ir_utils::filterByType<Split>(transforms);
+    for (auto split : splits) {
+      if (split->factor()->isConstInt()) {
+        if (split->in()->extent()->isConstInt() &&
+            split->in()->extent()->evaluateInt() %
+                    split->factor()->evaluateInt() ==
+                0) {
+          all_divisible_splits.emplace(split);
+          continue;
+        }
+
+        // even if the extent size is unknown, if the factor is known to
+        // be 1, it's always divisible
+        if (split->factor()->evaluateInt() == 1) {
+          all_divisible_splits.emplace(split);
+        }
+      }
     }
   }
 
