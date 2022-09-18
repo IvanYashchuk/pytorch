@@ -2348,8 +2348,9 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
   }
 
   std::unordered_map<IterDomain*, IterDomain*> contig_concrete_to_ref_map;
-  for(auto entry : consumer_index_map){
-    auto c_id = gpu_lower->caMap()->getConcreteMappedID(entry.first, IdMappingMode::EXACT);
+  for (auto entry : consumer_index_map) {
+    auto c_id = gpu_lower->caMap()->getConcreteMappedID(
+        entry.first, IdMappingMode::EXACT);
     contig_concrete_to_ref_map[c_id] = c_id;
   }
   std::vector<bool> predicate_contiguity(consumer_root_domain.size(), true);
@@ -2374,46 +2375,46 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
     }
   }
 
-ContigIDs contig_finder(
-    consumer_tv->domain()->domain(),
-    consumer_root_domain,
-    predicate_contiguity,
-    contig_concrete_to_ref_map,
-    GpuLower::current()->divisbleSplitSet(),
-    GpuLower::current()->caMap(),
-    GpuLower::current()->haloInfo(),
-    GpuLower::current()->concretizedBroadcastDomains(),
-    {},
-    false,
-    true);
+  ContigIDs contig_finder(
+      consumer_tv->domain()->domain(),
+      consumer_root_domain,
+      predicate_contiguity,
+      contig_concrete_to_ref_map,
+      GpuLower::current()->divisbleSplitSet(),
+      GpuLower::current()->caMap(),
+      GpuLower::current()->haloInfo(),
+      GpuLower::current()->concretizedBroadcastDomains(),
+      {},
+      false,
+      true);
 
-std::vector<PredicateDomainInfo> contig_id_infos;
-std::unordered_set<IterDomain*> covered_roots;
+  std::vector<PredicateDomainInfo> contig_id_infos;
+  std::unordered_set<IterDomain*> covered_roots;
 
-// Create entries and return them
-for (auto root_id : consumer_root_domain) {
-  if(covered_roots.count(root_id) > 0){
-    continue;
-  }
+  // Create entries and return them
+  for (auto root_id : consumer_root_domain) {
+    if (covered_roots.count(root_id) > 0) {
+      continue;
+    }
 
-  auto contig_id_it = contig_finder.rootToIndexedID().find(root_id);
+    auto contig_id_it = contig_finder.rootToIndexedID().find(root_id);
 
-  TORCH_INTERNAL_ASSERT(
-      contig_id_it != contig_finder.rootToIndexedID().end(),
-      "Error in predicate contiguity analysis, missing index for root ",
-      root_id->toString());
+    TORCH_INTERNAL_ASSERT(
+        contig_id_it != contig_finder.rootToIndexedID().end(),
+        "Error in predicate contiguity analysis, missing index for root ",
+        root_id->toString());
 
-  auto contig_id = contig_id_it->second;
+    auto contig_id = contig_id_it->second;
 
-  // Pick inputs from the starting domains, i.e.,
-  // reference_predicated_root_domain.
-  auto contig_root_ids = contig_finder.indexedRootIDs(contig_id);
-  covered_roots.insert(contig_root_ids.begin(), contig_root_ids.end());
-  PredicateDomainInfo contig_id_info;
-  contig_id_info.id = contig_id;
-  contig_id_info.covered_ids = std::unordered_set<IterDomain*>(
-      contig_root_ids.begin(), contig_root_ids.end());
-  contig_id_infos.push_back(contig_id_info);
+    // Pick inputs from the starting domains, i.e.,
+    // reference_predicated_root_domain.
+    auto contig_root_ids = contig_finder.indexedRootIDs(contig_id);
+    covered_roots.insert(contig_root_ids.begin(), contig_root_ids.end());
+    PredicateDomainInfo contig_id_info;
+    contig_id_info.id = contig_id;
+    contig_id_info.covered_ids = std::unordered_set<IterDomain*>(
+        contig_root_ids.begin(), contig_root_ids.end());
+    contig_id_infos.push_back(contig_id_info);
   }
   return contig_id_infos;
 }

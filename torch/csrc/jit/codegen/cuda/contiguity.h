@@ -151,7 +151,7 @@ class ContigIDs : public OptInDispatch {
   //! ignore the constraint on indexing and halo, respectively. It is
   //! the caller that is responsible for its correctness.
   //! Not really sure why but clang-tidy only complains about
-  //! std::unordered_map if passed as a const reference. 
+  //! std::unordered_map if passed as a const reference.
   ContigIDs(
       const std::vector<IterDomain*>& ids,
       const std::vector<IterDomain*>& root_domain,
