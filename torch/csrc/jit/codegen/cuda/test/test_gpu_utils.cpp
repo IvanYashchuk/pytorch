@@ -290,15 +290,6 @@ TEST_F(NVFuserTest, FusionVectorizeBackwardMapper1_CUDA) {
   }
 
   {
-    // Outer mapping doesn't propogate
-    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
-        tv1, {tv1->axis(0)});
-
-    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
-    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
-  }
-
-  {
     // Inner mapping partial propogates
     auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
         tv1, {tv1->axis(1)});
@@ -573,15 +564,6 @@ TEST_F(NVFuserTest, FusionVectorizeForwardMapper1_CUDA) {
 
     TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
     TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
-  }
-
-  {
-    // Outer mapping doesn't propogate
-    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
-        tv0, {tv0->axis(0)});
-
-    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
-    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
   }
 
   {

@@ -343,14 +343,15 @@ std::shared_ptr<PointwiseParams> getPointwiseHeuristics(
   // Try expanding vectorization to contig merged domains
   // TODO: This is an expensive function that shouldn't be in heuristics without
   // caching.
-  auto expanded_vector_word_size =
-      vectorize_helper::expandVectorizationToContigMergedDomains(
-          fusion,
-          runtime_info,
-          vectorizable_inputs_outputs,
-          largest_out,
-          break_point,
-          vectorize_factor);
+  auto maps = vectorize_helper::getAllVectorizedMapsOf(largest_out);
+
+  auto expanded_vector_word_size = vectorize_helper::getExpandedVectorization(
+      maps,
+      runtime_info,
+      vectorizable_inputs_outputs,
+      largest_out,
+      break_point,
+      vectorize_factor);
 
   expanded_vector_word_size = std::min(
       static_cast<size_t>(max_unroll_factor), expanded_vector_word_size);
