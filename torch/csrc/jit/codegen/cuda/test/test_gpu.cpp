@@ -11,7 +11,7 @@
 #include <torch/csrc/jit/codegen/cuda/fusion.h>
 #include <torch/csrc/jit/codegen/cuda/fusion_segmenter.h>
 #include <torch/csrc/jit/codegen/cuda/grouped_reduction.h>
-#include <torch/csrc/jit/codegen/cuda/inline_propagator.h>
+#include <torch/csrc/jit/codegen/cuda/inlining.h>
 #include <torch/csrc/jit/codegen/cuda/interface.h>
 #include <torch/csrc/jit/codegen/cuda/ir_all_nodes.h>
 #include <torch/csrc/jit/codegen/cuda/ir_builder.h>
@@ -9413,7 +9413,7 @@ TEST_F(NVFuserTest, FusionMagicSchedulerInstanceNormalizationBackward_CUDA) {
       "");
 }
 
-TEST_F(NVFuserTest, FusionPersistentSoftmaxLocalSmem_CUDA) {
+TEST_F(NVFuserTest, FusionPersistentSoftmaxLocalShared_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -9519,10 +9519,11 @@ TEST_F(NVFuserTest, FusionPersistentSoftmaxLocalSmem_CUDA) {
   const int64_t dimy = 16384;
 
   auto properties = at::cuda::getDeviceProperties(0);
-  // Require 70KB of smem to run test
-  const size_t required_smem_size = 70 << 10;
+  const size_t required_smem_size =
+      (dimy - static_size) * sizeof(float) + TIDX * sizeof(float);
   if (properties->sharedMemPerBlockOptin < required_smem_size) {
-    GTEST_SKIP() << "not enough shared memory space on device to run test";
+    GTEST_SKIP() << "not enough shared memory space on device to run test: "
+                 << properties->sharedMemPerBlock;
   }
 
   auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
@@ -9708,6 +9709,14 @@ TEST_F(NVFuserTest, FusionPersistentNormLocalShared_CUDA) {
   const float kEps = 1e-5;
   auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
 
+  auto properties = at::cuda::getDeviceProperties(0);
+  const size_t required_smem_size =
+      (dimy - static_size) * sizeof(float) + TIDX * sizeof(float);
+  if (properties->sharedMemPerBlockOptin < required_smem_size) {
+    GTEST_SKIP() << "not enough shared memory space on device to run test: "
+                 << properties->sharedMemPerBlock;
+  }
+
   at::Tensor aten_input = at::randn({dimx, dimy}, options);
   at::Tensor aten_static_in = aten_input.narrow(1, 0, static_size);
   at::Tensor aten_dynamic_in =
@@ -9722,13 +9731,6 @@ TEST_F(NVFuserTest, FusionPersistentNormLocalShared_CUDA) {
 
   torch::jit::fuser::cuda::FusionExecutor fe;
   fe.compileFusion(&fusion, aten_inputs);
-
-  auto properties = at::cuda::getDeviceProperties(0);
-  // Require 70KB of smem to run test
-  const size_t required_smem_size = 70 << 10;
-  if (properties->sharedMemPerBlockOptin < required_smem_size) {
-    GTEST_SKIP() << "not enough shared memory space on device to run test";
-  }
 
   fe.runFusion(aten_inputs, {cg_static_out, cg_dynamic_out});
 
@@ -11522,7 +11524,7 @@ TEST_F(NVFuserTest, FusionNonUniqueBroadcastSize_CUDA) {
   fusion.addInput(tv1);
   fusion.addInput(tv2);
 
-  auto tv3 = broadcast(tv0, {false, true});
+  auto tv3 = broadcast(tv0, {true, false});
   auto tv4 = add(tv3, tv1);
   auto tv5 = add(tv3, tv2);
 
@@ -21367,7 +21369,9 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
               pred->value()->definition()->as<BinaryOp>()->lhs() ==
                   hoisted_index,
               "Invalid predicate: ",
-              pred->value()->toInlineString());
+              pred->value()->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(arith_expr->inputs().size() == 1);
           auto in0 = arith_expr->inputs().front()->as<kir::TensorIndex>();
           TORCH_CHECK(in0->view()->name() == 0);
@@ -21376,19 +21380,25 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
           TORCH_CHECK(
               is_index_times_ns(t0_index, hoisted_index, "T0.stride[1]"),
               "Invalid index: ",
-              t0_index->toInlineString());
+              t0_index->toInlineString(),
+              ", ",
+              expr->toString());
         } else if (out_ti->view()->name() == 2) {
           // Ref: T3[*, hoisted_index] = T2[*, hoisted_index];
           auto out_index = out_ti->index(1);
           TORCH_CHECK(
               out_index == hoisted_index,
               "Invalid index: ",
-              out_index->toInlineString());
+              out_index->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(
               pred->value()->definition()->as<BinaryOp>()->lhs() ==
                   hoisted_index,
               "Invalid predicate: ",
-              pred->value()->toInlineString());
+              pred->value()->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(arith_expr->inputs().size() == 1);
           auto in0 = arith_expr->inputs().front()->as<kir::TensorIndex>();
           TORCH_CHECK(in0->view()->name() == 1);
@@ -21396,19 +21406,25 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
           TORCH_CHECK(
               in0_index == hoisted_index,
               "Invalid index: ",
-              in0_index->toInlineString());
+              in0_index->toInlineString(),
+              ", ",
+              expr->toString());
         } else if (out_ti->view()->name() == 3) {
           // Ref: T3[hoisted_index] = T2[hoisted_index];
           auto out_index = out_ti->index(0);
           TORCH_CHECK(
               out_index == hoisted_index,
               "Invalid index: ",
-              out_index->toInlineString());
+              out_index->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(
               pred->value()->definition()->as<BinaryOp>()->lhs() ==
                   hoisted_index,
               "Invalid predicate: ",
-              pred->value()->toInlineString());
+              pred->value()->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(arith_expr->inputs().size() == 1);
           auto in0 = arith_expr->inputs().front()->as<kir::TensorIndex>();
           TORCH_CHECK(in0->view()->name() == 2);
@@ -21416,14 +21432,18 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
           TORCH_CHECK(
               in0_index == hoisted_index,
               "Invalid index: ",
-              in0_index->toInlineString());
+              in0_index->toInlineString(),
+              ", ",
+              expr->toString());
         } else if (out_ti->view()->name() == 4) {
           // Ref: T4[0] = T3[hoisted_index];
           TORCH_CHECK(
               pred->value()->definition()->as<BinaryOp>()->lhs() ==
                   hoisted_index,
               "Invalid predicate: ",
-              pred->value()->toInlineString());
+              pred->value()->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(arith_expr->inputs().size() == 1);
           auto in0 = arith_expr->inputs().front()->as<kir::TensorIndex>();
           TORCH_CHECK(in0->view()->name() == 3);
@@ -21431,19 +21451,25 @@ TEST_F(NVFuserTest, FusionIndexHoist1_CUDA) {
           TORCH_CHECK(
               in0_index == hoisted_index,
               "Invalid index: ",
-              in0_index->toInlineString());
+              in0_index->toInlineString(),
+              ", ",
+              expr->toString());
         } else if (out_ti->view()->name() == 5) {
           // Ref: T5[hoisted_index] = T4[0]
           auto out_index = out_ti->index(0);
           TORCH_CHECK(
               out_index == hoisted_index,
               "Invalid index: ",
-              out_index->toInlineString());
+              out_index->toInlineString(),
+              ", ",
+              expr->toString());
           TORCH_CHECK(
               pred->value()->definition()->as<BinaryOp>()->lhs() ==
                   hoisted_index,
               "Invalid predicate: ",
-              pred->value()->toInlineString());
+              pred->value()->toInlineString(),
+              ", ",
+              expr->toString());
         }
       }
     }
@@ -24772,10 +24798,19 @@ TEST_F(NVFuserTest, FusionBoundedDirectionSelection1_CUDA) {
   scheduler_utils::BoundedDirectionalTransformPropagator::backward(
       tv3, -1, {tv0, tv2});
 
-  // Check that the splits are replayed on tv1, even though tv2
-  //  is part of the boundary.
+  // Check that the splits are replayed on tv2
   TORCH_INTERNAL_ASSERT(
-      tv2->nDims() == 4, "Propagator didn't propagate to tv2");
+      tv2->nDims() == tv3->nDims(),
+      "Propagator didn't propagate to tv2: ",
+      tv2->toString());
+
+  // Check that the splits are replayed on tv1 as well. Even though
+  //  one of its consumers, tv2, is part of the boundary, another
+  //  consumer is not a boundary, so tv1 should be transformed as well.
+  TORCH_INTERNAL_ASSERT(
+      tv1->nDims() == tv3->nDims(),
+      "Propagator didn't propagate to tv1: ",
+      tv1->toString());
 }
 
 TEST_F(NVFuserTest, FusionIssueRepro1844_CUDA) {
@@ -25075,7 +25110,7 @@ TEST_F(
       &fusion, cg_outputs, aten_inputs, {aten_output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims1_CUDA) {
+TEST_F(NVFuserTest, FusionInliningMismatchedDims1_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25088,8 +25123,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims1_CUDA) {
   auto tv5 = tan(tv4);
   fusion.addOutput(tv5);
 
-  InlinePropagator inline_propagator(tv5, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv5).traverse(&inline_propagator);
+  inlineMost();
 
   TORCH_CHECK(tv5->getComputeAtPosition() == 3);
   TORCH_CHECK(tv4->getComputeAtPosition() == 3);
@@ -25109,7 +25143,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims1_CUDA) {
   testValidate(&fusion, cg_outputs, {input}, {output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims2_CUDA) {
+TEST_F(NVFuserTest, FusionInliningMismatchedDims2_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25122,8 +25156,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims2_CUDA) {
   auto tv5 = tan(tv4);
   fusion.addOutput(tv5);
 
-  InlinePropagator inline_propagator(tv5, -1, ComputeAtMode::BestEffort);
-  MaxRootDomainInfoSpanningTree(tv5).traverse(&inline_propagator);
+  inlineAllAt(tv5, -1, true);
 
   TORCH_CHECK(tv5->getComputeAtPosition() == 3);
   TORCH_CHECK(tv4->getComputeAtPosition() == 3);
@@ -25143,7 +25176,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims2_CUDA) {
   testValidate(&fusion, cg_outputs, {input}, {output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims3_CUDA) {
+TEST_F(NVFuserTest, FusionInliningMismatchedDims3_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25167,8 +25200,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims3_CUDA) {
     tv->merge(2);
   }
 
-  InlinePropagator inline_propagator(tv8, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv8).traverse(&inline_propagator);
+  inlineMost();
 
   TORCH_CHECK(tv8->getComputeAtPosition() == 3);
   TORCH_CHECK(tv7->getComputeAtPosition() == 3);
@@ -25191,7 +25223,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims3_CUDA) {
   testValidate(&fusion, cg_outputs, {input}, {output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims4_CUDA) {
+TEST_F(NVFuserTest, FusionInliningMismatchedDims4_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25205,8 +25237,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims4_CUDA) {
   fusion.addOutput(tv5);
 
   tv3->merge(1);
-  InlinePropagator inline_propagator(tv0, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv0).traverse(&inline_propagator);
+  inlineMost();
 
   TORCH_CHECK(tv5->getComputeAtPosition() == 3);
   TORCH_CHECK(tv4->getComputeAtPosition() == 3);
@@ -25226,7 +25257,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorMismatchedDims4_CUDA) {
   testValidate(&fusion, cg_outputs, {input}, {output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorBroadcast_CUDA) {
+TEST_F(NVFuserTest, FusionInliningBroadcast_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25245,8 +25276,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorBroadcast_CUDA) {
     tv->merge(2);
   }
 
-  InlinePropagator inline_propagator(tv0, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv0).traverse(&inline_propagator);
+  inlineMost();
 
   TORCH_CHECK(tv4->getComputeAtPosition() == 3);
   TORCH_CHECK(tv3->getComputeAtPosition() == 3);
@@ -25265,7 +25295,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorBroadcast_CUDA) {
   testValidate(&fusion, cg_outputs, {input}, {output}, __LINE__, __FILE__);
 }
 
-TEST_F(NVFuserTest, FusionInlinePropagatorBroadcastTrivialReduction_CUDA) {
+TEST_F(NVFuserTest, FusionInliningBroadcastTrivialReduction_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
@@ -25287,8 +25317,7 @@ TEST_F(NVFuserTest, FusionInlinePropagatorBroadcastTrivialReduction_CUDA) {
     tv->merge(2);
   }
 
-  InlinePropagator inline_propagator(tv6, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv6).traverse(&inline_propagator);
+  inlineMost();
 
   TORCH_CHECK(tv6->getComputeAtPosition() == 3);
   TORCH_CHECK(tv5->getComputeAtPosition() == 3);
@@ -25378,8 +25407,7 @@ TEST_F(NVFuserTest, FusionIdGraphTrivialReduction_CUDA) {
     tv->merge(2);
   }
 
-  InlinePropagator inline_propagator(tv3, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv3).traverse(&inline_propagator);
+  inlineMost();
 
   ComputeAtMap ca_map(&fusion);
 
@@ -25645,8 +25673,7 @@ TEST_F(NVFuserTest, FusionPredicateUnshare_CUDA) {
     tv->axis(-1)->parallelize(ParallelType::TIDx);
   }
 
-  InlinePropagator propagator(tv2, -1, ComputeAtMode::MostInlined);
-  MaxRootDomainInfoSpanningTree(tv2).traverse(&propagator);
+  inlineMost();
 
   auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
   at::Tensor t0 = at::randn({5, 5}, options);
@@ -25737,8 +25764,7 @@ TEST_F(NVFuserTest, FusionMergeBroadcastingTrivialReduction1_CUDA) {
   TransformPropagatorWithCheck tp(tv0);
   tree.traverse(&tp);
 
-  InlinePropagator ip(tv0, -1, ComputeAtMode::MostInlined);
-  tree.traverse(&ip);
+  inlineMost();
 
   auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
   at::Tensor t0 = at::randn({1, 1}, options);
@@ -25773,8 +25799,7 @@ TEST_F(NVFuserTest, FusionMergeBroadcastingTrivialReduction2_CUDA) {
   TransformPropagatorWithCheck tp(tv0);
   tree.traverse(&tp);
 
-  InlinePropagator ip(tv0, -1, ComputeAtMode::MostInlined);
-  tree.traverse(&ip);
+  inlineMost();
 
   auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
   at::Tensor t0 = at::randn({10, 1, 1}, options);
@@ -25975,6 +26000,58 @@ TEST_F(NVFuserTest, FusionMappingRelation_CUDA) {
 
   testValidate(
       fusion, {out}, {t0, t1}, {t1 + t0.squeeze(0)}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionInlineAt_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = makeSymbolicTensor(2);
+  fusion->addInput(tv0);
+  auto tv1 = sin(tv0);
+  auto tv2 = cos(tv1);
+  fusion->addOutput(tv2);
+
+  tv1->inlineAt(-1);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({100, 2}, options);
+
+  FusionExecutor fe;
+  fe.compileFusion(fusion, {t0});
+  auto cg_outputs = fe.runFusion({t0});
+  auto out = cg_outputs[0];
+
+  testValidate(fusion, {out}, {t0}, {t0.sin().cos()}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionTrivialInputForwarding_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = makeConcreteTensor({-1, -1});
+  TensorView* tv1 = makeConcreteTensor({-1, -1});
+  fusion->addInput(tv0);
+  fusion->addInput(tv1);
+  // Note: tv2 is not needed. Kept it here since previously there was an
+  // assertion from sorting in codegen.
+  auto tv2 = add(tv1, IrBuilder::create<Double>(3.141));
+  fusion->addOutput(tv0);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({10, 4}, options);
+  at::Tensor t1 = at::randn({10, 4}, options);
+
+  FusionExecutorCache fec(std::move(fusion_ptr));
+  auto cg_outputs = fec.runFusionWithInputs({t0, t1});
+
+  testValidate(fusion, cg_outputs, {t0, t1}, {t0}, __LINE__, __FILE__);
+
+  // Second run to ensure cache hit handles trivial forwarding properly
+  auto cg_outputs2 = fec.runFusionWithInputs({t0, t1});
+  testValidate(fusion, cg_outputs2, {t0, t1}, {t0}, __LINE__, __FILE__);
 }
 
 } // namespace jit

@@ -236,10 +236,6 @@ kir::Allocate* allocGlobalBufferForGridComm(
     DataType dtype,
     bool zero_init);
 
-} // namespace lower_utils
-
-namespace lower_loop_utils {
-
 struct BasicAllocInfo {
   // The for loop that the initialization of this allocation must be
   // placed in, nullptr if not within a loop
@@ -267,7 +263,7 @@ BasicAllocInfo getAllocInformation(
     const std::vector<kir::ForLoop*>& loops,
     const std::unordered_map<IterDomain*, IterDomain*>& id_map = {},
     bool use_id_map = false);
-} // namespace lower_loop_utils
+} // namespace lower_utils
 
 } // namespace cuda
 } // namespace fuser

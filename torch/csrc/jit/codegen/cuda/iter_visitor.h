@@ -78,42 +78,38 @@ class TORCH_CUDA_CU_API IterVisitor : public OptOutDispatch {
   void traverseHelper(Fusion* fusion, bool traverse_all_paths = false);
 
  public:
-  //! Starts at nodes provided in from, traverses from these nodes to inputs.
-  //! Calls handle on all Statement*s in topological sorted order.
+  //! Traverses nodes in Fusion from inputs in topological order to "to". i.e.
+  //! from inputs towards outputs.
   //! \param traverseAllPaths = false only call handle on each Statement* once
-  //!    traverseAllPaths = true traverses all paths from nodes in from to
-  //!    inputs. Calls handle on a Statement* for every path from "from" nodes,
-  //!    to inputs.
+  //!    traverseAllPaths = true traverses all paths between expressions/values.
+  //!    Calls handle on a Statement* for every path from inputs to "to".
   //! \param traverseIntoMembers = When hitting nodes like TensorView,
   //! TensorDomain, or IterDomain where there are members of the nodes that are
   //! Val's a value of "true" will also traverse into those member Val's, a
   //! value of "false" will not traverse into the members.
-  //! \param inputs: Specified inputs to not traverse before. If input is on
-  //! path from the provided outputs handle will be called on them, but next
-  //! will not be called with them.
-  void traverseFrom(
+  void traverseTo(
       Fusion* fusion,
-      const std::vector<Val*>& from,
+      const std::vector<Val*>& to,
       bool traverse_all_paths = false,
       bool traverse_into_members = false);
 
-  //! Starts at nodes provided in from, traverses from these nodes to inputs.
-  //! Calls handle on all Statement*s in topological sorted order.
-  //! \param traverse_all_paths = false only call handle on each Statement* once
-  //!    traverse_all_paths = true traverses all paths from nodes in from to
-  //!    inputs. Calls handle on a Statement* for every path from "from" nodes,
-  //!    to inputs.
-  //! \param traverse_into_members = When hitting nodes like TensorView,
+  //! Traverses nodes in Fusion from inputs in topological order to "to". i.e.
+  //! from inputs towards outputs.
+  //! \param traverseAllPaths = false only call handle on each Statement* once
+  //!    traverseAllPaths = true traverses all paths between expressions/values.
+  //!    Calls handle on a Statement* for every path from inputs to "to".
+  //! \param traverseIntoMembers = When hitting nodes like TensorView,
   //! TensorDomain, or IterDomain where there are members of the nodes that are
   //! Val's a value of "true" will also traverse into those member Val's, a
   //! value of "false" will not traverse into the members.
-  //! \param inputs: Specified inputs to not traverse before. If input is on
-  //! path from the provided outputs handle will be called on them, but next
-  //! will not be called with them.
-  void traverseFrom(
+  //! \param from: Specified values to start traversing. If a "from" Val is not
+  //! on path from inputs to "to" node it will not be visited. If there's a path
+  //! from inputs to "to" that doesn't go through "from" that input and the path
+  //! from it will also be traversed.
+  void traverseBetween(
       Fusion* fusion,
-      const std::vector<Val*>& from,
-      const std::unordered_set<Val*>& inputs,
+      const std::unordered_set<Val*>& from,
+      const std::vector<Val*>& to,
       bool traverse_all_paths = false,
       bool traverse_into_members = false);
 
@@ -218,7 +214,7 @@ class TORCH_CUDA_CU_API BackwardVisitor : public OptOutDispatch {
   // traverseAllPaths = false only call handle on each Statement* once
   // traverseAllPaths = true traverses all paths from nodes in from to inputs.
   //   Handle on a Statement* for every path from "from" nodes, to inputs.
-  void traverseFrom(
+  void traverseTo(
       Fusion* fusion,
       const std::vector<Val*>& from,
       bool traverseAllPaths = false);
@@ -289,7 +285,7 @@ class StmtSort : public IterVisitor {
   // Returns ordered Statements required to produce from, including from.
   static std::vector<Statement*> getStmts(
       Fusion* fusion,
-      const std::vector<Val*>& from,
+      const std::vector<Val*>& to,
       bool traverse_members = false);
 
   // Returns ordered Statements required to produce from, including from.
@@ -309,10 +305,10 @@ class StmtSort : public IterVisitor {
   //
   // If traverse_members it will also extract all member nodes in the sorted
   // expr list in the fusion. i.e. all expressions on IterDomains, extents, etc
-  static std::vector<Statement*> getStmts(
+  static std::vector<Statement*> getStmtsBetween(
       Fusion* fusion,
       const std::vector<Val*>& from,
-      const std::vector<Val*>& inputs,
+      const std::vector<Val*>& to,
       bool traverse_members = false);
 
   // Same as getStmts version but filters to only return the Expr*s
@@ -323,14 +319,14 @@ class StmtSort : public IterVisitor {
   // Same as getStmts version but filters to only return the Expr*s
   static std::vector<Expr*> getExprs(
       Fusion* fusion,
-      const std::vector<Val*>& from,
+      const std::vector<Val*>& to,
       bool traverse_members = false);
 
   // Same as getStmts version but filters to only return the Expr*s
-  static std::vector<Expr*> getExprs(
+  static std::vector<Expr*> getExprsBetween(
       Fusion* fusion,
       const std::vector<Val*>& from,
-      const std::vector<Val*>& inputs,
+      const std::vector<Val*>& to,
       bool traverse_members = false);
 };
 

@@ -652,10 +652,6 @@ kir::Allocate* allocGlobalBufferForGridComm(
       buffer_tv, buffer_tv->getMemoryType(), nullptr, zero_init);
 }
 
-} // namespace lower_utils
-
-namespace lower_loop_utils {
-
 BasicAllocInfo getAllocInformation(
     const TensorView* tv,
     const std::vector<kir::ForLoop*>& for_loops,
@@ -731,7 +727,7 @@ BasicAllocInfo getAllocInformation(
   return info;
 }
 
-} // namespace lower_loop_utils
+} // namespace lower_utils
 
 } // namespace cuda
 } // namespace fuser

@@ -22,16 +22,12 @@ std::unordered_set<Split*> getAllDivisibleSplits(
   std::unordered_set<Split*> all_divisible_splits;
 
   auto all_tvs = ir_utils::allTvs(fusion);
-  // Find all tensor views with a view like rfactor
+  // Find all tensor views with a view like rfactor. Splits used in view
+  // transformations must be divisible by definition.
   for (auto tv : all_tvs) {
     auto rfactor_dom = tv->getMaybeRFactorDomain();
     // Not view if there's no rfactor axis
-    if (!tv->hasRFactor() ||
-        std::any_of(
-            rfactor_dom.begin(),
-            rfactor_dom.end(),
-            // Also not a view transform if there's a reduction dimension.
-            [](IterDomain* id) { return id->isReduction(); })) {
+    if (!tv->domain()->hasViewLikeRFactor()) {
       continue;
     }
 
@@ -43,12 +39,12 @@ std::unordered_set<Split*> getAllDivisibleSplits(
     all_divisible_splits.insert(split_exprs.begin(), split_exprs.end());
   }
 
-  // Collect vectorized dimensions as they have to be divisible inner splits.
+  // Vectorized dimensions are enforced to be a result of divisible splits.
+  // Gather vectorized splits.
   for (auto tv : all_tvs) {
     auto vec_id_it = std::find_if(
         tv->domain()->domain().begin(),
         tv->domain()->domain().end(),
-        // Also not a view transform if there's a reduction dimension.
         [](IterDomain* id) {
           return isParallelTypeVectorize(id->getParallelType());
         });
@@ -57,43 +53,17 @@ std::unordered_set<Split*> getAllDivisibleSplits(
       continue;
     }
 
-    // We could have a cass technically like:
+    // We could have a case technically like:
     // [8, 2] where we do:
     // split(0, 2)
     // merge(1)
     // so it ends up as [4, 4]
-    // split(0, 2) must be a divisible, but for now we're not going to capture
+    // split(0, 2) must be divisible, but for now we're not going to capture
     // cases like this. Just look for direct split's producing a vectorize
     // dimension.
     auto vec_id = *vec_id_it;
     if (vec_id->definition() != nullptr && vec_id->definition()->isA<Split>()) {
       all_divisible_splits.emplace(vec_id->definition()->as<Split>());
-    }
-  }
-
-  // Collect Splits with compile time constant inputs to see if they're
-  // divisible.
-  for (auto tv : all_tvs) {
-    auto transforms = StmtSort::getExprs(
-        tv->fusion(),
-        {tv->domain()->domain().begin(), tv->domain()->domain().end()});
-    auto splits = ir_utils::filterByType<Split>(transforms);
-    for (auto split : splits) {
-      if (split->factor()->isConstInt()) {
-        if (split->in()->extent()->isConstInt() &&
-            split->in()->extent()->evaluateInt() %
-                    split->factor()->evaluateInt() ==
-                0) {
-          all_divisible_splits.emplace(split);
-          continue;
-        }
-
-        // even if the extent size is unknown, if the factor is known to
-        // be 1, it's always divisible
-        if (split->factor()->evaluateInt() == 1) {
-          all_divisible_splits.emplace(split);
-        }
-      }
     }
   }
 
@@ -120,7 +90,7 @@ std::unordered_set<Split*> getAllDivisibleSplits(
     auto concrete_id = entry.first;
     auto original_view_split = entry.second;
 
-    auto exact_mapped_ids =
+    const auto& exact_mapped_ids =
         ca_map->idGraph().exactNodes().getDisjointSetOf(concrete_id).vector();
     for (auto other_id : exact_mapped_ids) {
       if (other_id->definition() == nullptr) {

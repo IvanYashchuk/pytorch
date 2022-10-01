@@ -83,11 +83,17 @@ class OrderedIdInformation : public OptInDispatch {
   std::vector<IterDomain*> active_ids_;
 
   // IterDomains in this set exclusively consume all the uses of their roots.
-  // For example: [i0, i1] split(0, ...)->merge(1) neither iter domains
-  // exclusively consume the roots. With another: merge(0) the resulting iter
-  // domain does exclusively consume their respective roots. Also: [i0, i1, i2,
-  // i3] merge->(1) merge->(1) both resulting iter domains exclusively consume
-  // their roots
+  // For example:
+  // [i0, i1] split(0, f)->merge(1)
+  // [ceilDiv(i0, f), f*i1]
+  // neither iter domains exclusively consume the roots. With another:
+  // merge(0) -> [ceilDiv(i0, f)*f*i1]
+  // The resulting iter domain does exclusively consume the roots.
+  //
+  // Also:
+  // [i0, i1, i2, i3] merge(1)->merge(1)
+  // ->[i0, i1*i2*i3]
+  // both resulting iter domains do exclusively consume their roots
   std::unordered_set<IterDomain*> exclusively_consumes_roots_;
 
   // Broadcast domains that are concretized cannot be considered contiguously
@@ -116,7 +122,6 @@ class NonDivisibleSplitDependencies : public OptInDispatch {
 
  private:
   std::unordered_set<IterDomain*> depends_on_non_divisible_split;
-  std::unordered_set<IterDomain*> visited;
 };
 
 // A merge is contiguous if:
@@ -156,7 +161,8 @@ class ContigIDs : public OptInDispatch {
       const std::vector<IterDomain*>& ids,
       const std::vector<IterDomain*>& root_domain,
       const std::vector<bool>& root_contiguity,
-      std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref,
+      const std::unordered_set<IterDomain*>& final_ids,
+      const std::unordered_map<IterDomain*, Val*>& index_map,
       const std::unordered_set<Split*>& divisible_splits,
       std::unordered_map<IterDomain*, IterDomain*> p2c_id_map = {},
       bool ignore_indexability = false,
@@ -186,7 +192,8 @@ class ContigIDs : public OptInDispatch {
       const std::vector<IterDomain*>& ids,
       const std::vector<IterDomain*>& root_domain,
       const std::vector<bool>& root_contiguity,
-      std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref,
+      const std::unordered_set<IterDomain*>& final_ids,
+      const std::unordered_map<IterDomain*, Val*>& index_map,
       const std::unordered_set<Split*>& divisible_splits,
       std::shared_ptr<const ComputeAtMap> ca_map,
       std::shared_ptr<const HaloInfo> halo_info,
@@ -194,6 +201,9 @@ class ContigIDs : public OptInDispatch {
       std::unordered_map<IterDomain*, IterDomain*> p2c_id_map = {},
       bool ignore_indexability = false,
       bool ignore_consistent_ordering = false);
+
+  //! Return an empty ContigIDs with no contiguous ID
+  static ContigIDs getNonContigIDs();
 
   const std::unordered_set<IterDomain*>& contigIDs() const {
     return contig_ids_;
@@ -258,9 +268,12 @@ class ContigIDs : public OptInDispatch {
   const std::vector<IterDomain*>& root_domain_;
   //! Contiguity of root_domain_
   const std::vector<bool>& root_contiguity_;
-  //! Mapping of concrete to reference domains. If a concrete domain
-  //! is not mapped, it is not indexable as there's no mapped index.
-  const std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref_;
+  //! Domains where indexing/predicates cannot be done with their
+  //! consumers domains
+  const std::unordered_set<IterDomain*>& final_ids_;
+  //! Mapping of concrete domains to indices. Just used to check if
+  //! there's an index for an IterDomain.
+  const std::unordered_map<IterDomain*, Val*> index_map_;
   // Divisible split information as we can still consider iter domains
   // contiguous through divisible splits.
   const std::unordered_set<Split*>& divisible_splits_;

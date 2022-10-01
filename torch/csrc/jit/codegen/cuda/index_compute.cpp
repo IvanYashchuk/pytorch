@@ -441,9 +441,8 @@ void IndexCompute::handle(Merge* merge) {
 
   // When the reference has halo extent for inner_id, that extent needs to
   // be used to un-merge
-  if (reference_halo_extent_map_.find(inner_id) !=
-      reference_halo_extent_map_.end()) {
-    inner_extent = reference_halo_extent_map_[inner_id];
+  if (halo_extent_map_.find(inner_id) != halo_extent_map_.end()) {
+    inner_extent = halo_extent_map_[inner_id];
   }
 
   const auto outer_extent = getExtent(outer_id);
@@ -588,16 +587,16 @@ IndexCompute::IndexCompute(
     std::unordered_set<IterDomain*> zero_domains,
     std::unordered_set<IterDomain*> zero_merged_in,
     std::unordered_set<IterDomain*> preferred_paths,
-    std::unordered_map<IterDomain*, Val*> reference_halo_extent_map)
+    std::unordered_map<IterDomain*, Val*> halo_extent_map)
     : IndexCompute(
           _td,
           std::move(initial_index_map),
           std::move(extent_map),
           std::move(zero_domains),
           std::move(zero_merged_in),
-          ContigIDs({}, {}, {}, {}, {}),
+          ContigIDs::getNonContigIDs(),
           std::move(preferred_paths),
-          std::move(reference_halo_extent_map)) {}
+          std::move(halo_extent_map)) {}
 
 IndexCompute::IndexCompute(
     const TensorDomain* _td,
@@ -607,14 +606,14 @@ IndexCompute::IndexCompute(
     std::unordered_set<IterDomain*> zero_merged_in,
     const ContigIDs& contig_finder,
     std::unordered_set<IterDomain*> preferred_paths,
-    std::unordered_map<IterDomain*, Val*> reference_halo_extent_map)
+    std::unordered_map<IterDomain*, Val*> halo_extent_map)
     : td_(_td),
       index_map_(std::move(initial_index_map)),
       extent_map_(std::move(extent_map)),
       zero_domains_(std::move(zero_domains)),
       zero_merged_in_(std::move(zero_merged_in)),
       preferred_paths_(std::move(preferred_paths)),
-      reference_halo_extent_map_(std::move(reference_halo_extent_map)) {
+      halo_extent_map_(std::move(halo_extent_map)) {
   FUSER_PERF_SCOPE("GpuLower::Lower::IndexCompute::IndexCompute");
 
   // Make sure we recompute any indices we can that map to a contiguous access
@@ -637,11 +636,11 @@ IndexCompute::IndexCompute(
     std::unordered_map<IterDomain*, Val*> initial_index_map,
     std::unordered_set<IterDomain*> zero_domains,
     std::unordered_set<IterDomain*> preferred_paths,
-    std::unordered_map<IterDomain*, Val*> reference_halo_extent_map)
+    std::unordered_map<IterDomain*, Val*> halo_extent_map)
     : index_map_(std::move(initial_index_map)),
       zero_domains_(std::move(zero_domains)),
       preferred_paths_(std::move(preferred_paths)),
-      reference_halo_extent_map_(std::move(reference_halo_extent_map)) {
+      halo_extent_map_(std::move(halo_extent_map)) {
   FUSER_PERF_SCOPE("GpuLower::Lower::IndexCompute::IndexCompute");
   concrete_id_pass_ = true;
   swizzle_mode_ = SwizzleMode::Loop;
@@ -752,7 +751,7 @@ void IndexCompute::run() {
   const std::vector<Val*> domain_vals(
       td_->domain().begin(), td_->domain().end());
 
-  traverseFrom(td_->fusion(), domain_vals, false);
+  traverseTo(td_->fusion(), domain_vals, false);
 }
 
 IterDomain* IndexCompute::maybeGetExactMapConcreteID(IterDomain* id) {
@@ -786,15 +785,14 @@ bool IndexCompute::isZero(IterDomain* id) const {
 IndexCompute IndexCompute::updateIndexCompute(
     const TensorDomain* new_td,
     const std::unordered_map<IterDomain*, IterDomain*>& id_map,
-    const ContigIDs& contig_finder,
-    const std::unordered_map<IterDomain*, Val*>& reference_halo_extent_map)
-    const {
+    const ContigIDs& contig_finder) const {
   FUSER_PERF_SCOPE("GpuLower::Lower::updateIndexCompute");
 
   std::unordered_map<IterDomain*, Val*> updated_index_map;
   std::unordered_map<IterDomain*, Val*> updated_extent_map;
   std::unordered_set<IterDomain*> updated_zero_domains;
   std::unordered_set<IterDomain*> updated_zero_merged_in;
+  std::unordered_map<IterDomain*, Val*> updated_halo_extent_map;
 
   for (auto id_entry : id_map) {
     IterDomain* prev_id = id_entry.first;
@@ -813,6 +811,11 @@ IndexCompute IndexCompute::updateIndexCompute(
     if (zero_merged_in_.find(prev_id) != zero_merged_in_.end()) {
       updated_zero_merged_in.emplace(new_id);
     }
+
+    auto halo_extent_it = halo_extent_map_.find(prev_id);
+    if (halo_extent_it != halo_extent_map_.end()) {
+      updated_halo_extent_map[new_id] = halo_extent_it->second;
+    }
   }
 
   IndexCompute updated_index_compute(
@@ -823,25 +826,7 @@ IndexCompute IndexCompute::updateIndexCompute(
       updated_zero_merged_in,
       contig_finder,
       {},
-      reference_halo_extent_map);
-
-  if (concrete_id_pass_) {
-    // This should be the same behavior as with a reference tensor
-    //   created, since originally halo was pulled through exact
-    //   ca mapping and in the concrete_id_pass case, the id_map
-    //   also represents exact ca mapping.
-    // TODO: might need to re-visit pathological cases when we may
-    //  need to traverse and propagate halo info again in here.
-    for (auto id_entry : id_map) {
-      IterDomain* prev_id = id_entry.first;
-      IterDomain* new_id = id_entry.second;
-      auto halo_extent_it = reference_halo_extent_map_.find(prev_id);
-      if (halo_extent_it != reference_halo_extent_map_.end()) {
-        updated_index_compute.reference_halo_extent_map_[new_id] =
-            halo_extent_it->second;
-      }
-    }
-  }
+      updated_halo_extent_map);
 
   updated_index_compute.run();
 
@@ -862,7 +847,7 @@ class UpdateLeafIndices : public IterVisitor {
     const std::vector<Val*> domain_vals(
         td_->domain().begin(), td_->domain().end());
 
-    traverseFrom(td_->fusion(), domain_vals, false);
+    traverseTo(td_->fusion(), domain_vals, false);
   }
 
   const std::unordered_map<IterDomain*, Val*>& indexMap() const {
@@ -2341,37 +2326,32 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
 
   const auto& consumer_root_domain = consumer_tv->getRootDomain();
 
-  std::vector<IterDomain*> contiguous_ids = consumer_root_domain;
-
-  if (contiguous_ids.empty()) {
+  if (consumer_root_domain.empty()) {
     return std::vector<PredicateDomainInfo>();
   }
 
-  std::unordered_map<IterDomain*, IterDomain*> contig_concrete_to_ref_map;
+  std::unordered_map<IterDomain*, Val*> concrete_index_map;
   for (auto entry : consumer_index_map) {
     auto c_id = gpu_lower->caMap()->getConcreteMappedID(
         entry.first, IdMappingMode::EXACT);
-    contig_concrete_to_ref_map[c_id] = c_id;
+    concrete_index_map[c_id] = entry.second;
   }
+
   std::vector<bool> predicate_contiguity(consumer_root_domain.size(), true);
+  std::unordered_set<IterDomain*> final_ids;
   for (auto root_i : c10::irange(predicate_contiguity.size())) {
     auto root_id = consumer_root_domain[root_i];
     if (root_id->maybePartial()) {
-      // predicate_contiguity[root_i] = false;
+      final_ids.insert(root_id);
       continue;
     }
     // Shifted or gathered axes need to be predicated at the root domain
     auto shift_expr = dynamic_cast<ShiftOp*>(consumer_tv->definition());
     auto gather_expr = dynamic_cast<GatherOp*>(consumer_tv->definition());
-    if (shift_expr == nullptr && gather_expr == nullptr) {
-      continue;
-    }
     if ((shift_expr && shift_expr->offset(root_i) != 0) ||
         (gather_expr && root_i < gather_expr->windowShape().size() &&
          gather_expr->windowShape().at(root_i) != 1)) {
-      // TODO: The following line commented out didn't have any failures, is it
-      // needed?
-      predicate_contiguity[root_i] = false;
+      final_ids.insert(root_id);
     }
   }
 
@@ -2379,7 +2359,8 @@ std::vector<PredicateDomainInfo> getPredicateContigIds(
       consumer_tv->domain()->domain(),
       consumer_root_domain,
       predicate_contiguity,
-      contig_concrete_to_ref_map,
+      final_ids,
+      concrete_index_map,
       GpuLower::current()->divisbleSplitSet(),
       GpuLower::current()->caMap(),
       GpuLower::current()->haloInfo(),

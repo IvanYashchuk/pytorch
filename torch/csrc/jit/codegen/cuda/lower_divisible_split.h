@@ -19,7 +19,7 @@ TORCH_CUDA_CU_API std::unordered_set<Split*> getAllDivisibleSplits(
     Fusion* fusion);
 
 // Same as above but will use provided ComputeAtMap instead of building its own.
-std::unordered_set<Split*> getAllDivisibleSplits(
+TORCH_CUDA_CU_API std::unordered_set<Split*> getAllDivisibleSplits(
     Fusion* fusion,
     const ComputeAtMap* ca_map);
 

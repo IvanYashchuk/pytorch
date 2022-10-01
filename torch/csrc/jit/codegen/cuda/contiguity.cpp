@@ -18,6 +18,7 @@ OrderedIdInformation::OrderedIdInformation(
     return;
   }
 
+  // Grab root ids and initialize them.
   for (const auto root_i : c10::irange(root_domain.size())) {
     auto root_id = root_domain[root_i]->as<IterDomain>();
 
@@ -30,11 +31,13 @@ OrderedIdInformation::OrderedIdInformation(
     exclusively_consumes_roots_.emplace(root_id);
   }
 
-  // Compute consistently_ordered_ids_, id_to_root_ids_, and
-  auto exprs = StmtSort::getExprs(
+  // Iterate from the root domain to the provided ids and fill
+  // consistently_ordered_ids_, id_to_root_ids_, and exclusively_consumes_roots_
+  // for all the IDs
+  auto exprs = StmtSort::getExprsBetween(
       ids[0]->fusion(),
-      {ids.begin(), ids.end()},
-      {root_domain.begin(), root_domain.end()});
+      {root_domain.begin(), root_domain.end()},
+      {ids.begin(), ids.end()});
 
   for (auto expr : exprs) {
     OptInDispatch::handle(expr);
@@ -123,6 +126,9 @@ void OrderedIdInformation::handle(Merge* merge) {
   //  axes to the right of the broadcast root domain in the contigous merge is
   //  bigger than the vectorization dimension. And that the tensor buffer
   //  supports the vector word size (always done).
+  bool outer_is_concretized_bcast = merge->outer()->isBroadcast() &&
+      concrete_info_->isConcretized(merge->outer());
+
   bool inner_is_concretized_bcast = merge->inner()->isBroadcast() &&
       concrete_info_->isConcretized(merge->inner());
 
@@ -153,7 +159,8 @@ void OrderedIdInformation::handle(Merge* merge) {
       // Inner could be a broadcast, so doesn't have to be right on
       // pos_after_outer as that ID (if it exists) should not be a broadcast.
       // However, merging over a broadcast should be fine.
-      inner_pos <= pos_after_outer && !inner_is_concretized_bcast;
+      inner_pos <= pos_after_outer && !inner_is_concretized_bcast &&
+      !outer_is_concretized_bcast;
 
   if (out_ordered) {
     consistently_ordered_ids_.emplace(merge->out());
@@ -235,12 +242,6 @@ void OrderedIdInformation::handle(Split* split) {
 
   VectorOfUniqueEntries<IterDomain*> in_root_ids = in_root_ids_it->second;
 
-  // Need to check this before we update the active_ids_
-
-  if (checkExclusivelyConsumesRoots(split->in())) {
-    exclusively_consumes_roots_.emplace(split->in());
-  }
-
   // Update map for outputs
   // Remove inputs from the active_ids_ and insert the output ID
   active_ids_[in_pos] = split->outer();
@@ -304,7 +305,7 @@ void OrderedIdInformation::handle(Swizzle2D* swizzle) {
       consistently_ordered_ids_.emplace(swizzle->outX());
     }
 
-    if (checkExclusivelyConsumesRoots(swizzle->outX())) {
+    if (exclusivelyConsumesRoots(swizzle->inX())) {
       exclusively_consumes_roots_.emplace(swizzle->outX());
     }
 
@@ -312,7 +313,7 @@ void OrderedIdInformation::handle(Swizzle2D* swizzle) {
       consistently_ordered_ids_.emplace(swizzle->outY());
     }
 
-    if (checkExclusivelyConsumesRoots(swizzle->outY())) {
+    if (exclusivelyConsumesRoots(swizzle->inY())) {
       exclusively_consumes_roots_.emplace(swizzle->outY());
     }
 
@@ -327,7 +328,7 @@ void OrderedIdInformation::handle(Swizzle2D* swizzle) {
 }
 
 NonDivisibleSplitDependencies::NonDivisibleSplitDependencies(
-    // TODO: Revisit reduction rfactor axes and propogation. Should probably use
+    // TODO: Revisit reduction rfactor axes and propagation. Should probably use
     // ca_map to propogate non divisibility dependencies across exact map. Still
     // need to think through divisible split and non divisible dependencies to
     // see if there's conflicts where a split might look non divisible but
@@ -338,16 +339,15 @@ NonDivisibleSplitDependencies::NonDivisibleSplitDependencies(
   if (ids.empty() || root_domain.empty()) {
     return;
   }
-  auto transforms = StmtSort::getExprs(
+  auto transforms = StmtSort::getExprsBetween(
       ids[0]->fusion(),
-      {ids.begin(), ids.end()},
-      {root_domain.begin(), root_domain.end()});
+      {root_domain.begin(), root_domain.end()},
+      {ids.begin(), ids.end()});
   for (auto transform : transforms) {
     auto inp_ids = ir_utils::filterByType<IterDomain>(transform->inputs());
     for (auto inp_id : inp_ids) {
       if (std::find(root_domain.begin(), root_domain.end(), inp_id) !=
           root_domain.end()) {
-        visited.emplace(inp_id);
         // This generally shouldn't happen as there shouldn't be
         // transformations before the root ids, but in case for some reason
         // we eventually do have cases like that, we should reset the
@@ -357,12 +357,6 @@ NonDivisibleSplitDependencies::NonDivisibleSplitDependencies(
       }
     }
 
-    // If we have visited all the inputs.
-    bool inputs_visited =
-        std::all_of(inp_ids.begin(), inp_ids.end(), [this](IterDomain* inp_id) {
-          return visited.find(inp_id) != visited.end();
-        });
-
     bool inputs_non_divisible =
         std::any_of(inp_ids.begin(), inp_ids.end(), [this](IterDomain* inp_id) {
           return depends_on_non_divisible_split.find(inp_id) !=
@@ -371,15 +365,8 @@ NonDivisibleSplitDependencies::NonDivisibleSplitDependencies(
 
     auto out_ids = ir_utils::filterByType<IterDomain>(transform->outputs());
 
-    if (inputs_visited) {
-      visited.insert(out_ids.begin(), out_ids.end());
-    }
-
-    if ( // If we haven't visited all the inputs we don't know if output
-         // depends on divisible split
-        !inputs_visited
-        // Or if any inputs are known to be dependent on a divisible split
-        || inputs_non_divisible) {
+    if (inputs_non_divisible) {
+      // If any inputs are known to be dependent on a divisible split
       // Mark outputs as dependent on a non_divisible split
       depends_on_non_divisible_split.insert(out_ids.begin(), out_ids.end());
       continue;
@@ -403,14 +390,16 @@ ContigIDs::ContigIDs(
     const std::vector<IterDomain*>& ids,
     const std::vector<IterDomain*>& root_domain,
     const std::vector<bool>& root_contiguity,
-    std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref,
+    const std::unordered_set<IterDomain*>& final_ids,
+    const std::unordered_map<IterDomain*, Val*>& index_map,
     const std::unordered_set<Split*>& divisible_splits,
     std::unordered_map<IterDomain*, IterDomain*> p2c_id_map,
     bool ignore_indexability,
     bool ignore_consistent_ordering)
     : root_domain_(root_domain),
       root_contiguity_(root_contiguity),
-      concrete_to_ref_(std::move(concrete_to_ref)),
+      final_ids_(final_ids),
+      index_map_(index_map),
       divisible_splits_(divisible_splits),
       p2c_id_map_(std::move(p2c_id_map)),
       ignore_indexability_(ignore_indexability),
@@ -434,7 +423,8 @@ ContigIDs::ContigIDs(
     const std::vector<IterDomain*>& ids,
     const std::vector<IterDomain*>& root_domain,
     const std::vector<bool>& root_contiguity,
-    std::unordered_map<IterDomain*, IterDomain*> concrete_to_ref,
+    const std::unordered_set<IterDomain*>& final_ids,
+    const std::unordered_map<IterDomain*, Val*>& index_map,
     const std::unordered_set<Split*>& divisible_splits,
     std::shared_ptr<const ComputeAtMap> ca_map,
     std::shared_ptr<const HaloInfo> halo_info,
@@ -444,7 +434,8 @@ ContigIDs::ContigIDs(
     bool ignore_consistent_ordering)
     : root_domain_(root_domain),
       root_contiguity_(root_contiguity),
-      concrete_to_ref_(std::move(concrete_to_ref)),
+      final_ids_(final_ids),
+      index_map_(index_map),
       divisible_splits_(divisible_splits),
       ca_map_(ca_map),
       halo_info_(halo_info),
@@ -458,6 +449,10 @@ ContigIDs::ContigIDs(
           concrete_info_)),
       non_divisible_id_info_(ids, root_domain, divisible_splits_) {
   build(ids);
+}
+
+ContigIDs ContigIDs::getNonContigIDs() {
+  return ContigIDs({}, {}, {}, {}, {}, {});
 }
 
 void ContigIDs::build(const std::vector<IterDomain*>& ids) {
@@ -491,10 +486,10 @@ void ContigIDs::build(const std::vector<IterDomain*>& ids) {
   }
 
   if (!contig_ids_.empty()) {
-    auto exprs = StmtSort::getExprs(
+    auto exprs = StmtSort::getExprsBetween(
         ids[0]->fusion(),
-        {ids.begin(), ids.end()},
-        {root_domain_.begin(), root_domain_.end()});
+        {root_domain_.begin(), root_domain_.end()},
+        {ids.begin(), ids.end()});
     for (auto expr : exprs) {
       handle(expr);
     }
@@ -520,6 +515,11 @@ void ContigIDs::handle(Merge* merge) {
     return;
   }
 
+  // If inputs are marked as final, stop
+  if (final_ids_.count(merge->inner()) || final_ids_.count(merge->outer())) {
+    return;
+  }
+
   // Check root domains for contiguity
   auto root_ids_it =
       consistent_transform_info_->idToRootIds().find(merge->out());
@@ -533,25 +533,23 @@ void ContigIDs::handle(Merge* merge) {
 
   VectorOfUniqueEntries<IterDomain*> root_ids = root_ids_it->second;
 
+  bool is_indexing_pass = !ignore_consistent_ordering_;
+
   IterDomain* last_root = nullptr;
   for (auto root_id_i : c10::irange(root_domain_.size())) {
     auto root_id = root_domain_[root_id_i];
     if (root_ids.has(root_id)) {
       // ID found, remove it
       root_ids.erase(root_id);
-      // If the last id isn't contiguous that's fine, we can use the stride of
-      // the last iter domain to multiply the contig index.
-      if (!root_contiguity_[root_id_i]) {
-        // If it's the last root, and we're indexing
-        // (!ignore_consistent_ordering) we can still consider this ID
-        // contiguously indexable since it will still be multiplied by its
-        // stride. If we're computing predicates, then we don't want to do this,
-        // as when we mark something as non-contiguous we don't want it merged
-        // with any other domains.
-        //
-        // TODO: This didn't error when I removed "!ignore_consistent_ordering_"
-        // is it really needed?
-        if (!(root_ids.empty() && !ignore_consistent_ordering_)) {
+      // If we're indexing:
+      // we could still potentially consider this ID linearly indexable, as we
+      // could multiple the index by the last root's stride.
+      //
+      // If we're computing predicates (ignore_consistent_ordering_==true),
+      // then we don't have this same constraint, we can just ignore
+      // contiguity of the roots all together.
+      if (!root_contiguity_[root_id_i] && is_indexing_pass) {
+        if (!root_ids.empty()) {
           return;
         }
       }
@@ -612,7 +610,7 @@ bool ContigIDs::isIndexable(IterDomain* id) const {
   }
   auto c_id =
       ca_map_->getConcreteMappedID(getMappedId(id), IdMappingMode::EXACT);
-  return concrete_to_ref_.find(c_id) != concrete_to_ref_.end();
+  return index_map_.find(c_id) != index_map_.end();
 }
 
 } // namespace cuda
