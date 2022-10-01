@@ -792,7 +792,7 @@ void StmtSort::handle(Statement* stmt) {
 
 std::vector<Expr*> StmtSort::getExprs(Fusion* fusion, bool traverse_members) {
   auto terminating_outputs = fusion->getTerminatingOutputs();
-  return StmtSort::getExprs(fusion, terminating_outputs, {}, traverse_members);
+  return StmtSort::getExprs(fusion, terminating_outputs, traverse_members);
 }
 
 std::vector<Expr*> StmtSort::getExprs(
@@ -811,17 +811,6 @@ std::vector<Expr*> StmtSort::getExprsBetween(
     const std::vector<Val*>& to,
     bool traverse_members) {
   auto stmts = StmtSort::getStmtsBetween(fusion, from, to, traverse_members);
-  auto filter = ir_utils::filterByType<Expr>(stmts.begin(), stmts.end());
-  std::vector<Expr*> exprs(filter.begin(), filter.end());
-  return exprs;
-}
-
-std::vector<Expr*> StmtSort::getExprs(
-    Fusion* fusion,
-    const std::vector<Val*>& from,
-    const std::vector<Val*>& inputs,
-    bool traverse_members) {
-  auto stmts = StmtSort::getStmts(fusion, from, inputs, traverse_members);
   auto filter = ir_utils::filterByType<Expr>(stmts.begin(), stmts.end());
   std::vector<Expr*> exprs(filter.begin(), filter.end());
   return exprs;
@@ -851,17 +840,6 @@ std::vector<Statement*> StmtSort::getStmtsBetween(
   StmtSort es;
   es.traverseBetween(
       fusion, {from.begin(), from.end()}, to, false, traverse_members);
-  return es.stmts;
-}
-
-std::vector<Statement*> StmtSort::getStmts(
-    Fusion* fusion,
-    const std::vector<Val*>& from,
-    const std::vector<Val*>& inputs,
-    bool traverse_members) {
-  StmtSort es;
-  es.traverseFrom(
-      fusion, from, {inputs.begin(), inputs.end()}, false, traverse_members);
   return es.stmts;
 }
 
