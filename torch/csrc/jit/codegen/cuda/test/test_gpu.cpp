@@ -20891,7 +20891,8 @@ TEST_F(NVFuserTest, FusionSmemBlockGemmCacheDoubleBuffer_CUDA) {
 }
 
 // TEST_F(NVFuserTest, FusionIntermediateTensorVectorize_CUDA) {
-//   std::vector<MemoryType> mem_types = {MemoryType::Shared, MemoryType::Local};
+//   std::vector<MemoryType> mem_types = {MemoryType::Shared,
+//   MemoryType::Local};
 
 //   for (auto mem_type : mem_types) {
 //     Fusion fusion;
@@ -20915,7 +20916,8 @@ TEST_F(NVFuserTest, FusionSmemBlockGemmCacheDoubleBuffer_CUDA) {
 
 //     tv2->axis(-1)->parallelize(ParallelType::Vectorize);
 
-//     auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+//     auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA,
+//     0);
 //     at::manual_seed(0);
 //     auto t0 = at::randn({15}, options);
 //     FusionExecutor fe;

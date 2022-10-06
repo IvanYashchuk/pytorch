@@ -1741,7 +1741,7 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule6_CUDA) {
   fusion.addInput(tv3);
   auto tv4 = add(tv2, tv3);
   fusion.addOutput(tv4);
-  fusion.printMath();
+
   auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
 
   at::Tensor t0 = at::randn({x, y}, options);
