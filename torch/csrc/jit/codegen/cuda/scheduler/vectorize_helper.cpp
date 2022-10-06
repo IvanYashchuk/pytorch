@@ -986,6 +986,7 @@ void ContiguousInnerDimensionsMapper::propagateSibling(
   projected_root_ids_[to] = sibling_root_ids;
 
   if (!from->hasRFactor()) {
+    projected_rfactor_ids_[to] = sibling_root_ids;
     return;
   }
 

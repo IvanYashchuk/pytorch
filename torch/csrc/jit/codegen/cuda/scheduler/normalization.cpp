@@ -909,8 +909,12 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getPersistentHeuristics(
   }
 
   // Try expanding vectorization to contig merged domains
-  vectorize_factor = vectorize_helper::expandVectorizationToContigMergedDomains(
-      fusion,
+  // TODO: This is an expensive function that shouldn't be in heuristics without
+  // caching.
+  auto maps = vectorize_helper::getAllVectorizedMapsOf(first_red_tv);
+
+  vectorize_factor = vectorize_helper::getExpandedVectorization(
+      maps,
       runtime_info,
       vectorizable_inputs_outputs,
       first_red_tv,
