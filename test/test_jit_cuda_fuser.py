@@ -59,9 +59,6 @@ if GRAPH_EXECUTOR == ProfilingMode.PROFILING:
 
 FUSION_GROUP = 'prim::CudaFusionGroup'
 FUSION_GUARD = 'prim::CudaFusionGuard'
-# TODO: revert disabled alias ops
-ALIAS_TEST_DISABLED = True
-
 
 @contextlib.contextmanager
 def nvfuser_singleton_fusion(flag):
@@ -3691,7 +3688,6 @@ class TestCudaFuser(JitTestCase):
         jit_o = t_jit(x.clone(), bias, output_shape)
         # eager - baseline
         o = t(x.clone(), bias, output_shape)
-
         self.assertEqual(o.dtype, jit_o.dtype)
         self.assertTrue(self._compare("comparing output failed", o, jit_o, error))
         graph = t_jit.graph_for(x, bias, output_shape)
@@ -3804,7 +3800,6 @@ class TestCudaFuser(JitTestCase):
                 total += 1
                 test_fn(all_views[idx], all_views[jdx], torch.float, 'cuda', 1e-6)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since view is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -3869,7 +3864,6 @@ class TestCudaFuser(JitTestCase):
         self.assertGraphContainsExactly(graph, FUSION_GUARD, 0)
         self.assertGraphContainsExactly(graph, 'prim::flatten_copy', 0)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since flatten is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -3944,7 +3938,6 @@ class TestCudaFuser(JitTestCase):
         self.assertGraphContains(graph, FUSION_GUARD)
         self.assertGraphContains(graph, 'prim::view_copy', True)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since view is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4003,7 +3996,6 @@ class TestCudaFuser(JitTestCase):
         self.assertGraphContainsExactly(graph, FUSION_GUARD, 0)
         self.assertGraphContainsExactly(graph, 'prim::squeeze_copy', 0)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since squeeze/unsqueeze is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4011,7 +4003,6 @@ class TestCudaFuser(JitTestCase):
         self._bias_squeeze_relu_helper([1, 6, 1, 2, 2, 5, 1], torch.float, 'cuda', 1e-6)
         self._alias_bias_squeeze_relu_helper([1, 6, 1, 2, 2, 5, 1], torch.float, 'cuda', 1e-6)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since squeeze/unsqueeze is disabled now")
     # remove this after opinfo tests are enabled
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
@@ -4088,7 +4079,6 @@ class TestCudaFuser(JitTestCase):
         self.assertGraphContainsExactly(graph, FUSION_GUARD, 0)
         self.assertGraphContainsExactly(graph, 'prim::unsqueeze_copy', 0)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since squeeze/unsqueeze is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4096,7 +4086,6 @@ class TestCudaFuser(JitTestCase):
         self._bias_unsqueeze_relu_helper([2, 3, 4, 5], torch.float, 'cuda', 1e-6)
         self._alias_bias_unsqueeze_relu_helper([2, 3, 4, 5], torch.float, 'cuda', 1e-6)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since unsqueeze is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4113,7 +4102,6 @@ class TestCudaFuser(JitTestCase):
         t_jit = torch.jit.script(t)
         self._run_helper(t_jit, t, x, w, b)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since squeeze/unsqueeze is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4269,7 +4257,6 @@ class TestCudaFuser(JitTestCase):
             self.assertGraphContainsExactly(t3.graph_for(x, y, z), FUSION_GUARD, 1)
             self.assertGraphContainsExactly(t3.graph_for(x, y, z), 'aten::add', 1)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since squeeze/unsqueeze is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4424,7 +4411,6 @@ class TestCudaFuser(JitTestCase):
             self._run_helper(t_jit_none, t_none, x)
 
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since reshape is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
@@ -4442,7 +4428,6 @@ class TestCudaFuser(JitTestCase):
             t_jit = torch.jit.script(t)
             self._run_helper(t_jit, t, x, y)
 
-    @unittest.skipIf(ALIAS_TEST_DISABLED, "skipping this test since view is disabled now")
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
                      "Requires fusion optimization pass to be effective")
