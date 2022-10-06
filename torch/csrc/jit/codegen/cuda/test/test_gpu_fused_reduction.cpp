@@ -370,7 +370,7 @@ TEST_F(NVFuserTest, FusionGridAllreduce6_CUDA) {
     GTEST_SKIP() << "Not enough SMs to run this test";
   }
 
-  auto tv0 = makeSymbolicTensor(2);
+  auto tv0 = makeContigTensor(2);
   fusion.addInput(tv0);
 
   auto tv1 = set(tv0);
@@ -419,7 +419,7 @@ TEST_F(NVFuserTest, FusionGridAllreduceWelford1_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
-  auto tv0 = makeSymbolicTensor(1);
+  auto tv0 = makeContigTensor(1);
   fusion.addInput(tv0);
 
   auto tvs = Welford(tv0, {0});
