@@ -1,5 +1,6 @@
 #pragma once
 
+#include <torch/csrc/jit/codegen/cuda/compute_at_map.h>
 #include <torch/csrc/jit/codegen/cuda/disjoint_set.h>
 #include <torch/csrc/jit/codegen/cuda/fusion.h>
 #include <torch/csrc/jit/codegen/cuda/ir_all_nodes.h>
@@ -535,6 +536,10 @@ TORCH_CUDA_CU_API bool breakIsDisjoint(std::vector<int> group_ids, int pos);
 // This is somewhat similar to orderTiledConcreteIdAsRoot
 TORCH_CUDA_CU_API std::unordered_map<int, int> domainReorderAsRfactorMap(
     TensorView* tv);
+
+// Assumes view's are consistent as detected by
+// registery.cpp::requiresForwardViewReplay returning false
+void propagateViewTransforms(Fusion* fusion, const ComputeAtMap& ca_map);
 
 } // namespace scheduler_utils
 } // namespace cuda

@@ -446,6 +446,139 @@ bool isConnectedFusionGraph(Fusion* fusion) {
   return true;
 }
 
+// Returns if a fusion cannot transformed into a consistent format since we
+// can't transform forward through view operations, for exmaple:
+//
+// tv0[I0, I1, I2]
+// tv1[I0*I1, I2] = view(tv0)
+// tv2[I0, I1*I2] = view(tv0)
+//
+// If we start transform propagation at either tv1 or tv2, it would require
+// "replaying forward" through the other. If we started at tv1 we'd have to be
+// able to take tv2[I0, I1*I2] and transform it to [I0*I1, I2], however this
+// would "undo" the view transformation which we do not support today.
+//
+// Returns true if a scenario like above is found in the fusion.
+bool requiresForwardViewReplay(Fusion* fusion, ComputeAtMap& ca_map) {
+  // Track the uses of the rfactor domains in the fusion. If an rfactor domain
+  // is used in more than one way it means the above situation is being
+  // encountered.
+  //
+  // tv1 root: [I0rf, I1rf, I2] -> rfactor [I0*I1rf, I2]
+  // tv1 root: [I0, I1rf, I2rf] -> rfactor [I0, I1*I2rf]
+  //
+  // Here we can see I1rf is used in two view transformations, one to I0*I1rf,
+  // and the other to I1*I2rf.
+
+  // Track the transformation each exact disjoint rfactor set is used in. If
+  // more than one is detected we can't support transforming the fusion into a
+  // consistent format.
+  std::unordered_map<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>, Expr*>
+      unique_exact_uses_;
+
+  // Don't check compute uses directly, as IterDomain->uses() isn't protected
+  // from going outside the TensorViews between registered inputs and outputs of
+  // the fusion. If there are view operations defined in the fusion container
+  // (because of how segmentation works) but not between registered input and
+  // outputs, that could be picked up as inconsistent view transformations.
+  //
+  // It would be unlikely this would be picked up as a conflict as we check
+  // which definitions were registered in the compute at map for matching
+  // transformations. However, we may want to support scheduling after
+  // transformations which could map to those views not on the input->output
+  // path.
+
+  // Look through all definitions associated with producing rfactor outputs.
+  // Mark those as an active use of the rfactor, if two are detected, return
+  // true.
+  for (const auto& disjoint_set_shared_ptr :
+       ca_map.idGraph().exactNodes().disjointSets()) {
+    // Make sure there's at least one rfactor domain in the set, otherwise we
+    // don't need to check anything from this set.
+    if (!std::any_of(
+            disjoint_set_shared_ptr->vector().begin(),
+            disjoint_set_shared_ptr->vector().end(),
+            [](IterDomain* id) { return id->isRFactorProduct(); })) {
+      continue;
+    }
+
+    // Grab all the unique definitions detected to consume the iter domains in
+    // this set
+    auto unique_defs =
+        ca_map.uniqueExactDefinitions(disjoint_set_shared_ptr->back());
+
+    // Iterate through the all the rfactor iter domains
+    for (auto id_rfactor_product : disjoint_set_shared_ptr->vector()) {
+      if (!id_rfactor_product->isRFactorProduct()) {
+        continue;
+      }
+
+      // Grab the rfactor definition
+      auto rfactor_def = id_rfactor_product->definition();
+
+      if (rfactor_def == nullptr) {
+        // Guard segfault if there isn't a definition for this iter domain
+        continue;
+      }
+
+      // If one output of the expression is an rfactor ID all of them should be
+      auto def_outs =
+          ir_utils::filterByType<IterDomain>(rfactor_def->outputs());
+      TORCH_INTERNAL_ASSERT(
+          std::all_of(
+              def_outs.begin(),
+              def_outs.end(),
+              [](IterDomain* id) { return id->isRFactorProduct(); }),
+          "This function does not support outputs of transformations with mismatching rfactor flags. ",
+          "If one output is rfactor all should be rfactor.");
+
+      // There could be a transformation where the inputs are rfactor
+      // dimensions, but outputs are not, just ignore those expressions as
+      // they're scheduling based after of the view definitions.
+      auto def_inps = ir_utils::filterByType<IterDomain>(rfactor_def->inputs());
+      if (!std::all_of(def_inps.begin(), def_inps.end(), [](IterDomain* id) {
+            return id->isRFactorProduct();
+          })) {
+        continue;
+      }
+
+      // Check which definition in the unique exact definition set this
+      // definition matches to:
+      for (auto unique_def : unique_defs) {
+        if (ca_map.areExactExprs(rfactor_def, unique_def)) {
+          // Check if we already have an expression that consumes an
+          // equivalent of any of the input rfactor domains. If so and it's
+          // not the already registered transformation, return false
+          for (auto inp : def_inps) {
+            auto inp_disjoint_set =
+                ca_map.disjointSetOf(inp, IdMappingMode::EXACT);
+            // Initialize the use entry for this set (if it doesn't already
+            // exist)
+            if (unique_exact_uses_.find(inp_disjoint_set) ==
+                unique_exact_uses_.end()) {
+              unique_exact_uses_[inp_disjoint_set] = nullptr;
+            }
+
+            if (unique_exact_uses_.at(inp_disjoint_set) == nullptr) {
+              // If expression is null pointer register this unique_def
+              unique_exact_uses_[inp_disjoint_set] = unique_def;
+            } else if (!ca_map.areExactExprs(
+                           unique_exact_uses_[inp_disjoint_set], unique_def)) {
+              // Two transformations that don't match on matching rfactor
+              // domains found, return true.
+              return true;
+            }
+          }
+          // Expression already mapped, stop trying to match expressions
+          break;
+        }
+      }
+    }
+  }
+  // No inconsistent rfactor uses found, we can safely transform this graph.
+  return false;
+}
+
 } // namespace
 
 void SchedulerRuntimeInfo::initialize(
@@ -1226,9 +1359,8 @@ class PointWiseScheduler : public SchedulerEntry {
       return false;
     }
 
-    if (!scheduler_utils::allMatchingViews(fusion) &&
-        SchedulerTopologyChecker::hasViewNotBeforeRef(
-            fusion, {getReferenceTensorView(fusion)})) {
+    ComputeAtMap ca_map(fusion);
+    if (requiresForwardViewReplay(fusion, ca_map)) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::PointWise, "Unsupported view fusion.");
       return false;

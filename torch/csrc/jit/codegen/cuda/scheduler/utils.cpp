@@ -2,7 +2,6 @@
 #include <torch/csrc/jit/codegen/cuda/scheduler/utils.h>
 #include <torch/csrc/jit/codegen/cuda/scheduler/vectorize_helper.h>
 
-#include <torch/csrc/jit/codegen/cuda/compute_at_map.h>
 #include <torch/csrc/jit/codegen/cuda/contiguity.h>
 #include <torch/csrc/jit/codegen/cuda/expr_evaluator.h>
 #include <torch/csrc/jit/codegen/cuda/instrumentation.h>
@@ -2206,6 +2205,7 @@ DisjointSets<IterDomain*> disjointViewSets(Fusion* fusion) {
   return disjoint_view_ids;
 }
 
+// TODO: Remove
 bool allMatchingViews(Fusion* fusion) {
   // Start from the exact iter domain graph of the fusion
   IterDomainGraph id_graph(fusion);
@@ -2389,6 +2389,88 @@ std::unordered_map<int, int> domainReorderAsRfactorMap(TensorView* tv) {
     old2new[old_pos] = new_pos;
   }
   return old2new;
+}
+
+void propagateViewTransforms(Fusion* fusion, const ComputeAtMap& ca_map) {
+  std::unordered_set<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+      transformed_disjoint_sets;
+
+  // If iter domains are involved in any transformation from root domains to
+  // rfactor domains they should be considered "contaminated".
+  for (auto tv : ir_utils::allTvs(fusion)) {
+    for (auto expr : StmtSort::getExprsBetween(
+             fusion,
+             {tv->getRootDomain().begin(), tv->getRootDomain().end()},
+             {tv->getMaybeRFactorDomain().begin(),
+              tv->getMaybeRFactorDomain().end()})) {
+      for (auto id : ir_utils::filterByType<IterDomain>(expr->inputs())) {
+        transformed_disjoint_sets.emplace(
+            ca_map.disjointSetOf(id, IdMappingMode::EXACT));
+      }
+    }
+  }
+
+  std::unordered_set<IterDomain*> terminating_rfactor_dims;
+  for (const auto& disjoint_set_shared_ptr :
+       ca_map.idGraph().exactNodes().disjointSets()) {
+    if (std::none_of(
+            disjoint_set_shared_ptr->vector().begin(),
+            disjoint_set_shared_ptr->vector().end(),
+            [](IterDomain* id) { return id->isRFactorProduct(); })) {
+      continue;
+    }
+    if (transformed_disjoint_sets.find(disjoint_set_shared_ptr) !=
+        transformed_disjoint_sets.end()) {
+      // Disjoint set was transformed for view, ignore it
+      continue;
+    }
+    for (auto id : disjoint_set_shared_ptr->vector()) {
+      terminating_rfactor_dims.emplace(id);
+    }
+  }
+
+  // If iter domains are involved in any transformation from root domains to
+  // rfactor domains they should be considered "contaminated".
+  for (auto tv : ir_utils::allTvs(fusion)) {
+    if (!tv->hasRFactor()) {
+      continue;
+    }
+
+    std::unordered_map<int, int> old2new;
+    // Make sure rfactor dims we need are in domain, and reorder them in domain
+    // so they're consecutive starting from the left of domain. TODO: We could
+    // improve this so that if there's transformations replayed after the
+    // rfactor dims we could try and pull those through the fusion instead of
+    // enforcing rfactor dims are in domain.
+    for (auto rfactor_id : tv->getMaybeRFactorDomain()) {
+      if (terminating_rfactor_dims.find(rfactor_id) !=
+          terminating_rfactor_dims.end()) {
+        auto find_it = std::find(
+            tv->domain()->domain().begin(),
+            tv->domain()->domain().end(),
+            rfactor_id);
+        TORCH_INTERNAL_ASSERT(
+            find_it != tv->domain()->domain().end(),
+            "Require ",
+            rfactor_id,
+            " is in the active domain of ",
+            tv->toString(),
+            " for view propagation.");
+        auto old_pos = std::distance(tv->domain()->domain().begin(), find_it);
+
+        old2new[old_pos] = old2new.size();
+      }
+    }
+
+    if (old2new.empty()) {
+      continue;
+    }
+
+    // Propagate the view transformations
+    tv->reorder(old2new);
+    //! Propagate current transformations on from_tv to all graphs
+    transformPropagateToAllFrom(tv, old2new.size());
+  }
 }
 
 } // namespace scheduler_utils
