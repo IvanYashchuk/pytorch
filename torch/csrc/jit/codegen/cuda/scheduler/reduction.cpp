@@ -939,7 +939,6 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getReductionHeuristics(
 
   auto& unrollable_inputs_outputs = unrollable_inputs_outputs_entry.get();
 
-  TORCH_INTERNAL_ASSERT(unrollable_inputs_outputs.size() > 0);
   // Vectorize as much as we can
   size_t vectorize_factor = std::numeric_limits<size_t>::max();
 
@@ -965,6 +964,10 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getReductionHeuristics(
   // Base max dtype and n_tensor_inputs on tensors that are vectorizable (i.e.
   // share inner dimension with data pattern we're looking at).
   size_t max_dtype_size = 1;
+
+  // TODO: This might be better if it was the larger of input or outputs. Would
+  // be even better if we had better analysis as not all unrolled elements have
+  // to be alive at the same time.
   size_t n_tensor_inputs = 0;
   for (auto tv : unrollable_inputs_outputs) {
     if (!tv->isFusionInput()) {
@@ -977,6 +980,9 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getReductionHeuristics(
             indexModeToDtype(runtime_info.getIndexMode())));
     n_tensor_inputs++;
   }
+
+  // Protect heuristics div by 0:
+  n_tensor_inputs = std::max(n_tensor_inputs, (size_t)1);
 
   return reductionHeuristic(
       properties.total_reduction_numel,

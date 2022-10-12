@@ -1317,6 +1317,7 @@ bool hasInnerDim(
     std::unordered_set<IterDomain*> inner_dims,
     bool should_vectorize) {
   const auto& inner_most_dim = innerMostRootDim(tv);
+  // TODO: Why "|| inner_most_dim->isReduction()"
   if (inner_most_dim == nullptr || inner_most_dim->isReduction()) {
     return false;
   }
