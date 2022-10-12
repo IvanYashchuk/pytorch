@@ -1018,6 +1018,17 @@ void scheduleReduction(Fusion* fusion, const ReductionParams& rparams) {
   // changes registry needs to change.
   auto reduction_tv = reduction_tvs[0];
 
+  if (ir_utils::getViewOps(fusion).size() > 0) {
+    ComputeAtMap ca_map(fusion);
+    // Propagate view transforms through the graph, expecially the reference.
+    scheduler_utils::propagateViewTransforms(fusion, ca_map);
+
+    // Reorder reference_tv after propagating the view operation. This will
+    // reorder for better merging.
+    reduction_tv->reorder(
+        scheduler_utils::domainReorderAsRfactorMap(reduction_tv));
+  }
+
   auto dim_analysis = scheduler_utils::canonicalDimReduction(
       fusion, reduction_tv, rparams.fastest_dim && rparams.schedule_3D);
 
