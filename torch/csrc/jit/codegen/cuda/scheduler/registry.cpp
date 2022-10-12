@@ -1250,12 +1250,12 @@ class ReductionScheduler : public SchedulerEntry {
       return false;
     }
 
-    if (findTransposeOps(fusion).size() > 0) {
-      // Use pointwise logic
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Reduction, "No support for transpose op");
-      return false;
-    }
+    // if (findTransposeOps(fusion).size() > 0) {
+    //   // Use pointwise logic
+    //   scheduler_debug_utils::canScheduleRejectReason(
+    //       ScheduleHeuristic::Reduction, "No support for transpose op");
+    //   return false;
+    // }
 
     if (hasNonUniqueBcast(fusion)) {
       scheduler_debug_utils::canScheduleRejectReason(
@@ -1604,12 +1604,12 @@ class PersistentKernelScheduler : public SchedulerEntry {
       }
     }
 
-    if (findTransposeOps(fusion).size() > 0) {
-      // Use pointwise logic
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Persistent, "no support for transpose");
-      return false;
-    }
+    // if (findTransposeOps(fusion).size() > 0) {
+    //   // Use pointwise logic
+    //   scheduler_debug_utils::canScheduleRejectReason(
+    //       ScheduleHeuristic::Persistent, "no support for transpose");
+    //   return false;
+    // }
 
     // Before examining the reduction axes want to quickly
     //   check the reductions have the same axis width
