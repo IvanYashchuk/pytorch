@@ -377,9 +377,15 @@ class TestCommon(TestCase):
         if executor == "nvfuser" and isinstance(op, ReductionPythonRefInfo):
             skip_zero_dim = True
 
-        # skip zero-dim tensors for some composites of reduction operations
-        normalization_ops = ["_refs.softmax", "_refs.logsumexp", "_refs.log_softmax", "_refs.sum_to_size"]
-        if executor == "nvfuser" and op.name in normalization_ops:
+        # skip zero-dim tensors for some composites of reduction operations and view
+        skip_zero_dim_ops = [
+            "_refs.softmax",
+            "_refs.logsumexp",
+            "_refs.log_softmax",
+            "_refs.sum_to_size",
+            "ops.nvprims.view",
+        ]
+        if executor == "nvfuser" and op.name in skip_zero_dim_ops:
             skip_zero_dim = True
 
         from torch._prims.executor import make_traced
@@ -1594,6 +1600,7 @@ class TestRefsOpsInfo(TestCase):
         '_refs.to',
         '_refs.ones',
         '_refs.ones_like',
+        '_refs.special.expit',
         '_refs.std_var',
         '_refs.swap_axes',
         '_refs.uniform',
@@ -1653,6 +1660,7 @@ class TestRefsOpsInfo(TestCase):
         '_refs.positive',
         '_refs.ravel',
         '_refs.reshape',
+        '_refs.special.expit',
         '_refs.square',
         '_refs.tensor_split',
         '_refs.to',
@@ -1811,10 +1819,6 @@ fake_backward_xfails = fake_tensor_stride_failing_ops | {
     "linalg.norm",
     "linalg.svd",
     "linalg.svdvals",
-    "nn.functional.binary_cross_entropy_with_logits",
-    "nn.functional.huber_loss",
-    "nn.functional.logsigmoid",
-    "nn.functional.multilabel_soft_margin_loss",
     "pca_lowrank",
     "roll",
     "svd_lowrank",
@@ -1934,7 +1938,7 @@ class TestFakeTensor(TestCase):
 
             # TODO: enable check_aliasing, batch norm fails
             with torch._subclasses.CrossRefFakeMode(ignore_op_fn=lambda fn: fn in common_skip_ops, check_aliasing=True):
-                with warnings.catch_warnings(), context():
+                with warnings.catch_warnings(), context(), torch.autograd.set_multithreading_enabled(False):
                     composite_compliance.compute_expected_grads(
                         op.get_op(), args, kwargs,
                         sample.output_process_fn_grad,
