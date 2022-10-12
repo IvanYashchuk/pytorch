@@ -579,6 +579,128 @@ bool requiresForwardViewReplay(Fusion* fusion, ComputeAtMap& ca_map) {
   return false;
 }
 
+// Returns if view intefers with how we want to treat the reference, being at
+// least a 2D reduction schedule but maybe a 3D reduction schedule.
+bool reductionInterferingView(
+    Fusion* fusion,
+    const ComputeAtMap& ca_map,
+    TensorView* reduction_reference) {
+  // Make sure the view doesn't interfere with how we'll want to schedule
+  // it. If we might want to do a 3D scheduler make sure views are disjoint
+  // based on what the 3D scheduler's merges would be.
+
+  // Utility to take dimensions out of the vector that we've already
+  // processed or don't want to process.
+  auto remove_dims = [](const std::vector<IterDomain*>& dims,
+                        std::unordered_set<IterDomain*> to_remove) {
+    std::vector<IterDomain*> dims_removed;
+    std::copy_if(
+        dims.begin(),
+        dims.end(),
+        std::back_inserter(dims_removed),
+        [&](IterDomain* id) { return to_remove.find(id) == to_remove.end(); });
+    return dims_removed;
+  };
+
+  // Remove trivial reduction dimensions
+  auto mapped_to_trivial_reduction =
+      scheduler_utils::getTrivialReductionMap(fusion);
+
+  std::vector<IterDomain*> dims = remove_dims(
+      reduction_reference->getMaybeRFactorDomain(),
+      mapped_to_trivial_reduction);
+
+  // The disjoint groups we need for this scheduler
+  std::vector<std::vector<IterDomain*>> groups;
+
+  // Do this three times as we could have a 3D scheduler at maximum
+  for (auto dimension : c10::irange(3)) {
+    // Tracker for this group
+    std::vector<IterDomain*> current_dims;
+
+    // Tracker of what we've already processed to remove from dims
+    std::unordered_set<IterDomain*> processed;
+
+    for (auto i : c10::irange(dims.size())) {
+      auto dim_i = dims.size() - i - 1;
+      if (dims[dim_i]->isReduction() != dims[dims.size() - 1]->isReduction()) {
+        if (dimension == 0) {
+          // First dimension must be contiguous merges
+          break;
+        } else {
+          // Other dimensions can be non contiguous merges
+          continue;
+        }
+      }
+      current_dims.push_back(dims[dim_i]);
+      processed.emplace(dims[dim_i]);
+    }
+
+    // Don't add empty group (would happen if it's a 2D scheduler not 3D)
+    if (current_dims.size() > 0) {
+      groups.push_back(current_dims);
+      dims = remove_dims(dims, processed);
+    }
+  }
+
+  TORCH_INTERNAL_ASSERT(
+      dims.empty(), "Error processing ", dims, " in registry.cpp.");
+
+  // Make sure groups are disjoint based on view
+
+  auto disjoint_view_sets = scheduler_utils::disjointViewSets(fusion);
+  auto disjoint_set_information = scheduler_utils::getDisjointViewSetsOf(
+      fusion, reduction_reference, disjoint_view_sets);
+
+  // Convert id's in groups to disjoint_set_ids of disjoint_set_information
+  std::vector<std::vector<int>> disjoint_groups;
+
+  for (auto group : groups) {
+    std::vector<int> disjoint_id_sets;
+    for (auto id : group) {
+      auto find_it = std::find(
+          reduction_reference->getMaybeRFactorDomain().begin(),
+          reduction_reference->getMaybeRFactorDomain().end(),
+          id);
+      TORCH_INTERNAL_ASSERT(
+          find_it != reduction_reference->getMaybeRFactorDomain().end(),
+          "Issue with view analysis on reduction like schedule, with reference: ",
+          reduction_reference->toString());
+      auto rfactor_pos = std::distance(
+          reduction_reference->getMaybeRFactorDomain().begin(), find_it);
+      TORCH_INTERNAL_ASSERT(
+          rfactor_pos < disjoint_set_information.disjoint_set_ids.size(),
+          "Error computing disjoint group on the rfactor domain of ",
+          reduction_reference->toString());
+      disjoint_id_sets.push_back(
+          disjoint_set_information.disjoint_set_ids[rfactor_pos]);
+    }
+    disjoint_groups.push_back(disjoint_id_sets);
+  }
+
+  // Make sure there's no intersection between the groups, otherwise view
+  // will interfere with the schedule. TODO: Make this better complexity,
+  // since it should be relatively small int vectors of a small total nDims,
+  // not too worried about it now.
+
+  for (auto first_dim_i : c10::irange(disjoint_groups.size())) {
+    for (auto second_dim_i = first_dim_i + 1;
+         second_dim_i < disjoint_groups.size();
+         ++second_dim_i) {
+      auto first_group = disjoint_groups[first_dim_i];
+      auto second_group = disjoint_groups[second_dim_i];
+      for (auto first_disjoint_id : first_group) {
+        for (auto second_disjoint_id : second_group) {
+          if (first_disjoint_id == second_disjoint_id) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 void SchedulerRuntimeInfo::initialize(
@@ -1113,15 +1235,6 @@ class ReductionScheduler : public SchedulerEntry {
 
   //! Check if the reduction heuristics apply in given fusion
   static bool canScheduleCompileTime(Fusion* fusion) {
-    // Temporarily disallow view in reduction scheduler
-    // TODO Add more testing before enabling
-    auto view_tvs = scheduler_utils::getViewTVs(fusion);
-    if (view_tvs.size() > 0) {
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Reduction, "No support for view op");
-      return false;
-    }
-
     // Needs at least one non-trivial reduction to consider.
     if (ir_utils::getReductionOps(fusion, true /* ignore_trivial */).empty()) {
       scheduler_debug_utils::canScheduleRejectReason(
@@ -1151,15 +1264,23 @@ class ReductionScheduler : public SchedulerEntry {
       return false;
     }
 
-    // Persistent scheduler simply uses reduction_tvs[0] as the reference, if
-    // that changes, this needs to be changed. Second check here may be overly
-    // conservative.
-    if (SchedulerTopologyChecker::hasViewNotBeforeRef(
-            fusion, {reduction_tvs[0]}) ||
-        !scheduler_utils::allMatchingViews(fusion)) {
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Reduction, "Unsupported view fusion.");
-      return false;
+    if (ir_utils::getViewOps(fusion).size() > 0) {
+      ComputeAtMap ca_map(fusion);
+      if (requiresForwardViewReplay(fusion, ca_map)) {
+        scheduler_debug_utils::canScheduleRejectReason(
+            ScheduleHeuristic::Reduction,
+            "Fusion requires view being reversible.");
+        return false;
+      }
+
+      // Reduction scheduler simply uses reduction_tvs[0] as the reference, if
+      // that changes, this needs to be changed.
+      if (reductionInterferingView(fusion, ca_map, reduction_tvs[0])) {
+        scheduler_debug_utils::canScheduleRejectReason(
+            ScheduleHeuristic::Reduction,
+            "View may interfere with reduction scheduling.");
+        return false;
+      }
     }
 
     // Make sure reduction axes are consistent through the fusion
@@ -1359,11 +1480,14 @@ class PointWiseScheduler : public SchedulerEntry {
       return false;
     }
 
-    ComputeAtMap ca_map(fusion);
-    if (requiresForwardViewReplay(fusion, ca_map)) {
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::PointWise, "Unsupported view fusion.");
-      return false;
+    if (ir_utils::getViewOps(fusion).size() > 0) {
+      ComputeAtMap ca_map(fusion);
+      if (requiresForwardViewReplay(fusion, ca_map)) {
+        scheduler_debug_utils::canScheduleRejectReason(
+            ScheduleHeuristic::PointWise,
+            "Fusion requires view being reversible.");
+        return false;
+      }
     }
 
     auto reduction_ops =
@@ -1444,13 +1568,6 @@ class PersistentKernelScheduler : public SchedulerEntry {
     auto reduction_ops =
         ir_utils::getReductionOps(fusion, false /* ignore_trivial */);
 
-    auto view_tvs = scheduler_utils::getViewTVs(fusion);
-    if (view_tvs.size() > 0) {
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Persistent, "no support for view");
-      return false;
-    }
-
     if (hasNonUniqueBcast(fusion)) {
       scheduler_debug_utils::canScheduleRejectReason(
           ScheduleHeuristic::Persistent,
@@ -1468,14 +1585,23 @@ class PersistentKernelScheduler : public SchedulerEntry {
       return false;
     }
 
-    // Persistent scheduler simply uses reduction_tvs[0] as the reference, if
-    // that changes, this needs to be changed. Second check here may be overly
-    // conservative.
-    if (SchedulerTopologyChecker::hasViewNotBeforeRef(
-            fusion, {reduction_tvs[0]}) ||
-        !scheduler_utils::allMatchingViews(fusion)) {
-      scheduler_debug_utils::canScheduleRejectReason(
-          ScheduleHeuristic::Persistent, "Unsupported view fusion.");
+    if (ir_utils::getViewOps(fusion).size() > 0) {
+      ComputeAtMap ca_map(fusion);
+      if (requiresForwardViewReplay(fusion, ca_map)) {
+        scheduler_debug_utils::canScheduleRejectReason(
+            ScheduleHeuristic::Persistent,
+            "Fusion requires view being reversible.");
+        return false;
+      }
+
+      // Persistent scheduler simply uses reduction_tvs[0] as the reference, if
+      // that changes, this needs to be changed.
+      if (reductionInterferingView(fusion, ca_map, reduction_tvs[0])) {
+        scheduler_debug_utils::canScheduleRejectReason(
+            ScheduleHeuristic::Persistent,
+            "View may interfere with normalization scheduling.");
+        return false;
+      }
     }
 
     if (findTransposeOps(fusion).size() > 0) {

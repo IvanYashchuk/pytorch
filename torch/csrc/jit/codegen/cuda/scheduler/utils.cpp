@@ -1395,26 +1395,6 @@ std::vector<TensorView*> getInputsOutputsWithInnerDim(
   return vectorizable_tensors;
 }
 
-namespace {
-// Holder return struct for the below function.
-struct DisjointViewSetInfo {
-  // const* to the disjoint set in disjoint_view_set passed in to
-  // getDisjointViewSetsOf each iterdomain in the rfactor of ref is mapped to.
-  //
-  // WARNING: these pointers are relative to the disjoint_view_set reference
-  // passed into getDisjointViewSetsOf it's the user's responsibillity to
-  // maintain the lifetime of that reference to match this vector.
-  std::vector<const VectorOfUniqueEntries<IterDomain*>*> disjoint_sets_of_ref;
-
-  // Unique ID associated to the disjoint view group the rfactor id belongs to
-  // in disjoint_sets_of_ref. It's straight forward to map from
-  // disjoint_sets_of_ref to the vector, but not the other way around.
-  std::vector<int> disjoint_set_ids;
-
-  // TensorView reference the above vectors are relative to.
-  TensorView* ref;
-};
-
 // Returns disjoint view sets mapped onto the given reference. Returns a pair
 // of vectors of size rfactorDomain of reference. Vector of
 // VectorOfUniqueEntries returns a const* to the disjoint set in
@@ -1495,7 +1475,6 @@ DisjointViewSetInfo getDisjointViewSetsOf(
 
   return info;
 }
-} // namespace
 
 BroadcastMultipleInformation getBroadcastMultiples(
     TensorView* reference_tv,

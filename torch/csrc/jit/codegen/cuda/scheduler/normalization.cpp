@@ -850,9 +850,13 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getPersistentHeuristics(
   auto persistent_buffer_size_info = scheduler_utils::persistentBufferSize(
       fusion, runtime_info, persistent_buffer_info, data_cache);
   // If projected persistent buffers are smaller, they will be used.
-  auto max_persistent_size = std::min(
-      persistent_buffer_size_info.persistent_buffer_size,
-      persistent_buffer_size_info.projected_persistent_buffer_size);
+  // TODO: Fix projected persistent buffers with view
+  // https://github.com/csarofeen/pytorch/issues/2054
+  auto max_persistent_size = ir_utils::getViewOps(fusion).size() > 0
+      ? persistent_buffer_size_info.persistent_buffer_size
+      : std::min(
+            persistent_buffer_size_info.persistent_buffer_size,
+            persistent_buffer_size_info.projected_persistent_buffer_size);
 
   // Figure out if we want to projet persistent buffers to the inputs for
   // exmaple if we have an input tensor t0 that's fp16:
@@ -965,7 +969,10 @@ TORCH_CUDA_CU_API void schedulePersistentKernel(
 
   // Project the persistent buffers to the inputs. Inputs will be cached in a
   // later step, this will move them to be in a register buffer as expected.
-  if (rparams.project_persistent_buffers) {
+  // TODO: Fix projected persistent buffers with view
+  // https://github.com/csarofeen/pytorch/issues/2054
+  if (rparams.project_persistent_buffers &&
+      ir_utils::getViewOps(fusion).empty()) {
     reduction_scheduler_utils::projectPersistentBuffers(fusion);
   }
 
@@ -995,6 +1002,17 @@ TORCH_CUDA_CU_API void schedulePersistentKernel(
   // Registry assumes the reference tv is the first reduction_tv, if this
   // changes registry needs to change.
   auto reduction_tv = reduction_tvs[0];
+
+  if (ir_utils::getViewOps(fusion).size() > 0) {
+    ComputeAtMap ca_map(fusion);
+    // Propagate view transforms through the graph, expecially the reference.
+    scheduler_utils::propagateViewTransforms(fusion, ca_map);
+
+    // Reorder reference_tv after propagating the view operation. This will
+    // reorder for better merging.
+    reduction_tv->reorder(
+        scheduler_utils::domainReorderAsRfactorMap(reduction_tv));
+  }
 
   auto dim_analysis = scheduler_utils::canonicalDimReduction(
       fusion, reduction_tv, rparams.fastest_dim && rparams.schedule_3D);
