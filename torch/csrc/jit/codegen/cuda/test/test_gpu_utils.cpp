@@ -1,4 +1,4 @@
-#if defined(USE_CUDA)
+// #if defined(USE_CUDA)
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -6,6 +6,7 @@
 #include <torch/csrc/jit/codegen/cuda/lower_utils.h>
 #include <torch/csrc/jit/codegen/cuda/ops/all_ops.h>
 #include <torch/csrc/jit/codegen/cuda/scheduler/utils.h>
+#include <torch/csrc/jit/codegen/cuda/scheduler/vectorize_helper.h>
 #include <torch/csrc/jit/codegen/cuda/test/test_gpu_validator.h>
 #include <torch/csrc/jit/codegen/cuda/test/test_utils.h>
 
@@ -268,6 +269,615 @@ TEST_F(NVFuserTest, FusionTVDomainGuard_CUDA) {
   TORCH_CHECK(tv->domain()->contiguity() == false_true);
 }
 
+// Test simple backward mapping through split
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper1_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3}, {2, 3});
+  fusion.addOutput(tv1);
+
+  {
+    // No mappings
+    auto mapper =
+        vectorize_helper::ContiguousInnerDimensionsMapper::map(tv1, {});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
+  }
+
+  {
+    // Inner mapping partial propogates
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv1, {tv1->axis(1)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(0)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv0->axis(0))->evaluateInt() == 3);
+  }
+
+  {
+    // Full mapping
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv1, {tv1->axis(0), tv1->axis(1)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[1]->sameAs(tv1->axis(1)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(0)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv0->axis(0))->evaluateInt() ==
+        2 * 3);
+  }
+}
+
+// Test backward mapping through multiple splits
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper2_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3 * 4}, {2 * 3, 4});
+  auto tv2 = view(tv1, {2 * 3, 4}, {2, 3, 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(1), tv2->axis(2)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv0->axis(0))->evaluateInt() == 3 * 4);
+
+  // Inner dim fully maps, outer dim of split partially maps
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[1]->sameAs(tv1->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 3);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[1]->sameAs(tv2->axis(2)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(2)));
+}
+
+// Test backward mapping through multiple splits
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper3_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3 * 4}, {2, 3 * 4});
+  auto tv2 = view(tv1, {2, 3 * 4}, {2, 3, 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(2)});
+
+  // Partial map forwarding
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv0->axis(0))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(1))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(2)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(2)));
+}
+
+// Test simple backward mapping through merge
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper4_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3}, {2 * 3});
+  fusion.addOutput(tv1);
+
+  {
+    // No mapping
+    auto mapper =
+        vectorize_helper::ContiguousInnerDimensionsMapper::map(tv1, {});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
+  }
+
+  {
+    // Full merge mapping
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv1, {tv1->axis(0)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 2);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[1]->sameAs(tv0->axis(1)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(0)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(0)));
+  }
+}
+
+// Test symbolic partial mapping through merge
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper5_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3, 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2, 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(1)});
+
+  // Symbolic mapping cannot map to the partial outer extent of the merge
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(1)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+}
+
+// Test concrete partial outer dim mapping through merge
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper6_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3, 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3, 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2, 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[1]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(0)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv0->axis(0))->evaluateInt() == 3);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+}
+
+// Test concrete exact inner dim mapping through merge
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper7_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3 * 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2, 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 3 * 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+}
+
+// Test concrete partial inner dim mapping through merge
+TEST_F(NVFuserTest, FusionVectorizeBackwardMapper8_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3 * 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2 * 3, 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv2, {tv2->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv0->axis(1))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+}
+
+// Similar to FusionVectorizeBackwardMapper1_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper1_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3}, {2 * 3});
+  fusion.addOutput(tv1);
+
+  {
+    // No mappings
+    auto mapper =
+        vectorize_helper::ContiguousInnerDimensionsMapper::map(tv0, {});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
+  }
+
+  {
+    // Inner mapping partial propogates
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv0, {tv0->axis(1)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 3);
+  }
+
+  {
+    // Full mapping
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv0, {tv0->axis(0), tv0->axis(1)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[1]->sameAs(tv0->axis(1)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(0)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() ==
+        2 * 3);
+  }
+}
+
+// Similar to FusionVectorizeBackwardMapper2_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper2_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3, 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3, 4}, {2 * 3, 4});
+  auto tv2 = view(tv1, {2 * 3, 4}, {2 * 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(1), tv0->axis(2)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv2->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv2->axis(0))->evaluateInt() == 3 * 4);
+
+  // Inner dim fully maps, outer dim partially maps
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[1]->sameAs(tv1->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 3);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[1]->sameAs(tv0->axis(2)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(2)));
+}
+
+// Similar to FusionVectorizeBackwardMapper3_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper3_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3, 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3, 4}, {2, 3 * 4});
+  auto tv2 = view(tv1, {2, 3 * 4}, {2 * 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(2)});
+
+  // Partial map forwarding
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv2->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv2->axis(0))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(1))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(2)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(2)));
+}
+
+// Similar to FusionVectorizeBackwardMapper4_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper4_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3}, {2, 3});
+  fusion.addOutput(tv1);
+
+  {
+    // No mapping
+    auto mapper =
+        vectorize_helper::ContiguousInnerDimensionsMapper::map(tv0, {});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).empty());
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).empty());
+  }
+
+  {
+    // Full mapping
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv0, {tv0->axis(0)});
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 2);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[1]->sameAs(tv1->axis(1)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(0)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv1->axis(1)));
+
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(0)));
+    TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(0)));
+  }
+}
+
+// Similar to FusionVectorizeBackwardMapper5_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper5_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3 * 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2 * 3, 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(1)});
+
+  // Symbolic mapping cannot map to the partial outer extent
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv2->axis(1)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+}
+
+// Similar to FusionVectorizeBackwardMapper6_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper6_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3 * 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {{2 * 3, 4}});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 2);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(0)));
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[1]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv2->axis(0)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv2->axis(0))->evaluateInt() == 3);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+}
+
+// Similar to FusionVectorizeBackwardMapper7_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper7_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2, 3 * 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2, 3 * 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2, 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv2->axis(1)));
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 3 * 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+}
+
+// Similar to FusionVectorizeBackwardMapper8_CUDA but in the reverse direction
+TEST_F(NVFuserTest, FusionVectorizeForwardMapper8_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigConcreteTensor({2 * 3, 4});
+  fusion.addInput(tv0);
+  auto tv1 = view(tv0, {2 * 3, 4}, {2 * 3 * 4});
+  auto tv2 = view(tv1, {2 * 3 * 4}, {2, 3 * 4});
+  fusion.addOutput(tv2);
+
+  auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+      tv0, {tv0->axis(1)});
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv2)[0]->sameAs(tv2->axis(1)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv2->axis(1)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv2->axis(1))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv1)[0]->sameAs(tv1->axis(0)));
+  TORCH_CHECK(mapper.hasPartialExtent(tv1->axis(0)));
+  TORCH_CHECK(
+      mapper.getMaybePartialMappedExtent(tv1->axis(0))->evaluateInt() == 4);
+
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+  TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+  TORCH_CHECK(!mapper.hasPartialExtent(tv0->axis(1)));
+}
+
+// Test propogation doesn't proceed across missing dimensions
+TEST_F(NVFuserTest, FusionVectorizeMapperAdvanced_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  // For broadcast we can't back propogate mapped axes to the left of bcast
+  // axis.
+  // For reduction we can't forward propogate mapped axes to the left of the
+  // reduce axis.
+
+  auto tv0 = makeContigConcreteTensor({3, 4 * 6});
+  fusion.addInput(tv0);
+
+  auto tv1 = view(tv0, {3, 4 * 6}, {3, 4, 6});
+  auto tv2 = broadcast(tv1, {false, false, true, false});
+
+  auto tv3 = makeContigConcreteTensor({3, 4, 5, 6});
+  fusion.addInput(tv3);
+  auto tv4 = add(tv3, tv2);
+
+  auto tv5 = view(tv4, {3, 4, 5, 6}, {3 * 4 * 5, 6});
+
+  // Broadcast path from tv0->tv5
+  fusion.addOutput(tv5);
+
+  // Sum path from tv3->tv6
+  auto tv6 = sum(tv3, {2});
+  auto tv7 = view(tv6, {3, 4, 6}, {3, 4 * 6});
+  fusion.addOutput(tv7);
+  {
+    // tv5[3*4*5, 6]
+    // tv0[3, 4*6]
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv5, {tv5->axis(0), tv5->axis(1)});
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv0)[0]->sameAs(tv0->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv0->axis(1)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv0->axis(1))->evaluateInt() == 6);
+  }
+
+  {
+    // tv3[3, 4, 5, 6]
+    // tv7[3, 4*6]
+    auto mapper = vectorize_helper::ContiguousInnerDimensionsMapper::map(
+        tv3, {tv3->axis(0), tv3->axis(1), tv3->axis(2), tv3->axis(3)});
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv7).size() == 1);
+    TORCH_CHECK(mapper.mappedRFactorIds().at(tv7)[0]->sameAs(tv7->axis(1)));
+    TORCH_CHECK(mapper.hasPartialExtent(tv7->axis(1)));
+    TORCH_CHECK(
+        mapper.getMaybePartialMappedExtent(tv7->axis(1))->evaluateInt() == 6);
+  }
+}
+
 } // namespace jit
 } // namespace torch
-#endif // #if defined(USE_CUDA)
+// #endif // #if defined(USE_CUDA)

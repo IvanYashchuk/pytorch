@@ -343,14 +343,15 @@ std::shared_ptr<PointwiseParams> getPointwiseHeuristics(
   // Try expanding vectorization to contig merged domains
   // TODO: This is an expensive function that shouldn't be in heuristics without
   // caching.
-  auto expanded_vector_word_size =
-      vectorize_helper::expandVectorizationToContigMergedDomains(
-          fusion,
-          runtime_info,
-          vectorizable_inputs_outputs,
-          largest_out,
-          break_point,
-          vectorize_factor);
+  auto maps = vectorize_helper::getAllVectorizedMapsOf(largest_out);
+
+  auto expanded_vector_word_size = vectorize_helper::getExpandedVectorization(
+      maps,
+      runtime_info,
+      vectorizable_inputs_outputs,
+      largest_out,
+      break_point,
+      vectorize_factor);
 
   expanded_vector_word_size = std::min(
       static_cast<size_t>(max_unroll_factor), expanded_vector_word_size);
@@ -485,36 +486,10 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams& params) {
   int rhs_i = -1;
   int lhs_i = -1;
 
-  auto view_ops = ir_utils::getViewOps(fusion);
-
-  /*
-   * If there's no path from reference through producer paths only to a view,
-   * e.g.: input
-   *      /  \
-   *   view reference
-   *    /
-   * output
-   *
-   * we need to propagate the view transformations to the reference tv before
-   * scheduling the reference tv. Since view ops have to be identical, if any
-   * path from reference tv through producers goes through a view, all paths
-   * from reference tv's to views should be through producers.
-   */
-  bool needs_view_prop =
-      view_ops.size() > 0 &&
-      !std::any_of(
-          view_ops.begin(), view_ops.end(), [&reference_tv](ViewOp* view) {
-            return DependencyCheck::isDependencyOf(view->out(), reference_tv) ||
-                view->out()->sameAs(reference_tv);
-          });
-
-  if (needs_view_prop) {
-    auto first_view_op = *view_ops.begin();
-
-    // Propagate the view transformations
-    TransformPropagator propagator(first_view_op->out());
-    MaxRootDomainInfoSpanningTree spanning_tree(first_view_op->out());
-    spanning_tree.traverse(&propagator);
+  if (ir_utils::getViewOps(fusion).size() > 0) {
+    ComputeAtMap ca_map(fusion);
+    // Propagate view transforms through the graph, expecially the reference.
+    scheduler_utils::propagateViewTransforms(fusion, ca_map);
 
     // Reorder reference_tv after propagating the view operation. This will
     // reorder for better merging.

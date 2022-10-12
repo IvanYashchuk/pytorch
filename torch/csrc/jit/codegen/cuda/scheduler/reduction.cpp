@@ -954,8 +954,12 @@ TORCH_CUDA_CU_API std::shared_ptr<ReductionParams> getReductionHeuristics(
   }
 
   // Try expanding vectorization to contig merged domains
-  vectorize_factor = vectorize_helper::expandVectorizationToContigMergedDomains(
-      fusion,
+  // TODO: This is an expensive function that shouldn't be in heuristics without
+  // caching.
+  auto maps = vectorize_helper::getAllVectorizedMapsOf(reduction_tv);
+
+  vectorize_factor = vectorize_helper::getExpandedVectorization(
+      maps,
       runtime_info,
       vectorizable_inputs_outputs,
       reduction_tv,
@@ -1013,6 +1017,17 @@ void scheduleReduction(Fusion* fusion, const ReductionParams& rparams) {
   // Registry assumes the reference tv is the first reduction_tv, if this
   // changes registry needs to change.
   auto reduction_tv = reduction_tvs[0];
+
+  if (ir_utils::getViewOps(fusion).size() > 0) {
+    ComputeAtMap ca_map(fusion);
+    // Propagate view transforms through the graph, expecially the reference.
+    scheduler_utils::propagateViewTransforms(fusion, ca_map);
+
+    // Reorder reference_tv after propagating the view operation. This will
+    // reorder for better merging.
+    reduction_tv->reorder(
+        scheduler_utils::domainReorderAsRfactorMap(reduction_tv));
+  }
 
   auto dim_analysis = scheduler_utils::canonicalDimReduction(
       fusion, reduction_tv, rparams.fastest_dim && rparams.schedule_3D);
