@@ -238,7 +238,9 @@ std::shared_ptr<PointwiseParams> getPointwiseHeuristics(
     if (n_elems * 2 > device_multiprocessor_count * kThreadX) {
       int64_t min_total_transfer = std::numeric_limits<int64_t>::max();
 
-      for (const auto break_point_i : c10::irange(ref_root.size())) {
+      // Don't check the inner most dimension, scheduler assumes there's always
+      // an rhs
+      for (const auto break_point_i : c10::irange(ref_root.size() - 1)) {
         // If break point is incoherent with view, don't consider breaking here.
         if (!scheduler_utils::breakIsDisjoint(
                 view_disjoint_sets, break_point_i)) {
