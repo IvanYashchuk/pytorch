@@ -674,8 +674,8 @@ ComputeAtMap::ComputeAtMap(Fusion* fusion)
 
 void ComputeAtMap::build(Fusion* fusion) {
   trivial_reduction_info_.build(fusion);
-  buildConcreteIds();
   buildUniqueExactExprMaps();
+  buildConcreteIds();
 }
 
 void ComputeAtMap::validateAndPropagatePType() {
@@ -806,101 +806,6 @@ bool ComputeAtMap::areMapped(
   return disjointSetOf(id0, mode)->has(id1);
 }
 
-namespace {
-
-// Validate a LOOP concrete ID has the complete ID set required for
-// indexing. See issue #1655 and FusionIncompleteConcreteID for an
-// example fusion that fails with this validation. Fixing this issue
-// would require creating a reference IterDomain with all the
-// necessary root ID for for loop extent generation, for indexing, and for
-// predication.
-//
-// root_ids_of_all_ids and root_ids_of_concrete_id consist of EXACT
-// concrete IDs.
-void validateCompletenessOfLoopConcreteID(
-    IterDomain* concrete_id,
-    const ComputeAtMap& ca_map,
-    const TrivialReductionInfo& trivial_reduction_info,
-    // All root id's of all IDs in the disjoint id set
-    const std::unordered_set<IterDomain*>& root_ids_of_all_ids,
-    // Map from a root id to the concrete id's it's represented in
-    const std::unordered_set<IterDomain*>& root_ids_of_concrete_id,
-    const std::unordered_map<IterDomain*, std::vector<IterDomain*>>&
-        root_id_to_maybe_concrete_ids,
-    // Disjoint set just for printing
-    const std::vector<IterDomain*>& id_set,
-    // All the candidate concrete IDs found for this disjoint id set
-    const std::vector<IterDomain*>& maybe_concrete_ids) {
-  std::vector<IterDomain*> root_ids_not_found_with_concrete_id;
-
-  for (auto root_id : root_ids_of_all_ids) {
-    if (root_ids_of_concrete_id.find(root_id) !=
-        root_ids_of_concrete_id.end()) {
-      continue;
-    }
-
-    // None of the root IDs of the conrete ID is exactly mapped with
-    // root_id.
-
-    // It is still a valid concrete ID if it has a non-broadcast
-    // root ID that is mapped with root_id.
-    if ((root_id->isBroadcast() || trivial_reduction_info.isDerived(root_id)) &&
-        std::any_of(
-            root_ids_of_concrete_id.begin(),
-            root_ids_of_concrete_id.end(),
-            [&](auto root_id_of_concrete_id) {
-              return !root_id_of_concrete_id->isBroadcast() &&
-                  !trivial_reduction_info.isDerived(root_id_of_concrete_id) &&
-                  ca_map.areMapped(
-                      root_id,
-                      root_id_of_concrete_id,
-                      IdMappingMode::PERMISSIVE);
-            })) {
-      continue;
-    }
-
-    // If all of the corresponding maybe-concrete IDs are exactly
-    // mapped with the concrete ID, this missing root_id is not a
-    // problem. This can happen with reduction rfactor, e.g.,
-    // FusionAdvancedLowering1.
-    if (std::all_of(
-            root_id_to_maybe_concrete_ids.at(root_id).begin(),
-            root_id_to_maybe_concrete_ids.at(root_id).end(),
-            [&](auto maybe_concrete_id) {
-              return ca_map.areMapped(
-                  concrete_id, maybe_concrete_id, IdMappingMode::EXACT);
-            })) {
-      continue;
-    }
-
-    root_ids_not_found_with_concrete_id.push_back(root_id);
-  }
-
-  if (root_ids_not_found_with_concrete_id.empty()) {
-    return;
-  }
-
-  // Error detected as some root IDs are not accounted for by the
-  // concrete ID.
-  std::stringstream error_msg;
-  error_msg << "IDs: " << ir_utils::toString(id_set);
-  error_msg << ", concrete ID: " << concrete_id->toString();
-  error_msg << ", maybe concrete IDs: "
-            << ir_utils::toString(maybe_concrete_ids);
-  error_msg << ", all root IDs:";
-  for (auto root_id : root_ids_of_all_ids) {
-    error_msg << " " << root_id->toString();
-  }
-  error_msg << ", root IDs not found with concrete ID: ";
-  for (auto id : root_ids_not_found_with_concrete_id) {
-    error_msg << " " << id->toString();
-  }
-  TORCH_INTERNAL_ASSERT(
-      false, "Concrete ID failed to cover all root IDs. ", error_msg.str());
-}
-
-} // namespace
-
 IterDomain* ComputeAtMap::computeConcreteId(
     IterDomain* id,
     IdMappingMode mode) {
@@ -952,109 +857,35 @@ IterDomain* ComputeAtMap::computeConcreteId(
   int max_iter_root_count = 0;
   int max_bcast_root_count = 0;
 
-  // For the LOOP map, the concrete ID must account for all root IDs
-  // of all of the IDs in each disjoit set. At least those ID's that are
-  // non-broadcast/non-reduction. As broadcast is only important here if it's
-  // concretized in the set. Track information so we can later make sure the
-  // concrete id has accounted for all iter domains meaning it has a correct
-  // loop size.
-  std::unordered_set<IterDomain*> root_ids_of_all_ids;
-  std::unordered_set<IterDomain*> root_ids_of_concrete_id;
-  std::unordered_map<IterDomain*, std::vector<IterDomain*>>
-      root_id_to_maybe_concrete_ids;
+  VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+      input_ids;
 
-  // Populate the above information, look for the concrete id, validate the loop
-  // concrete ID.
   for (auto maybe_concrete_id : maybe_concrete_ids.vector()) {
-    std::unordered_set<IterDomain*> root_ids;
-    std::deque<IterDomain*> to_visit;
-
-    to_visit.push_back(maybe_concrete_id);
-    while (to_visit.size()) {
-      auto current_id = to_visit.front();
-      to_visit.pop_front();
-      if (isViewRfactor(current_id)) {
-        root_ids.emplace(current_id);
-        continue;
-      }
-
-      // push back producer IterDomains or add root if they don't exist
-      auto producer_vals = ir_utils::producerValsOf(current_id);
-      auto producer_ids = ir_utils::filterByType<IterDomain>(producer_vals);
-
-      if (producer_ids.empty()) {
-        root_ids.emplace(current_id);
-      } else {
-        to_visit.insert(
-            to_visit.end(), producer_ids.begin(), producer_ids.end());
-      }
-    }
-
-    if (mode == IdMappingMode::LOOP) {
-      std::transform(
-          root_ids.begin(),
-          root_ids.end(),
-          std::inserter(root_ids_of_all_ids, root_ids_of_all_ids.end()),
-          [&](const auto root_id) {
-            auto exact_concrete_id =
-                getConcreteMappedID(root_id, IdMappingMode::EXACT);
-            root_id_to_maybe_concrete_ids[exact_concrete_id].push_back(
-                maybe_concrete_id);
-            return exact_concrete_id;
-          });
-    }
+    auto concrete_id_root_sets = getInputDisjointSetsOf(maybe_concrete_id);
 
     int bcast_root_count = std::count_if(
-        root_ids.begin(), root_ids.end(), [&](IterDomain* root_id) {
-          return root_id->isBroadcast()
+        concrete_id_root_sets.vector().begin(),
+        concrete_id_root_sets.vector().end(),
+        [&](std::shared_ptr<VectorOfUniqueEntries<IterDomain*>> set) {
+          return set->vector()[0]->isBroadcast()
               // TODO: This shouldn't have a negative impact, but (emperically)
               // might not be necessary
-              || trivial_reduction_info_.isDerived(root_id);
+              || trivial_reduction_info_.isDerived(set->vector()[0]);
         });
-    int iter_root_count = (int)root_ids.size() - bcast_root_count;
+
+    int iter_root_count =
+        (int)concrete_id_root_sets.vector().size() - bcast_root_count;
     if (iter_root_count > max_iter_root_count ||
         (iter_root_count == max_iter_root_count &&
          bcast_root_count > max_bcast_root_count)) {
       max_iter_root_count = iter_root_count;
       max_bcast_root_count = bcast_root_count;
       concrete_id = maybe_concrete_id;
-
-      // If we update the concrete_id, then update the root_ids_of_concrete_id
-      // to reflect this id
-      if (mode == IdMappingMode::LOOP) {
-        root_ids_of_concrete_id.clear();
-        std::transform(
-            root_ids.begin(),
-            root_ids.end(),
-            std::inserter(
-                root_ids_of_concrete_id, root_ids_of_concrete_id.end()),
-            [&](const auto root_id) {
-              return getConcreteMappedID(root_id, IdMappingMode::EXACT);
-            });
-      }
     }
-  } // end maybe_concrete_id
-
-  TORCH_INTERNAL_ASSERT(
-      concrete_id != nullptr,
-      "Something went wrong, could not find a concrete id.");
-
-  if (mode == IdMappingMode::LOOP) {
-    // Validate the concrete id has influence from all the roots of all the
-    // consumers that will map to this concete id in the loop map. This means
-    // all the consumers in all expressions of the loop nest generated based on
-    // this concrete ID will have their roots mapping to this concrete ID
-    // represented in the extent of this concrete id.
-    validateCompletenessOfLoopConcreteID(
-        concrete_id,
-        *this,
-        trivial_reduction_info_,
-        root_ids_of_all_ids,
-        root_ids_of_concrete_id,
-        root_id_to_maybe_concrete_ids,
-        disjoint_set_shared_ptr->vector(),
-        maybe_concrete_ids.vector());
   }
+
+  // TODO: Validate that all input disjoint sets that are not broadcast that any
+  // "maybe_concrete_id" entry had is covered by the selected concrete_id.
 
   return concrete_id;
 }
@@ -1143,12 +974,7 @@ void ComputeAtMap::buildUniqueExactExprMaps() {
 
     // N^2 in number of unique transformations, this might be better to do
     // when generating the map.
-    IterDomain* concrete_id = nullptr;
     for (auto id : disjoint_set_shared_ptr->vector()) {
-      if (concrete_id == nullptr) {
-        concrete_id = getConcreteMappedID(id, IdMappingMode::EXACT);
-      }
-
       if (id->definition() != nullptr) {
         bool match = false;
         for (auto recorded_def : definitions) {
@@ -1331,6 +1157,58 @@ const DisjointSets<IterDomain*>& ComputeAtMap::getIdSets(
 bool ComputeAtMap::idExistsInMap(IterDomain* id) const {
   return getIdSets(IdMappingMode::EXACT).disjointSetMap().find(id) !=
       getIdSets(IdMappingMode::EXACT).disjointSetMap().end();
+}
+
+VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+ComputeAtMap::getInputDisjointSetsOf(IterDomain* of_id) {
+  VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+      input_disjoint_sets;
+
+  VectorOfUniqueEntries<IterDomain*> inputs;
+  // This deque could be VectorOfUniqueEntries
+  std::deque<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>> to_visit(
+      {disjointSetOf(of_id, IdMappingMode::EXACT)});
+  std::unordered_set<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+      visited;
+  while (!to_visit.empty()) {
+    auto currently_visiting = to_visit.front();
+    to_visit.pop_front();
+    if (!visited.emplace(currently_visiting).second) {
+      continue;
+    }
+    auto defs_it = unique_exact_definitions_.find(currently_visiting);
+    TORCH_INTERNAL_ASSERT(
+        defs_it != unique_exact_definitions_.end(),
+        "unique_exact_definitions_ wasn't correctly generated, missing the disjoint set:\n",
+        currently_visiting->toString());
+
+    // If there's no definition, we've found an input.
+    if (defs_it->second.empty()) {
+      input_disjoint_sets.pushBack(currently_visiting);
+    }
+
+    // Traverse producers of current disjoint set and collect unique exact
+    // disjoint set producers
+    VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+        producers_of_currently_visiting;
+
+    for (auto def : defs_it->second) {
+      auto id_inps = ir_utils::filterByType<IterDomain>(def->inputs());
+      for (auto id_inp : id_inps) {
+        producers_of_currently_visiting.pushBack(
+            disjointSetOf(id_inp, IdMappingMode::EXACT));
+      }
+    }
+
+    // Add producers to visit if not already there
+    for (auto producer : producers_of_currently_visiting.vector()) {
+      if (visited.find(producer) == visited.end()) {
+        to_visit.push_back(producer);
+      }
+    }
+  }
+
+  return input_disjoint_sets;
 }
 
 } // namespace cuda

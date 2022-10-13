@@ -1885,7 +1885,7 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule9_CUDA) {
   auto tv9 = set(tv6);
 
   auto s10 = IrBuilder::create<Double>(1e-12);
-  auto tv11 = add(tv8, s10);
+  auto tv11 = add(abs(tv8), s10);
 
   auto tv12 = sub(tv4, tv9);
   auto tv13 = rsqrt(tv11);
@@ -1912,7 +1912,7 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule9_CUDA) {
   auto t8 = t3.unsqueeze(-1);
   auto t9 = t6;
 
-  auto t11 = t8.add(1.e-12);
+  auto t11 = t8.abs().add(1.e-12);
   auto t12 = t4.sub(t9);
   auto t13 = t11.rsqrt();
   auto t14 = t13;

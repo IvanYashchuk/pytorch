@@ -247,6 +247,13 @@ class TORCH_CUDA_CU_API ComputeAtMap {
       IdMappingMode mode) const;
 
  private:
+  // Traverses through definitions of exact maps (unique_exact_definitions_) to
+  // input ID's from provided ID. Returns all the exact map concrete IDs of the
+  // exact sets that are inputs required to construct the exact concrete id of
+  // of_id.
+  VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+  getInputDisjointSetsOf(IterDomain* of_id);
+
   // Build id_graph_
   void build(Fusion* fusion);
 
