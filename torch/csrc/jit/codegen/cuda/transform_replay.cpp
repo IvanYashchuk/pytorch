@@ -478,6 +478,16 @@ std::pair<TensorDomain*, unsigned int> TransformReplay::replayCasP(
   ReplayTransformations replay_CasP(
       producer_CA_ids, forwarded_replay_map, false);
 
+  std::cout << "producer_CA_ids:" << std::endl;
+  for (auto pair : forwarded_replay_map) {
+    std::cout << pair.first << " -> " << pair.second << std::endl;
+  }
+
+  std::cout << "replay_CasP.getReplay():" << std::endl;
+  for (auto pair : replay_CasP.getReplay()) {
+    std::cout << pair.first << " -> " << pair.second << std::endl;
+  }
+
   auto leaf_ids(replay_CasP.getUnorderedLeafIDs());
 
   // Remove all ids that map to the compute at axis, we're going to replay the
@@ -485,11 +495,17 @@ std::pair<TensorDomain*, unsigned int> TransformReplay::replayCasP(
   std::vector<IterDomain*> needed_dims;
   for (auto p_id : producer_CA_ids) {
     auto it = replay_CasP.getReplay().find(p_id);
+    if (it == replay_CasP.getReplay().end()) {
+      producer->fusion()->print();
+    }
     TORCH_INTERNAL_ASSERT(
         it != replay_CasP.getReplay().end(),
         "Could not find axis, ",
         p_id,
-        ", requested in replay.");
+        ", requested in replaying consumer ",
+        consumer,
+        " as producer ",
+        producer);
     TORCH_INTERNAL_ASSERT(
         leaf_ids.find(it->second) != leaf_ids.end(),
         "Replayed id to match producer id ",
