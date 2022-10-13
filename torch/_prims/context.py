@@ -251,13 +251,13 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
         aten_ops_to_skip = (
             "aten.transpose.int",
             "aten.t.default",
-            "aten.view.default",
             "aten.unsqueeze.default",
             "aten.permute.default",
             "aten._log_softmax.default",
             "aten._log_softmax_backward_data.default",
             "aten.expand.default",
         )
+        self.skip_ops = tuple(skip_ops) + aten_ops_to_skip
         super().__init__(
             strict=False,
             should_fallback_fn=functools.partial(
@@ -339,7 +339,7 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
         )
 
     def _is_view_or_reshape(self, func):
-        allowed_ops = [
+        allowed_ops = {
             "torch.Tensor.view",
             "torch.Tensor.reshape",
             "torch.view_copy",
@@ -347,7 +347,7 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
             "aten.view.default",
             "aten._unsafe_view.default",
             "aten.view_copy.default",
-        ]
+        } - set(self.skip_ops)
         return torch.overrides.resolve_name(func) in allowed_ops
 
     def _is_native_batch_norm(self, func):
@@ -392,7 +392,13 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
                 return self._cudnn_batch_norm_backward(*args, **kwargs)
 
         if self._is_view_or_reshape(orig_func):
-            return torch.ops.nvprims.view(*args, **kwargs)
+            a, *shape = args
+            shape = torch._prims_common.extract_shape_from_varargs(
+                shape, validate=False
+            )  # type: ignore[assignment]
+            if len(kwargs) > 0:
+                warn("view has ignored kwargs!")
+            return torch.ops.nvprims.view(a, shape)
 
         if self._is_native_batch_norm(orig_func):
             return torch.ops.nvprims.native_batch_norm(*args, **kwargs)
