@@ -57,7 +57,6 @@ class CapabilityBasedPartitioner:
         assignment: Dict[Node, int] = {}   # maping from node to partition_id
         partitions_by_id: Dict[int, Partition] = {}  # mapping from partition_id to partition
         new_partition_id = itertools.count()
-        print("=== partitioning graph:", self.graph_module.graph)
 
         # try to merge partition other_id into partition self_id
         # merge only happens if the end graph doesn't contain cyclic dependency
