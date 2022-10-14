@@ -5149,11 +5149,11 @@ TEST_F(NVFuserTest, FusionInsertMagicZero1_CUDA) {
       tv2->toString());
 }
 
-TEST_F(NVFuserTest, FusionRepro1860_CUDA) {
+TEST_F(NVFuserTest, FusionExpandRepro1860_CUDA) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr;
   FusionGuard fg(&fusion);
-  std::vector<bool> contiguity{true, false, false};
+  std::vector<bool> contiguity{false, false, false};
 
   std::vector<int64_t> shape{1, -1, -1};
   TensorView* tv0 = makeContigConcreteTensor(shape);
@@ -6486,6 +6486,252 @@ TEST_F(NVFuserTest, FusionVectorizeStrideContiguitySelfOverlapping_CUDA) {
     TORCH_CHECK(getVecSizeForPointwise(fec) == vec);
     testValidate(fusion, cg_outputs, {t0}, {t0}, __LINE__, __FILE__);
   }
+}
+
+TEST_F(NVFuserTest, FusionSimpleAmperePipeline_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  // requires ampere+ GPU
+  if (!deviceMajorMinorCheck(8)) {
+    GTEST_SKIP() << "skipping tests on pre-AMPERE GPUs";
+    return;
+  }
+
+  auto tv0 = makeContigTensor(1);
+
+  fusion.addInput(tv0);
+
+  auto tv1 = set(tv0);
+
+  fusion.addOutput(tv1);
+
+  auto tv_cache = tv0->cacheAfter(LoadStoreOpType::CpAsync);
+  tv_cache->setMemoryType(MemoryType::Shared);
+
+  tv1->split(0, 16);
+  tv0->computeAt(tv1, 1);
+
+  tv_cache->circularBuffer(10);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input1 = at::randn({255}, options);
+
+  // Add check that the cp async op has an inlined predicate.
+  class InlinedCpAsyncPredChecker : public kir::IrVisitor {
+   public:
+    using kir::IrVisitor::handle;
+
+   private:
+    void handle(kir::IfThenElse* ite) final {
+      auto prev_within_ite = within_ite_;
+      within_ite_ = true;
+      kir::IrVisitor::handle(ite);
+      within_ite_ = prev_within_ite;
+    }
+
+    void handle(LoadStoreOp* ldst) final {
+      if (ldst->opType() == LoadStoreOpType::CpAsync) {
+        TORCH_INTERNAL_ASSERT(!within_ite_, "CPASYNC predicate not inlined");
+        TORCH_INTERNAL_ASSERT(
+            ldst->predicate()->hasValue() &&
+                !ldst->predicate()->value()->isConst(),
+            "CPASYNC predicate is not generated");
+      }
+    }
+
+   private:
+    bool within_ite_ = false;
+  } pred_checker;
+
+  // Check that cp async is inlined:
+  GpuLower gpulw(&fusion);
+  pred_checker.handle(gpulw.kernel()->topLevelExprs());
+
+  FusionExecutor fe;
+  fe.compileFusion(&fusion, {input1});
+  auto cg_outputs = fe.runFusion({input1});
+
+  testValidate(&fusion, cg_outputs, {input1}, {input1}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionExpandedInput_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = TensorViewBuilder()
+                        .ndims(3)
+                        .shape({-1, -1, -1})
+                        .contiguity({false, false, true})
+                        .expanded({false, true, false})
+                        .build();
+  fusion->addInput(tv0);
+  auto tv1 = set(tv0);
+  fusion->addOutput(tv1);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t0 = at::randn({4096, 1, 4}, options).expand({-1, 7, -1});
+
+  FusionExecutorCache fec(std::move(fusion_ptr));
+  auto cg_outputs = fec.runFusionWithInputs({t0});
+
+  testValidate(fusion, cg_outputs, {t0}, {t0}, __LINE__, __FILE__);
+}
+
+TEST_F(NVFuserTest, FusionExpandedInputThrow_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv0 = TensorViewBuilder()
+                        .ndims(3)
+                        .shape({3, 7, 3})
+                        .contiguity({false, false, true})
+                        .expanded({false, true, false})
+                        .build();
+  fusion->addInput(tv0);
+  auto tv1 = set(tv0);
+  tv1->domain()->setContiguity({true, true, true});
+  fusion->addOutput(tv1);
+
+  EXPECT_THAT(
+      [&]() { GpuLower lower(fusion); },
+      ::testing::ThrowsMessage<c10::Error>(::testing::HasSubstr(
+          "The expanded dim and the dim before it can not be contiguous.")));
+}
+
+// Repro for
+// https://github.com/csarofeen/pytorch/issues/1843#issuecomment-1270759724
+TEST_F(NVFuserTest, FusionVectorizeRepro1843_CUDA) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  auto fusion = fusion_ptr.get();
+  FusionGuard fg(fusion);
+
+  TensorView* tv1 =
+      TensorViewBuilder().ndims(2).contiguity({true, true}).build();
+  TensorView* tv0 =
+      TensorViewBuilder().ndims(2).contiguity({true, true}).build();
+  fusion->addInput(tv1);
+  fusion->addInput(tv0);
+
+  auto tv7 = sum(tv0, {1}, true);
+  auto tv_exp =
+      expand(tv7, {tv0->axis(0)->extent(), IrBuilder::create<Int>(32128)});
+  auto tv3 = exp(tv1);
+  auto tv8 = mul(tv3, tv_exp);
+  auto tv13 = sub(tv0, tv8);
+  fusion->addOutput(tv13);
+
+  auto options = at::TensorOptions().dtype(kFloat).device(at::kCUDA, 0);
+  at::Tensor t1 =
+      at::empty_strided({4096, 32128}, {32128, 1}, options).random_();
+  at::Tensor t0 =
+      at::empty_strided({4096, 32128}, {32128, 1}, options).random_();
+
+  FusionExecutorCache fec(std::move(fusion_ptr));
+  auto cg_outputs = fec.runFusionWithInputs({t1, t0});
+
+  auto ref = t0 - t1.exp() * t0.sum((1), true);
+  testValidate(fusion, cg_outputs, {t1, t0}, {ref}, __LINE__, __FILE__);
+}
+
+// https://github.com/csarofeen/pytorch/issues/2068
+TEST_F(NVFuserTest, FusionIssue2068_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int w = 32, x = 56, y = 56, z = 128;
+
+  auto tv0 = makeContigTensor(3);
+  auto tv1 = makeContigTensor(1);
+  auto tv2 = makeContigTensor(3);
+  auto tv3 = makeContigTensor(1);
+  auto tv4 = makeContigTensor(4);
+
+  fusion.addInput(tv0);
+  fusion.addInput(tv1);
+  fusion.addInput(tv2);
+  fusion.addInput(tv3);
+  fusion.addInput(tv4);
+
+  auto tv5 = broadcast(tv0, {false, false, false, true});
+  auto tv6 = broadcast(tv1, {true, true, true, false});
+  auto tv7 = expand(
+      tv6,
+      {IrBuilder::create<Int>(w),
+       IrBuilder::create<Int>(x),
+       IrBuilder::create<Int>(y),
+       tv6->axis(3)->extent()});
+  auto tv8 = broadcast(tv2, {false, false, false, true});
+  auto tv9 = broadcast(tv3, {true, true, true, false});
+  auto tv10 = expand(
+      tv9,
+      {IrBuilder::create<Int>(w),
+       IrBuilder::create<Int>(x),
+       IrBuilder::create<Int>(y),
+       tv9->axis(3)->extent()});
+  auto tv11 = set(tv5);
+  auto tv12 = expand(
+      tv11,
+      {tv11->axis(0)->extent(),
+       tv11->axis(1)->extent(),
+       tv11->axis(2)->extent(),
+       IrBuilder::create<Int>(z)});
+
+  auto tv13 = add(tv8, IrBuilder::create<Double>(1.e-6));
+  auto tv14 = sub(tv4, tv12);
+  auto tv15 = rsqrt(abs(tv13));
+  auto tv16 = set(tv15);
+  auto tv17 = expand(
+      tv16,
+      {tv16->axis(0)->extent(),
+       tv16->axis(1)->extent(),
+       tv16->axis(2)->extent(),
+       IrBuilder::create<Int>(z)});
+  auto tv18 = mul(tv14, tv17);
+  auto tv19 = mul(tv18, tv7);
+  auto tv20 = add(tv19, tv10);
+  auto tv21 = set(tv20);
+
+  fusion.addOutput(tv5);
+  fusion.addOutput(tv15);
+  fusion.addOutput(tv21);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto t0 = at::randn({w, x, y}, options);
+  auto t1 = at::randn({z}, options);
+  auto t2 = at::randn({w, x, y}, options);
+  auto t3 = at::randn({z}, options);
+  auto t4 = at::randn({w, x, y, z}, options);
+
+  auto t5 = t0.unsqueeze(-1);
+  auto t12 = t5.expand({-1, -1, -1, z});
+  auto t7 = t1.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand({w, x, y, -1});
+  auto t8 = t2.unsqueeze(-1);
+  auto t10 = t3.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand({w, x, y, -1});
+  auto t9 = t4;
+
+  auto t13 = t8 + 1.e-6;
+  auto t14 = t4 - t12;
+  auto t15 = t13.abs().rsqrt();
+  auto t17 = t15.expand({-1, -1, -1, z});
+  auto t18 = mul(t14, t17);
+  auto t19 = mul(t18, t7);
+  auto t21 = add(t19, t10);
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2, t3, t4});
+
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      {t0, t1, t2, t3, t4},
+      {t5, t15, t21},
+      __LINE__,
+      __FILE__,
+      "");
 }
 
 // Test file size should be up to 10K LoC. Create a new file for more tests.
