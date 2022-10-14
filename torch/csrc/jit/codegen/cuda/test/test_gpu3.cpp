@@ -6613,7 +6613,7 @@ TEST_F(NVFuserTest, FusionHuggingFaceRepro2064_CUDA) {
   auto t0 = at::randn({2, 8}, options);
   auto t1 = t0.expand({1, 2, 8});
   auto t2 = t1 * 0.5;
-  auto t5 = (t2 * 0.707107).erf() + 1.0;
+  auto t5 = (t1 * 0.707107).erf() + 1.0;
   auto t6 = t2 * t5;
   auto t7 = t6.sum(0);
 
