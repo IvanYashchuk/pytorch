@@ -1859,6 +1859,203 @@ TEST_F(NVFuserTest, FusionViewMagicSchedule8_CUDA) {
   testValidate(&fusion, cg_outputs, {t0, t3}, {t9}, __LINE__, __FILE__);
 }
 
+// AlbertForMaskedLM repro
+TEST_F(NVFuserTest, FusionViewMagicSchedule9_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int x = 2, y = 512, z = 128;
+
+  auto tv0 = makeContigTensor(1);
+  auto tv1 = makeContigTensor(2);
+  auto tv2 = makeContigTensor(1);
+  auto tv3 = makeContigTensor(2);
+  auto tv4 = makeContigTensor(3);
+  fusion.addInput(tv0);
+  fusion.addInput(tv1);
+  fusion.addInput(tv2);
+  fusion.addInput(tv3);
+  fusion.addInput(tv4);
+
+  auto tv5 = broadcast(tv0, {true, true, false});
+  auto tv6 = broadcast(tv1, {false, false, true});
+  auto tv7 = broadcast(tv2, {true, true, false});
+  auto tv8 = broadcast(tv3, {false, false, true});
+  auto tv9 = set(tv6);
+
+  auto s10 = IrBuilder::create<Double>(1e-12);
+  auto tv11 = add(abs(tv8), s10);
+
+  auto tv12 = sub(tv4, tv9);
+  auto tv13 = rsqrt(tv11);
+  auto tv14 = broadcast(tv13, {false, false, false});
+  auto tv15 = mul(tv12, tv14);
+  auto tv16 = mul(tv15, tv5);
+  auto tv17 = add(tv16, tv7);
+  auto tv18 = castOp(DataType::Float, tv17);
+  auto tv19 = view(tv18, {x, y, z}, {x * y, z});
+  fusion.addOutput(tv6);
+  fusion.addOutput(tv13);
+  fusion.addOutput(tv19);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto t0 = at::randn({128}, options);
+  auto t1 = at::randn({2, 512}, options);
+  auto t2 = at::randn({128}, options);
+  auto t3 = at::randn({2, 512}, options);
+  auto t4 = at::randn({2, 512, 128}, options);
+
+  auto t5 = t0.unsqueeze(0).unsqueeze(0);
+  auto t6 = t1.unsqueeze(-1);
+  auto t7 = t2.unsqueeze(0).unsqueeze(0);
+  auto t8 = t3.unsqueeze(-1);
+  auto t9 = t6;
+
+  auto t11 = t8.abs().add(1.e-12);
+  auto t12 = t4.sub(t9);
+  auto t13 = t11.rsqrt();
+  auto t14 = t13;
+  auto t15 = t12.mul(t14);
+  auto t16 = t15.mul(t5);
+  auto t17 = t16.add(t7);
+  auto t18 = t17.to(at::kFloat);
+  auto t19 = at::native::view(t18, {x * y, z});
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2, t3, t4});
+
+  testValidate(
+      &fusion,
+      cg_outputs,
+      {t0, t1, t2, t3, t4},
+      {t6, t13, t19},
+      __LINE__,
+      __FILE__);
+}
+
+// Simpler version of FusionViewMagicSchedule9_CUDA
+TEST_F(NVFuserTest, FusionViewMagicSchedule10_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int x = 2, y = 512, z = 128;
+
+  auto tv0 = makeContigTensor(1);
+  auto tv1 = makeContigTensor(2);
+  auto tv2 = makeContigTensor(3);
+  fusion.addInput(tv0);
+  fusion.addInput(tv1);
+  fusion.addInput(tv2);
+
+  auto tv3 = broadcast(tv0, {true, true, false});
+  auto tv4 = broadcast(tv1, {false, false, true});
+
+  auto tv5 = add(tv2, tv4);
+  auto tv6 = add(tv5, tv3);
+  auto tv7 = view(tv6, {x, y, z}, {x * y, z});
+  fusion.addOutput(tv4);
+  fusion.addOutput(tv7);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto t0 = at::randn({128}, options);
+  auto t1 = at::randn({2, 512}, options);
+  auto t2 = at::randn({2, 512, 128}, options);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2});
+}
+
+// CamemBert repro
+TEST_F(NVFuserTest, FusionViewMagicSchedule11_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  int x = 512, y = 12, z = 64;
+
+  auto tv0 = makeContigConcreteTensor({1, -1, -1, -1});
+  fusion.addInput(tv0);
+  auto tv1 = set(tv0);
+  auto tv2 = view(tv1, {1, x, y, z}, {1, x, y * z});
+  auto tv3 = view(tv2, {1, x, y * z}, {x, y * z});
+  fusion.addOutput(tv3);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto t0 = at::randn({1, x, y, z}, options);
+  auto t2 = at::native::view(t0, {1, x, y * z});
+  auto t3 = at::native::view(t2, {x, y * z});
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0});
+
+  testValidate(&fusion, cg_outputs, {t0}, {t3}, __LINE__, __FILE__);
+}
+
+// TIMM repro
+TEST_F(NVFuserTest, FusionViewMagicSchedule12_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigTensor(3);
+  auto tv1 = makeContigTensor(1);
+  auto tv2 = makeContigTensor(1);
+  auto tv3 = makeContigTensor(1);
+  auto tv4 = makeContigTensor(1);
+  fusion.addInput(tv0);
+  fusion.addInput(tv1);
+  fusion.addInput(tv2);
+  fusion.addInput(tv3);
+  fusion.addInput(tv4);
+
+  auto tv5 = set(tv0);
+  auto tv6 = view(tv5, {512, 64, 256}, {128, 256, 16, 16});
+  auto s7 = IrBuilder::create<Double>(0.1);
+  auto s8 = IrBuilder::create<Double>(1e-5);
+
+  auto result = batch_norm(tv6, tv1, tv2, tv3, tv4, true, s7, s8);
+
+  fusion.addOutput(tv6);
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.mean);
+  fusion.addOutput(result.invstd);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto t0 = at::randn({512, 64, 256}, options);
+  auto t1 = at::randn({256}, options);
+  auto t2 = at::randn({256}, options);
+  auto t3 = at::randn({256}, options);
+  auto t4 = at::randn({256}, options);
+
+  auto t6 = at::native::view(t0, {128, 256, 16, 16});
+
+  auto aten_outputs = at::native_batch_norm(
+      t6,
+      c10::optional<at::Tensor>(t1),
+      c10::optional<at::Tensor>(t2),
+      c10::optional<at::Tensor>(t3),
+      c10::optional<at::Tensor>(t4),
+      true,
+      0.1,
+      1.e-5);
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2, t3, t4});
+
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      {t0, t1, t2, t3, t4},
+      {t6,
+       std::get<0>(aten_outputs),
+       std::get<1>(aten_outputs),
+       std::get<2>(aten_outputs)},
+      __LINE__,
+      __FILE__,
+      "");
+}
+
 // Make sure different views that are consumed by the reference are segmented
 // into a single kernel.
 TEST_F(NVFuserTest, FusionViewMapping_CUDA) {
