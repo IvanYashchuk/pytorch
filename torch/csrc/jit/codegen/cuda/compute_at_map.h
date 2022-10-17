@@ -3,6 +3,7 @@
 #include <torch/csrc/jit/codegen/cuda/disjoint_set.h>
 #include <torch/csrc/jit/codegen/cuda/ir_all_nodes.h>
 #include <torch/csrc/jit/codegen/cuda/kernel_ir.h>
+#include <torch/csrc/jit/codegen/cuda/lower_trivial_broadcast.h>
 #include <torch/csrc/jit/codegen/cuda/lower_trivial_reductions.h>
 
 #include <deque>
@@ -252,7 +253,25 @@ class TORCH_CUDA_CU_API ComputeAtMap {
   // exact sets that are inputs required to construct the exact concrete id of
   // of_id.
   VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
-  getInputDisjointSetsOf(IterDomain* of_id);
+  getInputDisjointSetsOf(IterDomain* of_id, bool stop_at_rfactor = true);
+
+  // Traverses through definitions of exact maps (unique_exact_definitions_) to
+  // all input ID's from provided exact_sets. Returns all the exact map concrete
+  // IDs of all the exact sets that on the path to and including the inputs
+  // required to construct the exact concrete id of of_id.
+  VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+  getAllDisjointSetProducers(
+      const VectorOfUniqueEntries<
+          std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>& exact_sets);
+
+  // Traverses through uses of exact maps (unique_exact_uses_) to
+  // all input ID's from provided exact_sets. Returns all the exact map concrete
+  // IDs of all the exact sets that on the path to and including the inputs
+  // required to construct the exact concrete id of of_id.
+  VectorOfUniqueEntries<std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>
+  getAllDisjointSetConsumers(
+      const VectorOfUniqueEntries<
+          std::shared_ptr<VectorOfUniqueEntries<IterDomain*>>>& exact_sets);
 
   // Build id_graph_
   void build(Fusion* fusion);
@@ -267,6 +286,11 @@ class TORCH_CUDA_CU_API ComputeAtMap {
 
   // Should be built once and never modified again.
   IterDomainGraph id_graph_;
+
+  // Used specifically for concrete ID computation
+  ConcretizedBroadcastDomains concretized_bcasts_;
+
+  // TODO: Remove
   TrivialReductionInfo trivial_reduction_info_;
 
   // Prevent needing to recompute concrete_id's in compute at map.

@@ -2186,6 +2186,163 @@ TEST_F(NVFuserTest, FusionLowerDivisibleSplits_CUDA) {
   }
 }
 
+TEST_F(NVFuserTest, FusionIssue2076_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  // torch.randn(4, 128, 1, 128, device='cuda').transpose(1,2),
+  // sizes[4, 128, 1, 128] strides[128*128, 128, 128, 1]
+  // sizes[4, 1, 128, 128] strides[128*128, 128, 128, 1]
+  auto tv0 = TensorViewBuilder()
+                 .shape({-1, 1, -1, -1})
+                 .dtype(DataType::Bool)
+                 .contiguity({false, true, true, true})
+                 .build();
+  fusion.addInput(tv0);
+
+  // torch.randn(48, 128, 128, device='cuda'),
+  auto tv1 = makeContigTensor(3);
+  fusion.addInput(tv1);
+
+  // torch.randn(4, 1, 128, 128, device='cuda'),
+  auto tv2 = makeContigConcreteTensor({-1, 1, -1, -1});
+  fusion.addInput(tv2);
+
+  auto tv3 = castOp(DataType::Float, tv0);
+  auto tv4 = view(tv1, {48, 128, 128}, {4, 12, 128, 128});
+
+  auto tv5 = mul(tv3, IrBuilder::create<Double>(1));
+  auto tv6 = sub(IrBuilder::create<Double>(1), tv5);
+  auto tv7 = castOp(DataType::Bool, tv6);
+  auto tv8 =
+      where(tv7, IrBuilder::create<Double>(-3.4028200000000001e+38), tv6);
+  auto tv9 = add(tv8, tv2);
+  auto tv10 = set(tv9);
+  auto tv11 = expand(
+      tv10,
+      {tv10->axis(0)->extent(),
+       IrBuilder::create<Int>(12),
+       tv10->axis(2)->extent(),
+       tv10->axis(3)->extent()});
+
+  auto tv12 = add(tv4, tv11);
+  auto tv13 = view(tv12, {4, 12, 128, 128}, {48, 128, 128});
+  auto tv14 = max(tv13, {2});
+  auto tv15 = broadcast(tv14, {false, false, true});
+  auto tv16 = set(tv15);
+  auto tv17 = expand(
+      tv16,
+      {tv16->axis(0)->extent(),
+       tv16->axis(1)->extent(),
+       IrBuilder::create<Int>(128)});
+  auto tv18 = sub(tv13, tv17);
+  auto tv19 = exp(tv18);
+  auto tv20 = sum(tv19, {2});
+  auto tv21 = broadcast(tv20, {false, false, true});
+  auto tv22 = set(tv21);
+  auto tv23 = expand(
+      tv22,
+      {tv22->axis(0)->extent(),
+       tv22->axis(1)->extent(),
+       IrBuilder::create<Int>(128)});
+  auto tv24 = div(tv19, tv23);
+
+  fusion.addOutput(tv9);
+  fusion.addOutput(tv24);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  at::Tensor t0 =
+      at::randn({4, 128, 1, 128}, options).transpose(1, 2).to(at::kBool);
+  at::Tensor t1 = at::randn({48, 128, 128}, options);
+  at::Tensor t2 = at::randn({4, 1, 128, 128}, options);
+
+  auto t3 = t0.to(at::kFloat);
+  auto t4 = t1.view({4, 12, 128, 128});
+
+  // [4, 1, 128, 128]
+  auto t5 = t3 * 1;
+  auto t6 = 1 - t5;
+  auto t7 = t6.to(at::kBool);
+  auto t8 = at::where(t7, -3.4028200000000001e+38, t6);
+  auto t9 = t8 + t2;
+  auto t10 = t9;
+  // [4, 1, 128, 128]
+  auto t11 = t10.expand({4, 12, 128, 128});
+
+  auto t12 = t4 + t11;
+  auto t13 = t12.view({48, 128, 128});
+  // 48, 128, 128
+  auto t14 = std::get<0>(t13.max({2}));
+  auto t15 = t14.unsqueeze(-1);
+  // 48, 128, 1
+  auto t16 = t15;
+  auto t17 = t16.expand({48, 128, 128});
+  auto t18 = t13 - t17;
+  auto t19 = t18.exp();
+  auto t20 = t19.sum({2});
+  auto t21 = t20.unsqueeze(-1);
+  auto t22 = t21;
+  auto t23 = t22.expand({48, 128, 128});
+  auto t24 = t19 / t23;
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2});
+  testValidate(
+      &fusion, cg_outputs, {t0, t1, t2}, {t9, t24}, __LINE__, __FILE__);
+}
+
+// Simplify first to reproduce compute at issue
+TEST_F(NVFuserTest, FusionIssue2076_v2_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr.get();
+  FusionGuard fg(&fusion);
+
+  // torch.randn(4, 128, 1, device='cuda').transpose(1,2)
+  // sizes[4, 128, 1] strides[128, 1, 1]
+  // sizes[4, 1, 128] strides[128, 128, 1]
+  auto tv0 = TensorViewBuilder()
+                 .shape({-1, 1, -1})
+                 .contiguity({false, true, true})
+                 .build();
+  fusion.addInput(tv0);
+
+  // torch.randn(48, 128, device='cuda')
+  auto tv1 = makeContigTensor(2);
+  fusion.addInput(tv1);
+
+  // torch.randn(4, 1, 128, device='cuda'),
+  auto tv2 = makeContigConcreteTensor({-1, 1, -1});
+  fusion.addInput(tv2);
+
+  auto tv3 = view(tv1, {48, 128}, {4, 12, 128});
+  auto tv4 = add(tv0, tv2);
+
+  auto tv5 = add(tv3, tv4);
+  auto tv6 = view(tv5, {4, 12, 128}, {48, 128});
+
+  fusion.addOutput(tv4);
+  fusion.addOutput(tv6);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+
+  at::Tensor t0 = at::randn({4, 128, 1}, options).transpose(1, 2);
+  at::Tensor t1 = at::randn({48, 128}, options);
+  at::Tensor t2 = at::randn({4, 1, 128}, options);
+
+  auto t3 = t1.view({4, 12, 128});
+
+  // [4, 1, 128]
+  auto t4 = t0.add(t2);
+  auto t5 = t3.add(t4);
+  auto t6 = t5.view({48, 128});
+
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto cg_outputs = executor_cache.runFusionWithInputs({t0, t1, t2});
+  testValidate(&fusion, cg_outputs, {t0, t1, t2}, {t4, t6}, __LINE__, __FILE__);
+}
+
 } // namespace jit
 } // namespace torch
 #endif // #if defined(USE_CUDA)
