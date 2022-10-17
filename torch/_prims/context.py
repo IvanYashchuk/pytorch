@@ -251,7 +251,6 @@ class TorchRefsNvfuserCapabilityMode(TorchRefsMode):
         aten_ops_to_skip = (
             "aten._log_softmax.default",
             "aten._log_softmax_backward_data.default",
-            "aten.expand.default",
         )
         self.skip_ops = tuple(skip_ops) + aten_ops_to_skip
         super().__init__(
