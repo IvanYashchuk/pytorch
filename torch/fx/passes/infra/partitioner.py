@@ -165,7 +165,7 @@ class CapabilityBasedPartitioner:
                     if node.op == "call_function" and \
                        _get_qualified_name(node.target) in self.allowed_single_node_partition_ops:
                         compute_node_count += 1
-                if compute_node_count <= 1:
+                if compute_node_count <= 3:
                     partitions_to_remove.append(id)
             for id in partitions_to_remove:
                 del partitions_by_id[id]
