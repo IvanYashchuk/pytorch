@@ -34,7 +34,7 @@ bool idIsALeafDomain(IterDomain* id, TensorView* tv) {
 IterDomainGraph::IterDomainGraph(Fusion* fusion, bool allow_self_mapping) {
   build(fusion);
 
-  if (false && !allow_self_mapping) {
+  if (!allow_self_mapping) {
     TORCH_INTERNAL_ASSERT(
         !hasSelfMapping(),
         "Unsupported domain mapping detected in ",
@@ -657,27 +657,27 @@ void IterDomainGraph::build(Fusion* fusion) {
       }
     }
   }
-  
+
   // Build almost exact map by forwarding through broadcast axes
   almost_exact_nodes_ = exact_nodes_;
   std::unordered_set<Expr*> visited;
   auto all_elements = exact_nodes_.getAllElements();
-  for(auto entry : all_elements.vector()){
-    if(entry->definition() == nullptr){
+  for (auto entry : all_elements.vector()) {
+    if (entry->definition() == nullptr) {
       continue;
     }
     auto def = entry->definition();
-    if(!visited.emplace(def).second){
+    if (!visited.emplace(def).second) {
       continue;
     }
-    if(auto merge = dynamic_cast<Merge*>(def)) {
-      if(merge->inner()->extent()->isOneInt()){
+    if (auto merge = dynamic_cast<Merge*>(def)) {
+      if (merge->inner()->extent()->isOneInt()) {
         almost_exact_nodes_.mapEntries(merge->outer(), merge->out());
       }
-      if(merge->outer()->extent()->isOneInt()){
+      if (merge->outer()->extent()->isOneInt()) {
         almost_exact_nodes_.mapEntries(merge->inner(), merge->out());
       }
-    } else if(auto split = dynamic_cast<Split*>(def)) {
+    } else if (auto split = dynamic_cast<Split*>(def)) {
       if (split->factor()->isOneInt() && split->startOffset()->isZeroInt() &&
           split->stopOffset()->isZeroInt()) {
         if (split->innerSplit()) {
@@ -1094,8 +1094,11 @@ IterDomain* ComputeAtMap::computeConcreteId(
     }
   }
 
+  TORCH_INTERNAL_ASSERT(concrete_id != nullptr, "No concrete ID is found");
+
   // TODO: Validate that all input disjoint sets that are not broadcast that any
-  // "maybe_concrete_id" entry had is covered by the selected concrete_id.
+  // "maybe_concrete_id" entry had is covered by the selected
+  // concrete_id.
   return concrete_id;
 }
 

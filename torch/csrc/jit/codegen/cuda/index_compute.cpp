@@ -2164,6 +2164,13 @@ std::vector<Val*> Index::getNonGlobalConsumerStridedIndices(
       continue;
     }
 
+    std::stringstream error_msg_loops;
+    if (index_map.find(root_dom[i]) == index_map.end()) {
+      for (auto loop : loops) {
+        error_msg_loops << " " << loop->iter_domain()->toString();
+      }
+    }
+
     TORCH_INTERNAL_ASSERT(
         index_map.find(root_dom[i]) != index_map.end(),
         "Couldn't find root mapping for ",
@@ -2171,7 +2178,9 @@ std::vector<Val*> Index::getNonGlobalConsumerStridedIndices(
         " dim: ",
         i,
         " id: ",
-        root_dom[i]->toString());
+        root_dom[i]->toString(),
+        ", loops: ",
+        error_msg_loops.str());
 
     auto root_ind_i = index_map.at(root_dom[i]);
     if (root_ind_i->isZeroInt()) {
