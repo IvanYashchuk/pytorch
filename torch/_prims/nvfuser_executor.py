@@ -238,11 +238,6 @@ class NvfuserPrimOperatorSupport(torch.fx.passes.operator_support.OperatorSuppor
                 )
                 is not None
             )
-        if node.op == "call_function" and node.target == operator.getitem:
-            # Check if the node unpacks a tuple from a supported node
-            node_to_unpack = node.args[0]
-            assert isinstance(node_to_unpack, torch.fx.Node)
-            return self.is_node_supported(submodules, node_to_unpack)
         return (
             node.op == "call_function"
             and getattr(node.target, "impl_nvfuser", None) is not None
@@ -363,6 +358,7 @@ def maybe_partition_graph(
             allowed_single_node_partition_ops=_allowed_single_node_partition_ops,
         )
         partitions = partitioner.propose_partitions()
+        partitioner.remove_bookend_non_compute_ops(partitions)
         if len(partitions) == 0:
             warn(
                 "No partition found for the graph. "
