@@ -963,7 +963,7 @@ IndexFromIdGraph getPredicateIndexingFromIdGraph(
     mapped_dims.pushBack(consumer_id);
   }
 
-  // Map the concrete id indexing back to the producer or consumer tv
+  // Map the concrete id indexing back to the consumer tv
   std::unordered_map<IterDomain*, VectorOfUniqueEntries<IterDomain*>>
       index_update_map;
   for (auto entry : indexing.indexMap()) {
