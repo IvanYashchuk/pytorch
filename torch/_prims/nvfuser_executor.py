@@ -238,7 +238,7 @@ class NvfuserPrimOperatorSupport(torch.fx.passes.operator_support.OperatorSuppor
                 )
                 is not None
             )
-        if "getitem" in node.name:
+        if node.op == "call_function" and node.target == operator.getitem:
             # Check if the node unpacks a tuple from a supported node
             node_to_unpack = node.args[0]
             assert isinstance(node_to_unpack, torch.fx.Node)
