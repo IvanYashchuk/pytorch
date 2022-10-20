@@ -804,7 +804,7 @@ IndexFromIdGraph getTensorIndexFromIdGraph(
   // Want update map to be based on almost exact, but indexing is on exact, make
   // a map from one space to the other.
   std::unordered_map<IterDomain*, VectorOfUniqueEntries<IterDomain*>>
-      almost_exact_2_target_id;
+      almost_exact_2_target_ids;
 
   for (IterDomain* consumer_id :
        ir_utils::filterByType<IterDomain>(all_consumer_vals)) {
@@ -825,17 +825,17 @@ IndexFromIdGraph getTensorIndexFromIdGraph(
         GpuLower::current()->caMap()->getConcreteMappedID(
             consumer_id, IdMappingMode::ALMOSTEXACT);
 
-    auto almost_exact_2_target_id_it =
-        almost_exact_2_target_id.find(almost_exact_concrete_id);
-    if (almost_exact_2_target_id_it == almost_exact_2_target_id.end()) {
-      almost_exact_2_target_id_it =
-          almost_exact_2_target_id
+    auto almost_exact_2_target_ids_it =
+        almost_exact_2_target_ids.find(almost_exact_concrete_id);
+    if (almost_exact_2_target_ids_it == almost_exact_2_target_ids.end()) {
+      almost_exact_2_target_ids_it =
+          almost_exact_2_target_ids
               .emplace(std::make_pair(
                   almost_exact_concrete_id,
                   VectorOfUniqueEntries<IterDomain*>()))
               .first;
     }
-    auto& mapped_dims = almost_exact_2_target_id_it->second;
+    auto& mapped_dims = almost_exact_2_target_ids_it->second;
     mapped_dims.pushBack(target_id);
   }
 
@@ -848,12 +848,12 @@ IndexFromIdGraph getTensorIndexFromIdGraph(
         GpuLower::current()->caMap()->getConcreteMappedID(
             ref_exact_id, IdMappingMode::ALMOSTEXACT);
 
-    if (almost_exact_2_target_id.find(almost_exact_concrete_id) ==
-        almost_exact_2_target_id.end()) {
+    if (almost_exact_2_target_ids.find(almost_exact_concrete_id) ==
+        almost_exact_2_target_ids.end()) {
       continue;
     }
 
-    auto consumer_ids = almost_exact_2_target_id.at(almost_exact_concrete_id);
+    auto consumer_ids = almost_exact_2_target_ids.at(almost_exact_concrete_id);
 
     for (auto consumer_id : consumer_ids) {
       auto index_update_map_it = index_update_map.find(ref_exact_id);

@@ -1077,10 +1077,9 @@ IterDomain* ComputeAtMap::computeConcreteId(
         concrete_id_root_sets.vector().begin(),
         concrete_id_root_sets.vector().end(),
         [&](std::shared_ptr<VectorOfUniqueEntries<IterDomain*>> set) {
-          return set->vector()[0]->isBroadcast()
-              // TODO: This shouldn't have a negative impact, but (emperically)
-              // might not be necessary
-              || trivial_reduction_info_.isDerived(set->vector()[0]);
+          return set->vector()[0]->isBroadcast() ||
+              set->vector()[0]->isTrivialReduction() ||
+              trivial_reduction_info_.isDerived(set->vector()[0]);
         });
 
     int iter_root_count =
