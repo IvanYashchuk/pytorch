@@ -976,7 +976,8 @@ IndexFromIdGraph getPredicateIndexingFromIdGraph(
         almost_exact_2_consumer_ids.end()) {
       continue;
     }
-    auto consumer_ids = almost_exact_2_consumer_ids.at(almost_exact_concrete_id);
+    auto consumer_ids =
+        almost_exact_2_consumer_ids.at(almost_exact_concrete_id);
 
     for (auto consumer_id : consumer_ids) {
       auto index_update_map_it = index_update_map.find(ref_exact_id);
