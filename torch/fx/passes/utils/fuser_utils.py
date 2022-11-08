@@ -196,11 +196,11 @@ def erase_nodes(gm: GraphModule, nodes: NodeList):
         gm.graph.erase_node(node)
 
 
-def fuse_by_partitions(gm: GraphModule, partitions: List[NodeList]) -> GraphModule:
+def fuse_by_partitions(gm: GraphModule, partitions: List[NodeList], name_prefix) -> GraphModule:
     for partition_id, nodes in enumerate(partitions):
         sorted_nodes = topo_sort(nodes)
 
-        submodule_name = "fused_" + str(partition_id)
+        submodule_name = name_prefix + "fused_" + str(partition_id)
         sub_gm, orig_inputs, orig_outputs = fuse_as_graphmodule(gm, sorted_nodes, submodule_name)
 
         insert_subgm(gm, sub_gm, orig_inputs, orig_outputs)
