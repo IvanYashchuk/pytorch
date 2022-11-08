@@ -265,6 +265,67 @@ aot_mem_efficient_fusion = AOTMemEfficientFusionWithContext(True)
 aot_mem_efficient_fusion_no_decomp = AOTMemEfficientFusionWithContext(False)
 
 
+class InductorGraphModule(torch.nn.Module):
+    def __init__(self, gm):
+        super().__init__()
+        self.gm = gm
+        self.compiled_fn = None
+
+    def __call__(self, *args):
+        if self.compiled_fn is None:
+            from torch._inductor.compile_fx import compile_fx_inner
+
+            self.compiled_fn = compile_fx_inner(self.gm, args, cudagraphs=True)
+        return self.compiled_fn(list(args))
+
+
+@functools.lru_cache(maxsize=1024)  # type: ignore[arg-type]
+def partition_and_inductorify(gm: GraphModule):
+    from copy import deepcopy
+    from warnings import warn
+
+    from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+
+    class InductorOperatorSupport(torch.fx.passes.operator_support.OperatorSupport):
+        def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
+            if node.op == "call_method" or node.op == "call_module":
+                return False
+            if node.op == "call_function":
+                return True
+            return False
+
+    supported_ops = InductorOperatorSupport()
+
+    # CapabilityBasedPartitioner modifies the graph in-place so we need to make a copy of the graph
+    gm = deepcopy(gm)
+    partitioner = CapabilityBasedPartitioner(
+        gm,
+        supported_ops,
+        allows_single_node_partition=True,
+    )
+    partitions = partitioner.propose_partitions()
+    if len(partitions) == 0:
+        warn(
+            "No partition found for the graph. "
+            + "Please use the eager ATen mode to execute the graph.",
+            category=RuntimeWarning,
+        )
+    partitioned_graph = partitioner.fuse_partitions(partitions, name_prefix="inductor_")
+
+    # Replacing graph's fused submodules with a wrapper module with
+    # __call__() method that calls compile_fx_inner.
+    # This avoids the need to call the interpreter on the graph
+    for node in partitioned_graph.graph.nodes:
+        if node.op == "call_module" and "inductor_fused_" in node.name:
+            inductor_submodule = getattr(partitioned_graph, node.name)
+            partitioned_graph.delete_submodule(node.target)
+            gm.add_submodule(
+                node.target,
+                InductorGraphModule(inductor_submodule),
+            )
+    return partitioned_graph
+
+
 def prims_executor(gm, inputs, *, executor):
     from functorch.compile import make_boxed_func
 
@@ -280,8 +341,26 @@ def prims_executor(gm, inputs, *, executor):
     with TorchRefsNvfuserCapabilityMode():
         prim_gm = make_fx(gm)(*inputs)
 
-    # Then we return a callable that executes the "prim_gm" graph
-    return make_boxed_func(partial(execute, prim_gm, executor=executor))
+    # Now that we have a graph consisting of nvprims where possible,
+    # we can group the nodes together into a module that can be
+    # compiled by the nvFuser executor
+    from torch._prims.nvfuser_executor import maybe_partition_graph
+
+    partitioned_gm, is_partitioned = maybe_partition_graph(
+        prim_gm,
+        allow_single_op_fusion=False,
+        use_python_fusion_cache=True,
+    )
+    if not is_partitioned:
+        # We didn't partition the graph because the whole graph is executable by
+        # nvFuser
+        return make_boxed_func(partial(execute, prim_gm, executor=executor))
+
+    # If the graph was partitioned there are likely some nodes that
+    # can't be fused by nvFuser. We try to fuse the rest of the graph
+    # using Inductor
+    partitioned_gm = partition_and_inductorify(partitioned_gm)
+    return make_boxed_func(partitioned_gm)
 
 
 def create_nvprims_backend(*, executor):
