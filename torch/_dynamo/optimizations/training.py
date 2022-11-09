@@ -270,13 +270,20 @@ class InductorGraphModule(torch.nn.Module):
         super().__init__()
         self.gm = gm
         self.compiled_fn = None
+        output_node = next(filter(lambda n: n.op == "output", gm.graph.nodes))
+        self.is_output_tuple = isinstance(output_node.args[0], tuple)
 
     def __call__(self, *args):
         if self.compiled_fn is None:
             from torch._inductor.compile_fx import compile_fx_inner
 
             self.compiled_fn = compile_fx_inner(self.gm, args, cudagraphs=True)
-        return self.compiled_fn(list(args))
+        result = self.compiled_fn(list(args))
+        # For some reason, the result is a tuple of a single tensor
+        # We need to unwrap it.
+        if isinstance(result, tuple) and len(result) == 1 and not self.is_output_tuple:
+            return result[0]
+        return result
 
 
 @functools.lru_cache(maxsize=1024)  # type: ignore[arg-type]
