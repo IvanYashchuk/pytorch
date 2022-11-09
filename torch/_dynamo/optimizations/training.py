@@ -377,9 +377,11 @@ def create_nvprims_backend(*, executor):
             self.executor = executor
 
         def candidate(self):
+            from torch._inductor.decomposition import select_decomp_table
             return BACKENDS["aot_autograd"](
                 self.gm,
                 self.example_inputs,
+                decompositions=select_decomp_table(),
                 fw_compiler=partial(prims_executor, executor=self.executor),
                 bw_compiler=partial(prims_executor, executor=self.executor),
             )
