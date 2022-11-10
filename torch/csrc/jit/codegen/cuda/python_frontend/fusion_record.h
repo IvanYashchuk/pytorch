@@ -699,6 +699,85 @@ struct BroadcastInDimOpRecord : RecordFunctor {
   std::vector<int64_t> broadcast_dims_;
 };
 
+struct BroadcastInDimSymbolicOpRecord : RecordFunctor {
+  BroadcastInDimSymbolicOpRecord(
+      std::vector<State> _args,
+      std::vector<State> _outputs,
+      std::string _name,
+      std::vector<State> output_shape,
+      std::vector<int64_t>& broadcast_dims)
+      : RecordFunctor(
+            std::move(_args),
+            std::move(_outputs),
+            _name,
+            RecordType::BroadcastInDimOp),
+        output_shape_(std::move(output_shape)),
+        broadcast_dims_(std::move(broadcast_dims)) {}
+  virtual ~BroadcastInDimSymbolicOpRecord() = default;
+  virtual RecordFunctor* clone() final {
+    return new BroadcastInDimSymbolicOpRecord(*this);
+  }
+
+  virtual void operator()(FusionDefinition& fd) final {
+    auto arg =
+        fd.getFusionState(args_.at(0).index)->template as<Nvf::TensorView>();
+
+    const auto& arg_domains_nr = arg->domain()->noReductions();
+    const auto arg_ndims = arg_domains_nr.size();
+    TORCH_CHECK(
+        output_shape_.size() >= arg_ndims,
+        "The new shape is expected to be greater-then-or-equal to the input",
+        output_shape_.size(),
+        arg_ndims);
+    TORCH_CHECK(
+        arg_ndims == broadcast_dims_.size(),
+        "The broadcast dimensions should match the input dimensions.",
+        arg_ndims,
+        broadcast_dims_.size());
+
+    std::vector<bool> is_broadcast_dim(output_shape_.size(), true);
+    std::vector<bool> is_expand_dim(output_shape_.size(), true);
+    for (const auto idx : c10::irange(broadcast_dims_.size())) {
+      if (idx > 0) {
+        TORCH_CHECK(
+            broadcast_dims_[idx - 1] < broadcast_dims_[idx],
+            "Broadcast dimension is not greater than the previous value.");
+      }
+      TORCH_CHECK(
+          broadcast_dims_[idx] < static_cast<int>(output_shape_.size()),
+          "Invalid broadcast_dims value.");
+      is_broadcast_dim.at(broadcast_dims_[idx]) = false;
+      // Note: when we expand a broadcasted dimension, we need to expand it
+      // to a concrete size, hence the need for `is_expand_dim` flag and the
+      // expand operation following the broadcast.
+      is_expand_dim.at(broadcast_dims_[idx]) =
+          arg_domains_nr[idx]->isBroadcast();
+    }
+
+    std::vector<torch::jit::fuser::cuda::Val*> output_shape_on_bcast(
+        output_shape_.size(), nullptr);
+    std::transform(
+        output_shape_.begin(),
+        output_shape_.end(),
+        output_shape_on_bcast.begin(),
+        [&fd](const State& state) {
+          return fd.getFusionState(state.index)->template as<Nvf::Val>();
+        });
+
+    auto output = Nvf::broadcast(arg, is_broadcast_dim);
+    output = Nvf::expand(output, output_shape_on_bcast);
+    fd.setFusionState(outputs_.at(0).index, output);
+  }
+
+ private:
+  //! Represents the tensor dimensions of the output tensor.
+  std::vector<State> output_shape_;
+  //! Communicates which dimensions of the output the input tensor maps.
+  //! For instance, for output [2, 3, 4] and input [3]. This vector would
+  //! contain [1].
+  std::vector<int64_t> broadcast_dims_;
+};
+
 //! Specialized Record Functor for the FusionDefinition's broadcast op.
 
 struct BroadcastOpRecord : RecordFunctor {

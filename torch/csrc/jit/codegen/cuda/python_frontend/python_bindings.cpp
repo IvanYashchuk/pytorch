@@ -1376,6 +1376,40 @@ void initNvFuserPythonBindings(PyObject* module) {
       py::arg("output_shape"),
       py::arg("broadcast_dims"),
       py::return_value_policy::reference);
+  // symbolic output shape overload
+  nvf_ops.def(
+      "broadcast_in_dim",
+      [](nvfuser::FusionDefinition::Operators& self,
+         nvfuser::Tensor arg,
+         std::vector<nvfuser::Scalar>& output_shape,
+         std::vector<int64_t>& broadcast_dims) -> nvfuser::Tensor {
+        FUSER_PERF_SCOPE("Operators.broadcast_in_dim");
+        nvfuser::FusionDefinition* fd = self.fusion_definition;
+        TORCH_CHECK(
+            output_shape.size() >= broadcast_dims.size(),
+            "broadcast_dims vector size is too big for output shape!");
+        nvfuser::Tensor output = fd->defineTensor();
+        std::vector<nvfuser::State> output_shape_states(
+            output_shape.size(), nvfuser::State(0, nvfuser::StateType::Scalar));
+        std::transform(
+            output_shape.begin(),
+            output_shape.end(),
+            output_shape_states.begin(),
+            [&fd](const nvfuser::Scalar& s) {
+              return fd->recordingState(s());
+            });
+        fd->defineRecord(new nvfuser::BroadcastInDimSymbolicOpRecord(
+            {fd->recordingState(arg())},
+            {fd->recordingState(output())},
+            "ops.broadcast_in_dim",
+            output_shape_states,
+            broadcast_dims));
+        return output;
+      },
+      py::arg("arg"),
+      py::arg("output_shape"),
+      py::arg("broadcast_dims"),
+      py::return_value_policy::reference);
   nvf_ops.def(
       "broadcast",
       [](nvfuser::FusionDefinition::Operators& self,
