@@ -291,6 +291,7 @@ void initNvFuserPythonBindings(PyObject* module) {
             // identified by -1, and size == 0 is not supported.
 
             // Translate to TensorViewBuilder's view of the world.
+            std::vector<bool> contiguity = computeContiguity(sizes, strides);
             std::vector<int64_t> maybe_symbolic_sizes;
             maybe_symbolic_sizes.reserve(sizes.size());
             for (const auto i : c10::irange(sizes.size())) {
@@ -301,6 +302,7 @@ void initNvFuserPythonBindings(PyObject* module) {
                   " is not supported in nvFuser. Expected size > 0.");
               if (sizes[i] == 1) {
                 maybe_symbolic_sizes.push_back(1);
+                contiguity.erase(contiguity.begin() + i);
               } else {
                 maybe_symbolic_sizes.push_back(-1);
               }
@@ -310,7 +312,7 @@ void initNvFuserPythonBindings(PyObject* module) {
             self.defineRecord(new TensorRecord(
                 {self.recordingState(out())},
                 std::move(maybe_symbolic_sizes),
-                computeContiguity(sizes, strides),
+                std::move(contiguity),
                 dtype,
                 is_cpu));
 
