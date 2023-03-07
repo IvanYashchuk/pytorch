@@ -1115,7 +1115,7 @@ class TestNvFuserFrontend(TestCase):
 
         self.assertEqual(at_rfloat, rfloat)
         self.assertEqual(at_rdouble, rdouble)
-        
+
     def test_reduction_complex_number(self) :
         def test_dtype(torch_dtype):
             inputs = [torch.randn(2, 32, device='cuda', dtype=torch_dtype)]
@@ -1330,6 +1330,23 @@ class TestNvFuserFrontend(TestCase):
         strides = [800, 300, 300, 456456465465, 0, 60, 10]
         contiguity = [False, True, True, False]
         self.assertEqual(compute_contiguity(sizes, strides), contiguity)
+
+    def test_fix_2549(self):
+        a = torch.ones(4, 1, dtype=torch.double, device='cuda')
+        b = torch.ones(4, 4, dtype=torch.double, device='cuda')
+
+        def nvfuser_fusion_id(fd : FusionDefinition) -> None :
+            T0 = fd.define_tensor(sizes=a.shape, strides=a.stride(), dtype=DataType.Double, is_cpu=False)
+            T1 = fd.define_tensor(sizes=b.shape, strides=b.stride(), dtype=DataType.Double, is_cpu=False)
+            T2 = fd.ops.broadcast_in_dim(T0, output_shape=[4, 4], broadcast_dims=[0, 1])
+            T3 = fd.ops.div(T1, T2)
+            fd.add_output(T3)
+
+        with FusionDefinition() as fd:
+            nvfuser_fusion_id(fd)
+
+        out = fd.execute([a, b])
+        self.assertEqual(out[0], b / a)
 
     def test_prod(self) :
         inputs = [
