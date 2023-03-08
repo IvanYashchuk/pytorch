@@ -25,7 +25,7 @@ std::vector<bool> computeContiguity(
   TORCH_CHECK(
       sizes.size() == strides.size(),
       "compute_contiguity: Sizes and strides must have the same number of dimensions");
-  auto not_broadcast = [&](auto i) { return strides[i] != 0 && sizes[i] != 1; };
+  auto not_broadcast = [&](auto i) { return (sizes[i] != 1) || (strides[i] != 0 && sizes[i] != 1); };
   auto irange = c10::irange(sizes.size());
   auto no_b_size = std::count_if(irange.begin(), irange.end(), not_broadcast);
   std::vector<bool> contiguity(no_b_size);
@@ -291,7 +291,6 @@ void initNvFuserPythonBindings(PyObject* module) {
             // identified by -1, and size == 0 is not supported.
 
             // Translate to TensorViewBuilder's view of the world.
-            std::vector<bool> contiguity = computeContiguity(sizes, strides);
             std::vector<int64_t> maybe_symbolic_sizes;
             maybe_symbolic_sizes.reserve(sizes.size());
             for (const auto i : c10::irange(sizes.size())) {
@@ -302,7 +301,6 @@ void initNvFuserPythonBindings(PyObject* module) {
                   " is not supported in nvFuser. Expected size > 0.");
               if (sizes[i] == 1) {
                 maybe_symbolic_sizes.push_back(1);
-                contiguity.erase(contiguity.begin() + i);
               } else {
                 maybe_symbolic_sizes.push_back(-1);
               }
@@ -312,7 +310,7 @@ void initNvFuserPythonBindings(PyObject* module) {
             self.defineRecord(new TensorRecord(
                 {self.recordingState(out())},
                 std::move(maybe_symbolic_sizes),
-                std::move(contiguity),
+                computeContiguity(sizes, strides),
                 dtype,
                 is_cpu));
 
