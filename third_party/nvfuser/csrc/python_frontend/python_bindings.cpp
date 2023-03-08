@@ -25,7 +25,9 @@ std::vector<bool> computeContiguity(
   TORCH_CHECK(
       sizes.size() == strides.size(),
       "compute_contiguity: Sizes and strides must have the same number of dimensions");
-  auto not_broadcast = [&](auto i) { return (sizes[i] != 1) || (strides[i] != 0 && sizes[i] != 1); };
+  auto not_broadcast = [&](auto i) {
+    return (sizes[i] != 1) || (strides[i] != 0 && sizes[i] != 1);
+  };
   auto irange = c10::irange(sizes.size());
   auto no_b_size = std::count_if(irange.begin(), irange.end(), not_broadcast);
   std::vector<bool> contiguity(no_b_size);
