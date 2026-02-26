@@ -111,6 +111,65 @@ class InPlaceCompilationTests(TestCase):
 
         g(torch.randn(3))
 
+    def test_int_specialization_mode_dynamic(self):
+        torch._dynamo.reset()
+
+        def fn(x, n):
+            return x + n
+
+        x = torch.randn(10, 10)
+        cnt = CompileCounter()
+        opt_fn = torch.compile(
+            fn, backend=cnt, fullgraph=True, int_specialization_mode="dynamic"
+        )
+
+        self.assertEqual(fn(x, 3), opt_fn(x, 3))
+        self.assertEqual(fn(x, 7), opt_fn(x, 7))
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_int_specialization_mode_specialized(self):
+        torch._dynamo.reset()
+
+        def fn(x, n):
+            return x + n
+
+        x = torch.randn(10, 10)
+        cnt = CompileCounter()
+        opt_fn = torch.compile(
+            fn, backend=cnt, fullgraph=True, int_specialization_mode="specialized"
+        )
+
+        self.assertEqual(fn(x, 3), opt_fn(x, 3))
+        self.assertEqual(fn(x, 7), opt_fn(x, 7))
+        self.assertEqual(cnt.frame_count, 2)
+
+    @torch._dynamo.config.patch(specialize_int=True)
+    def test_int_specialization_mode_overrides_global_config(self):
+        torch._dynamo.reset()
+
+        def fn(x, n):
+            return x + n
+
+        x = torch.randn(10, 10)
+        cnt = CompileCounter()
+        opt_fn = torch.compile(
+            fn, backend=cnt, fullgraph=True, int_specialization_mode="dynamic"
+        )
+
+        self.assertEqual(fn(x, 4), opt_fn(x, 4))
+        self.assertEqual(fn(x, 9), opt_fn(x, 9))
+        self.assertEqual(cnt.frame_count, 1)
+
+    def test_int_specialization_mode_invalid_value(self):
+        def fn(x):
+            return x + 1
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Invalid value for int_specialization_mode='invalid'",
+        ):
+            torch.compile(fn, int_specialization_mode="invalid")
+
     def test_compilation_callback_with_graph_break(self):
         torch._dynamo.reset()
         counter = 0
