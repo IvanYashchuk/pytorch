@@ -27,6 +27,7 @@ from collections.abc import Callable as _Callable
 from typing import (
     Any as _Any,
     get_origin as _get_origin,
+    Literal as _Literal,
     overload as _overload,
     TYPE_CHECKING,
     TypeVar as _TypeVar,
@@ -2549,6 +2550,7 @@ def compile(
     *,
     fullgraph: builtins.bool = False,
     dynamic: builtins.bool | None = None,
+    int_specialization_mode: _Literal["dynamic", "specialized"] | None = None,
     backend: str | _Callable = "inductor",
     mode: str | None = None,
     options: dict[str, str | builtins.int | builtins.bool | _Callable] | None = None,
@@ -2562,6 +2564,7 @@ def compile(
     *,
     fullgraph: builtins.bool = False,
     dynamic: builtins.bool | None = None,
+    int_specialization_mode: _Literal["dynamic", "specialized"] | None = None,
     backend: str | _Callable = "inductor",
     mode: str | None = None,
     options: dict[str, str | builtins.int | builtins.bool | _Callable] | None = None,
@@ -2574,6 +2577,7 @@ def compile(
     *,
     fullgraph: builtins.bool = False,
     dynamic: builtins.bool | None = None,
+    int_specialization_mode: _Literal["dynamic", "specialized"] | None = None,
     backend: str | _Callable = "inductor",
     mode: str | None = None,
     options: dict[str, str | builtins.int | builtins.bool | _Callable] | None = None,
@@ -2612,6 +2616,14 @@ def compile(
         When this is False, we will NEVER generate dynamic kernels, we will always specialize.
         By default (None), we automatically detect if dynamism has occurred and compile a more
         dynamic kernel upon recompile.
+       int_specialization_mode (str or None): Controls integer-value specialization policy for
+        Python `int` inputs at compile time.
+
+        - "dynamic": force unspecialized integer inputs so changing integer values can reuse one compiled body.
+
+        - "specialized": force specialization on integer values to generate distinct compiled instances.
+
+        - None (default): preserve existing behavior controlled by Dynamo defaults/config.
        backend (str or Callable): backend to be used
 
         - "inductor" is the default backend, which is a good balance between performance and overhead
@@ -2701,6 +2713,7 @@ def compile(
                 model,
                 fullgraph=fullgraph,
                 dynamic=dynamic,
+                int_specialization_mode=int_specialization_mode,
                 backend=backend,
                 mode=mode,
                 options=options,
@@ -2715,6 +2728,22 @@ def compile(
         )
     if mode is None and options is None:
         mode = "default"
+
+    specialize_int = None
+    force_unspec_int = None
+    if int_specialization_mode is None:
+        pass
+    elif int_specialization_mode == "dynamic":
+        specialize_int = False
+        force_unspec_int = True
+    elif int_specialization_mode == "specialized":
+        specialize_int = True
+        force_unspec_int = False
+    else:
+        raise RuntimeError(
+            f"Invalid value for int_specialization_mode={int_specialization_mode!r}. "
+            "Expected one of: None, 'dynamic', 'specialized'."
+        )
 
     from torch._inductor.compiler_bisector import CompilerBisector
 
@@ -2759,6 +2788,8 @@ def compile(
         backend=backend,
         nopython=fullgraph,
         dynamic=dynamic,
+        specialize_int=specialize_int,
+        force_unspec_int=force_unspec_int,
         disable=disable,
         guard_filter_fn=guard_filter_fn,
     )(model)  # type: ignore[return-value]

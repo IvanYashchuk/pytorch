@@ -137,6 +137,12 @@ fail_on_cache_limit_hit: bool = Config(
 # to be dynamic, but accesses to ints should NOT get promoted into inputs.
 specialize_int = False
 
+# Force local integer inputs to be unspecialized even when
+# assume_static_by_default=True. This is primarily used by torch.compile
+# APIs that want explicit "single compiled body across int values"
+# behavior without requiring users to globally relax static assumptions.
+force_unspec_int = False
+
 # Whether or not to specialize on float inputs.  Dynamo will always promote
 # float inputs into Tensor inputs, but at the moment, backends inconsistently
 # support codegen on float (this is to be fixed).

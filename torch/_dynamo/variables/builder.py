@@ -2188,9 +2188,13 @@ class VariableBuilder:
                 return self.wrap_symint(value, dynamism=DimDynamic.UNBACKED)
 
             if not config.specialize_int:
-                # unspecializing int by default, but still
-                # specialize for the following conditions
-                if is_int_specialization_case(value, self.source):
+                # Unspecializing int by default, but still specialize for
+                # selected cases unless explicitly overridden by
+                # force_unspec_int.
+                if (
+                    not config.force_unspec_int
+                    and is_int_specialization_case(value, self.source)
+                ):
                     recompile_hint = None
                     if (
                         self.source.guard_source.is_unspecialized_builtin_nn_module()
@@ -2692,6 +2696,8 @@ class VariableBuilder:
 
             if dynamism is not None:
                 dynamic_dim = dynamism
+            elif config.force_unspec_int:
+                dynamic_dim = DimDynamic.DYNAMIC
             elif (
                 config.automatic_dynamic_shapes
                 and frame_state_entry.scalar is auto_dynamic

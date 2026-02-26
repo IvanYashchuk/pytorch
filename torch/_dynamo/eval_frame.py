@@ -746,6 +746,8 @@ class _TorchDynamoContext:
         error_on_graph_break: Optional[bool] = None,
         export: bool = False,
         dynamic: Optional[bool] = None,
+        specialize_int: Optional[bool] = None,
+        force_unspec_int: Optional[bool] = None,
         compiler_config: Optional[Any] = None,
         package: Optional[CompilePackage] = None,
         hooks: Optional[Hooks] = None,
@@ -760,6 +762,8 @@ class _TorchDynamoContext:
         self.error_on_graph_break = error_on_graph_break
         self.export = export
         self._dynamic = dynamic
+        self._specialize_int = specialize_int
+        self._force_unspec_int = force_unspec_int
         self.compiler_config = compiler_config
         self.cleanup_fns: list[Callable[[], Any]] = []
         self.enter_exit_hooks = []
@@ -773,6 +777,14 @@ class _TorchDynamoContext:
 
         if dynamic is not None:
             self.enter_exit_hooks.append(make_set_enable_dynamic(dynamic))
+
+        if specialize_int is not None or force_unspec_int is not None:
+            config_changes: dict[str, bool] = {}
+            if specialize_int is not None:
+                config_changes["specialize_int"] = specialize_int
+            if force_unspec_int is not None:
+                config_changes["force_unspec_int"] = force_unspec_int
+            self.enter_exit_hooks.append(config._make_closure_patcher(**config_changes))
 
         if on_enter is not nothing:
             # this case is not common
@@ -1128,6 +1140,8 @@ class OptimizeContext(_TorchDynamoContext):
         error_on_graph_break: Optional[bool] = None,
         export: bool = False,
         dynamic: Optional[bool] = None,
+        specialize_int: Optional[bool] = None,
+        force_unspec_int: Optional[bool] = None,
         compiler_config: Optional[Any] = None,
         rebuild_ctx: Optional[
             Callable[[], Union[OptimizeContext, _NullDecorator]]
@@ -1148,6 +1162,8 @@ class OptimizeContext(_TorchDynamoContext):
             error_on_graph_break=error_on_graph_break,
             export=export,
             dynamic=dynamic,
+            specialize_int=specialize_int,
+            force_unspec_int=force_unspec_int,
             compiler_config=compiler_config,
             package=package,
             hooks=hooks,
@@ -1300,6 +1316,8 @@ def _optimize_catch_errors(
     error_on_graph_break: Optional[bool] = None,
     export: bool = False,
     dynamic: Optional[bool] = None,
+    specialize_int: Optional[bool] = None,
+    force_unspec_int: Optional[bool] = None,
     compiler_config: Optional[Any] = None,
     rebuild_ctx: Optional[Callable[[], Union[OptimizeContext, _NullDecorator]]] = None,
     package: Optional[CompilePackage] = None,
@@ -1312,6 +1330,8 @@ def _optimize_catch_errors(
         error_on_graph_break=error_on_graph_break,
         export=export,
         dynamic=dynamic,
+        specialize_int=specialize_int,
+        force_unspec_int=force_unspec_int,
         compiler_config=compiler_config,
         rebuild_ctx=rebuild_ctx,
         package=package,
@@ -1500,6 +1520,8 @@ def _optimize(
     | None = None,
     disable: bool = False,
     dynamic: Optional[bool] = None,
+    specialize_int: Optional[bool] = None,
+    force_unspec_int: Optional[bool] = None,
     package: Optional[CompilePackage] = None,
 ) -> Union[OptimizeContext, _NullDecorator]:
     """
@@ -1556,6 +1578,8 @@ def _optimize(
         return optimize_assert(
             backend,
             dynamic=dynamic,
+            specialize_int=specialize_int,
+            force_unspec_int=force_unspec_int,
             hooks=hooks,
             rebuild_ctx=rebuild_ctx,
             package=package,
@@ -1590,6 +1614,8 @@ def _optimize(
         error_on_graph_break=error_on_graph_break
         and not config.debug_force_graph_break_on_leaf_return,
         dynamic=dynamic,
+        specialize_int=specialize_int,
+        force_unspec_int=force_unspec_int,
         compiler_config=(
             backend.get_compiler_config()
             if hasattr(backend, "get_compiler_config")
@@ -2436,6 +2462,8 @@ def _optimize_assert(
     export: bool = False,
     export_constraints: Optional[Any] = None,
     dynamic: Optional[bool] = None,
+    specialize_int: Optional[bool] = None,
+    force_unspec_int: Optional[bool] = None,
     package: Optional[CompilePackage] = None,
 ) -> OptimizeContext:
     """
@@ -2474,6 +2502,8 @@ def _optimize_assert(
         fullgraph=True,
         export=export,
         dynamic=dynamic,
+        specialize_int=specialize_int,
+        force_unspec_int=force_unspec_int,
         rebuild_ctx=rebuild_ctx,
         package=package,
     )
