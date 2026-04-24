@@ -1,6 +1,8 @@
 # mypy: allow-untyped-defs
+from dataclasses import dataclass
 import functools
 import logging
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -21,6 +23,7 @@ from torch.torch_version import TorchVersion
 
 from .. import config as inductor_config, distributed_autotune
 from ..codegen.cutlass.gemm_template import CUTLASS2xGemmTemplate, CUTLASS3xGemmTemplate
+from ..codegen.common import _same_registered_symbol, _validate_backend_name
 from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
 from ..codegen.rocm.ck_universal_gemm_template import CKGemmTemplate
 from ..codegen.subgraph import SubgraphChoiceCaller, SubgraphTemplate
@@ -41,8 +44,10 @@ from ..select_algorithm import (
     TritonTemplate,
 )
 from ..utils import (
+    _use_autotune_backend,
     _use_cutlass_for_op,
     ceildiv,
+    get_current_backend,
     use_aten_gemm_kernels,
     use_ck_gemm_template,
     use_ck_tile_gemm_template,
@@ -77,6 +82,67 @@ except ImportError:
 log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
+
+@dataclass(frozen=True)
+class GemmTemplateProviderContext:
+    op_name: str
+    kernel_inputs: MMKernelInputs
+    layout: Layout
+    mat1: Buffer
+    mat2: Buffer
+    m: Any
+    n: Any
+    k: Any
+    out_dtype: torch.dtype | None
+    static_shape: bool
+    is_nonzero: bool
+
+
+GemmTemplateProvider = Callable[
+    [GemmTemplateProviderContext], Iterable[ChoiceCaller] | None
+]
+_gemm_template_providers: dict[str, GemmTemplateProvider] = {}
+
+
+def register_gemm_template_provider(
+    backend: str, provider: GemmTemplateProvider
+) -> None:
+    """
+    Register a backend-owned GEMM template provider for ``aten.mm`` lowering.
+
+    Providers are called from ``tuned_mm`` for the active CUDA backend and may
+    return additional ``ChoiceCaller`` objects for autotuning. This keeps
+    out-of-tree backends from advertising Triton template support only to inject
+    their own GEMM templates.
+    """
+    _validate_backend_name("GEMM template provider", backend)
+    if (
+        existing := _gemm_template_providers.get(backend)
+    ) is not None and not _same_registered_symbol(existing, provider):
+        raise ValueError(
+            f"GEMM template provider for backend {backend!r} is already registered"
+        )
+    _gemm_template_providers[backend] = provider
+
+
+def get_gemm_template_provider(backend: str) -> GemmTemplateProvider | None:
+    return _gemm_template_providers.get(backend)
+
+
+def get_backend_gemm_template_choices(
+    backend: str,
+    context: GemmTemplateProviderContext,
+) -> list[ChoiceCaller]:
+    provider = get_gemm_template_provider(backend)
+    if provider is None:
+        return []
+    if not (inductor_config.max_autotune or inductor_config.max_autotune_gemm):
+        return []
+    if not _use_autotune_backend(backend):
+        return []
+    choices = provider(context)
+    return list(choices or ())
+
 
 # We define each template kernel in a separate file which is the name of the input to load_kernel_template
 # (e.g. triton_mm for templates/triton_mm.py.jinja).
@@ -448,7 +514,6 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
             kwarg_overrides=kwarg_overrides,
         )
     )
-
     if (
         out_dtype is None
         and is_nonzero
@@ -528,6 +593,26 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
                 choices = [choice for choice in choices if choice in ah_choices]
             else:
                 choices = choices[:num_choices_before_extra_configs]
+
+    if out_dtype is None and is_nonzero:
+        choices.extend(
+            get_backend_gemm_template_choices(
+                get_current_backend(layout.device.type),
+                context=GemmTemplateProviderContext(
+                    op_name=name,
+                    kernel_inputs=kernel_inputs,
+                    layout=layout,
+                    mat1=mat1,
+                    mat2=mat2,
+                    m=m,
+                    n=n,
+                    k=k,
+                    out_dtype=out_dtype,
+                    static_shape=static_shape,
+                    is_nonzero=is_nonzero,
+                ),
+            )
+        )
 
     if out_dtype is None:
         for k in inductor_config.external_matmul:

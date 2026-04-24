@@ -21,6 +21,7 @@ from torch._inductor.codegen.triton import (
     TritonKernel,
     TritonScheduling,
 )
+from torch._inductor.kernel import mm as mm_kernel
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.runtime.hints import HeuristicType
 from torch._inductor.runtime.triton_compat import Config
@@ -43,6 +44,7 @@ class BackendExtensionAPITests(TestCase):
         wrapper_benchmark._kernel_benchmark_providers.pop(
             "dummy_benchmark_backend", None
         )
+        mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -147,6 +149,15 @@ class BackendExtensionAPITests(TestCase):
             dummy_benchmark_provider.__qualname__
         )
 
+        def dummy_gemm_provider(context):
+            return ()
+
+        def reloaded_dummy_gemm_provider(context):
+            return ()
+
+        reloaded_dummy_gemm_provider.__module__ = dummy_gemm_provider.__module__
+        reloaded_dummy_gemm_provider.__qualname__ = dummy_gemm_provider.__qualname__
+
         common.register_cuda_backend("dummy_cuda_backend", DummyCudaScheduling)
         common.register_cuda_backend(
             "dummy_cuda_backend", ReloadedDummyCudaScheduling
@@ -189,6 +200,17 @@ class BackendExtensionAPITests(TestCase):
             reloaded_dummy_benchmark_provider,
         )
 
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", reloaded_dummy_gemm_provider
+        )
+        self.assertIs(
+            mm_kernel._gemm_template_providers["dummy_gemm_backend"],
+            reloaded_dummy_gemm_provider,
+        )
+
     def test_register_backend_wrapper_import(self):
         common.register_backend_wrapper_import(
             "dummy_wrapper_backend", "import dummy_backend"
@@ -210,6 +232,108 @@ class BackendExtensionAPITests(TestCase):
             common.register_backend_wrapper_import("not-valid", "import dummy")
         with self.assertRaisesRegex(ValueError, "non-empty"):
             common.register_backend_wrapper_import("dummy_wrapper_backend", " ")
+
+    def test_register_gemm_template_provider(self):
+        seen_context = None
+
+        def dummy_gemm_provider(context):
+            nonlocal seen_context
+            seen_context = context
+            return ("choice0",)
+
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+
+        self.assertIs(
+            mm_kernel.get_gemm_template_provider("dummy_gemm_backend"),
+            dummy_gemm_provider,
+        )
+        context = mm_kernel.GemmTemplateProviderContext(
+            op_name="mm",
+            kernel_inputs="kernel_inputs",
+            layout="layout",
+            mat1="mat1",
+            mat2="mat2",
+            m=16,
+            n=32,
+            k=64,
+            out_dtype=None,
+            static_shape=False,
+            is_nonzero=True,
+        )
+        with config.patch(
+            max_autotune_gemm=True,
+            max_autotune_gemm_backends="DUMMY_GEMM_BACKEND",
+        ):
+            self.assertEqual(
+                mm_kernel.get_backend_gemm_template_choices(
+                    "dummy_gemm_backend",
+                    context=context,
+                ),
+                ["choice0"],
+            )
+        self.assertIs(seen_context, context)
+        self.assertEqual(seen_context.op_name, "mm")
+        self.assertEqual(seen_context.kernel_inputs, "kernel_inputs")
+        self.assertEqual(seen_context.m, 16)
+        self.assertEqual(seen_context.out_dtype, None)
+        self.assertFalse(seen_context.static_shape)
+        with config.patch(
+            max_autotune_gemm=True,
+            max_autotune_gemm_backends="TRITON",
+        ):
+            self.assertEqual(
+                mm_kernel.get_backend_gemm_template_choices(
+                    "dummy_gemm_backend",
+                    context=context,
+                ),
+                [],
+            )
+        with config.patch(max_autotune=False, max_autotune_gemm=False):
+            self.assertEqual(
+                mm_kernel.get_backend_gemm_template_choices(
+                    "dummy_gemm_backend",
+                    context=context,
+                ),
+                [],
+            )
+        self.assertEqual(
+            mm_kernel.get_backend_gemm_template_choices(
+                "missing_gemm_backend",
+                context=context,
+            ),
+            [],
+        )
+
+    def test_register_gemm_template_provider_rejects_conflicting_duplicate(self):
+        def dummy_gemm_provider(context):
+            return ()
+
+        def other_dummy_gemm_provider(context):
+            return ()
+
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            mm_kernel.register_gemm_template_provider(
+                "dummy_gemm_backend", other_dummy_gemm_provider
+            )
+
+    def test_register_gemm_template_provider_rejects_invalid_name(self):
+        def dummy_gemm_provider(context):
+            return ()
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                mm_kernel.register_gemm_template_provider(
+                    name, dummy_gemm_provider
+                )
 
     def test_backend_wrapper_import_restores_async_compile_registration(self):
         with tempfile.TemporaryDirectory() as tmpdir:
