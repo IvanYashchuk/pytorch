@@ -3879,9 +3879,12 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
 
         if (has_tmpmask or has_rindex) and indexing.has_mask():
             if self._load_other:
-                other = f", other={constant_repr(self._load_other)}"
+                other_padding = self.codegen_load_padding(
+                    constant_repr(self._load_other), dtype
+                )
             else:
-                other = ", other=0.0"
+                other_padding = self.codegen_load_padding("0.0", dtype)
+            other = f", {other_padding}" if other_padding else ""
         else:
             other = ""
 
