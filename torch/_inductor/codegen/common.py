@@ -375,6 +375,7 @@ device_op_overrides_dict: dict[str, DeviceOpOverrides] = {}
 _device_op_overrides_initialized = False
 custom_backend_passes: dict[str, CustomGraphModulePass | None] = {}
 custom_backend_codegen_configs: dict[str, ConfigModule | None] = {}
+_backend_wrapper_imports: dict[str, list[str]] = {}
 
 
 def _validate_backend_name(kind: str, name: str) -> None:
@@ -457,6 +458,25 @@ def register_cuda_backend(
     ) is not None and existing is not device_scheduling:
         raise ValueError(f"CUDA backend {name!r} is already registered")
     _cuda_backends[name] = device_scheduling
+
+
+def register_backend_wrapper_import(name: str, import_code: str) -> None:
+    """
+    Register Python code emitted into generated wrappers for a backend.
+
+    Out-of-tree backends can use this to import their package and re-register
+    process-local hooks when a cached generated module is imported.
+    """
+    _validate_backend_name("wrapper import", name)
+    if not import_code.strip():
+        raise ValueError("wrapper import code must be non-empty")
+    imports = _backend_wrapper_imports.setdefault(name, [])
+    if import_code not in imports:
+        imports.append(import_code)
+
+
+def get_backend_wrapper_imports(name: str) -> tuple[str, ...]:
+    return tuple(_backend_wrapper_imports.get(name, ()))
 
 
 def _lookup_cuda_backend(name: str) -> SchedulingConstructor:

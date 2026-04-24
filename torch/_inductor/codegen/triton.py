@@ -6106,6 +6106,7 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
     ):
         wrapper = V.graph.wrapper_code
         wrapper.write_triton_header_once()
+        wrapper.write_backend_header_once(self.backend())
         _, call_args, _, arg_types = self.args.python_argdefs()
         self.add_numel_to_call_args(name, call_args, arg_types)
 
@@ -6709,6 +6710,7 @@ class TileKernelScheduling(SIMDScheduling):
 
         compile_wrapper = IndentedBuffer()
         backend_name = self.kernel_type.backend()
+        wrapper.write_backend_header_once(backend_name)
 
         if async_compile.use_process_pool():
             # The process pool is warm, we can shell out to workers right away. This

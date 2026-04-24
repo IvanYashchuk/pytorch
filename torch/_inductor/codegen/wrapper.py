@@ -68,6 +68,7 @@ from .common import (
     ArgName,
     CodeGen,
     DeferredLine,
+    get_backend_wrapper_imports,
     PythonPrinter,
     WorkspaceArg,
     WorkspaceZeroMode,
@@ -1492,6 +1493,15 @@ class PythonWrapperCodegen(CodeGen):
             )
         except (ImportError, AttributeError):
             pass
+
+    def write_backend_header_once(self, backend_name: str) -> None:
+        backend_headers_written = getattr(self, "_backend_headers_written", set())
+        if backend_name in backend_headers_written:
+            return
+        for import_code in get_backend_wrapper_imports(backend_name):
+            self.imports.splice(import_code, strip=True)
+        backend_headers_written.add(backend_name)
+        self._backend_headers_written = backend_headers_written
 
     @cache_on_self
     def write_triton_header_once(self) -> None:

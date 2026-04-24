@@ -1,6 +1,9 @@
 # Owner(s): ["module: inductor"]
 
+import sys
+import tempfile
 from unittest import mock
+from pathlib import Path
 
 import torch
 from torch._inductor import config
@@ -28,6 +31,7 @@ class BackendExtensionAPITests(TestCase):
         common._cuda_backends.pop("dummy_cuda_backend", None)
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
         common._dtype_propagation_backends.pop("dummy_dtype_backend", None)
+        common._backend_wrapper_imports.pop("dummy_wrapper_backend", None)
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -86,6 +90,70 @@ class BackendExtensionAPITests(TestCase):
         for name in ("", "not-valid", "class"):
             with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
                 common.register_cuda_backend(name, DummyCudaScheduling)
+
+    def test_register_backend_wrapper_import(self):
+        common.register_backend_wrapper_import(
+            "dummy_wrapper_backend", "import dummy_backend"
+        )
+        common.register_backend_wrapper_import(
+            "dummy_wrapper_backend", "import dummy_backend"
+        )
+        common.register_backend_wrapper_import(
+            "dummy_wrapper_backend", "dummy_backend.register()"
+        )
+
+        self.assertEqual(
+            common.get_backend_wrapper_imports("dummy_wrapper_backend"),
+            ("import dummy_backend", "dummy_backend.register()"),
+        )
+
+    def test_register_backend_wrapper_import_rejects_invalid_input(self):
+        with self.assertRaisesRegex(ValueError, "valid Python identifier"):
+            common.register_backend_wrapper_import("not-valid", "import dummy")
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            common.register_backend_wrapper_import("dummy_wrapper_backend", " ")
+
+    def test_backend_wrapper_import_restores_async_compile_registration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            package_path = Path(tmpdir) / "dummy_backend_package.py"
+            package_path.write_text(
+                "\n".join(
+                    [
+                        "from torch._inductor.async_compile import register_async_compile_backend",
+                        "",
+                        "def compile_dummy(self, kernel_name, source_code):",
+                        "    return kernel_name, source_code",
+                        "",
+                        "register_async_compile_backend('dummy_async_backend', compile_dummy)",
+                    ]
+                )
+            )
+
+            sys.path.insert(0, tmpdir)
+            try:
+                common.register_backend_wrapper_import(
+                    "dummy_wrapper_backend", "import dummy_backend_package"
+                )
+                _async_compile_backends.pop("dummy_async_backend", None)
+                if hasattr(AsyncCompile, "dummy_async_backend"):
+                    delattr(AsyncCompile, "dummy_async_backend")
+                sys.modules.pop("dummy_backend_package", None)
+
+                source = "\n".join(
+                    [
+                        "from torch._inductor.async_compile import AsyncCompile",
+                        *common.get_backend_wrapper_imports("dummy_wrapper_backend"),
+                        "async_compile = AsyncCompile()",
+                        "compiled = async_compile.dummy_async_backend('kernel', 'source')",
+                    ]
+                )
+                namespace: dict[str, object] = {}
+                exec(source, namespace)
+
+                self.assertEqual(namespace["compiled"], ("kernel", "source"))
+            finally:
+                sys.path.remove(tmpdir)
+                sys.modules.pop("dummy_backend_package", None)
 
     def test_unknown_cuda_backend_has_actionable_error(self):
         common.init_backend_registration()
