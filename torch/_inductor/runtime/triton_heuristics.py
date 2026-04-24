@@ -3210,7 +3210,7 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
-def _prepare_pointwise(
+def prepare_pointwise_configs(
     size_hints,
     triton_meta,
     tile_hint=None,
@@ -3384,6 +3384,24 @@ def _prepare_pointwise(
     return configs, size_hints, inductor_meta
 
 
+def _prepare_pointwise(
+    size_hints,
+    triton_meta,
+    tile_hint=None,
+    filename=None,
+    min_elem_per_thread=0,
+    inductor_meta=None,
+):
+    return prepare_pointwise_configs(
+        size_hints,
+        triton_meta,
+        tile_hint=tile_hint,
+        filename=filename,
+        min_elem_per_thread=min_elem_per_thread,
+        inductor_meta=inductor_meta,
+    )
+
+
 def pointwise(
     size_hints,
     triton_meta,
@@ -3396,7 +3414,7 @@ def pointwise(
     """
     Construct @triton.heuristics() based on size_hints.
     """
-    configs, size_hints, inductor_meta = _prepare_pointwise(
+    configs, size_hints, inductor_meta = prepare_pointwise_configs(
         size_hints,
         triton_meta,
         tile_hint=tile_hint,
@@ -3898,7 +3916,7 @@ def filter_reduction_configs_for_determinism(
     return configs
 
 
-def _prepare_reduction(
+def prepare_reduction_configs(
     size_hints,
     reduction_hint=False,
     triton_meta=None,
@@ -3946,6 +3964,22 @@ def _prepare_reduction(
     return configs, size_hints, inductor_meta
 
 
+def _prepare_reduction(
+    size_hints,
+    reduction_hint=False,
+    triton_meta=None,
+    filename=None,
+    inductor_meta=None,
+):
+    return prepare_reduction_configs(
+        size_hints,
+        reduction_hint=reduction_hint,
+        triton_meta=triton_meta,
+        filename=filename,
+        inductor_meta=inductor_meta,
+    )
+
+
 def reduction(
     size_hints,
     reduction_hint=False,
@@ -3955,7 +3989,7 @@ def reduction(
     return_configs=False,
 ):
     """args to @triton.heuristics()"""
-    configs, size_hints, inductor_meta = _prepare_reduction(
+    configs, size_hints, inductor_meta = prepare_reduction_configs(
         size_hints,
         reduction_hint=reduction_hint,
         triton_meta=triton_meta,
@@ -4157,15 +4191,20 @@ def _persistent_reduction_configs(
     return configs
 
 
-def persistent_reduction(
+def prepare_persistent_reduction_configs(
     size_hints,
     reduction_hint=False,
     triton_meta=None,
     filename=None,
     inductor_meta=None,
-    return_configs=False,
 ):
-    """Generate persistent reductions + mix-order if available"""
+    """
+    Common persistent reduction heuristic setup shared by tile backends.
+
+    Returns ``(configs, size_hints, inductor_meta)``. ``size_hints`` is ``None``
+    for combo-kernel per-subkernel configs to preserve the existing autotune
+    cache behavior.
+    """
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
     if inductor_meta.get("no_x_dim"):
@@ -4179,14 +4218,7 @@ def persistent_reduction(
         reduction_hint=reduction_hint,
     )
     if configs is not None:
-        return cached_autotune(
-            None,
-            configs,
-            triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
-            heuristic_type=HeuristicType.PERSISTENT_REDUCTION,
-            filename=filename,
-        )
+        return configs, None, inductor_meta
 
     configs = _persistent_reduction_configs(
         size_hints, reduction_hint, inductor_meta, triton_meta
@@ -4263,6 +4295,25 @@ def persistent_reduction(
         configs = unique_configs(new_configs)
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    return configs, size_hints, inductor_meta
+
+
+def persistent_reduction(
+    size_hints,
+    reduction_hint=False,
+    triton_meta=None,
+    filename=None,
+    inductor_meta=None,
+    return_configs=False,
+):
+    """Generate persistent reductions + mix-order if available"""
+    configs, size_hints, inductor_meta = prepare_persistent_reduction_configs(
+        size_hints,
+        reduction_hint=reduction_hint,
+        triton_meta=triton_meta,
+        filename=filename,
+        inductor_meta=inductor_meta,
+    )
 
     if return_configs:
         return configs

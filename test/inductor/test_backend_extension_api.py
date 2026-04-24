@@ -507,7 +507,77 @@ class BackendExtensionAPITests(TestCase):
             with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
                 common.register_dtype_propagation_backend(name)
 
-    def test_reduction_heuristic_uses_shared_prepare(self):
+    def test_tile_heuristic_prepare_symbols_are_public(self):
+        for name in (
+            "prepare_pointwise_configs",
+            "prepare_reduction_configs",
+            "prepare_persistent_reduction_configs",
+        ):
+            self.assertTrue(callable(getattr(triton_heuristics, name)))
+
+        with mock.patch.object(
+            triton_heuristics,
+            "prepare_pointwise_configs",
+            return_value="pointwise",
+        ):
+            self.assertEqual(
+                triton_heuristics._prepare_pointwise({"x": 1}, {"signature": {}}),
+                "pointwise",
+            )
+
+        with mock.patch.object(
+            triton_heuristics,
+            "prepare_reduction_configs",
+            return_value="reduction",
+        ):
+            self.assertEqual(
+                triton_heuristics._prepare_reduction(
+                    {"x": 1, "r0_": 1}, triton_meta={"signature": {}}
+                ),
+                "reduction",
+            )
+
+    def test_pointwise_heuristic_uses_public_prepare(self):
+        configs = [Config({"XBLOCK": 1})]
+        inductor_meta = {"kernel_name": "dummy"}
+        triton_meta = {"signature": {}}
+
+        with (
+            mock.patch.object(
+                triton_heuristics,
+                "prepare_pointwise_configs",
+                return_value=(configs, {"x": 1}, inductor_meta),
+            ) as prepare,
+            mock.patch.object(
+                triton_heuristics, "cached_autotune", return_value="decorator"
+            ) as cached_autotune,
+        ):
+            result = triton_heuristics.pointwise(
+                {"x": 1},
+                triton_meta=triton_meta,
+                filename="dummy.py",
+                inductor_meta=inductor_meta,
+            )
+
+        self.assertEqual(result, "decorator")
+        prepare.assert_called_once_with(
+            {"x": 1},
+            triton_meta,
+            tile_hint=None,
+            filename="dummy.py",
+            min_elem_per_thread=0,
+            inductor_meta=inductor_meta,
+        )
+        cached_autotune.assert_called_once_with(
+            {"x": 1},
+            configs,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            heuristic_type=HeuristicType.POINTWISE,
+            filename="dummy.py",
+        )
+
+    def test_reduction_heuristic_uses_public_prepare(self):
         configs = [Config({"XBLOCK": 1, "R0_BLOCK": 1})]
         inductor_meta = {"kernel_name": "dummy"}
         triton_meta = {"signature": {}}
@@ -515,7 +585,7 @@ class BackendExtensionAPITests(TestCase):
         with (
             mock.patch.object(
                 triton_heuristics,
-                "_prepare_reduction",
+                "prepare_reduction_configs",
                 return_value=(configs, {"x": 1, "r0_": 1}, inductor_meta),
             ) as prepare,
             mock.patch.object(
@@ -545,6 +615,46 @@ class BackendExtensionAPITests(TestCase):
             inductor_meta=inductor_meta,
             heuristic_type=HeuristicType.REDUCTION,
             filename="dummy.py",
+        )
+
+    def test_persistent_reduction_heuristic_uses_public_prepare(self):
+        configs = [Config({"XBLOCK": 1})]
+        inductor_meta = {"kernel_name": "dummy"}
+        triton_meta = {"signature": {}}
+
+        with (
+            mock.patch.object(
+                triton_heuristics,
+                "prepare_persistent_reduction_configs",
+                return_value=(configs, None, inductor_meta),
+            ) as prepare,
+            mock.patch.object(
+                triton_heuristics, "cached_autotune", return_value="decorator"
+            ) as cached_autotune,
+        ):
+            result = triton_heuristics.persistent_reduction(
+                {"x": 1, "r0_": 1},
+                reduction_hint=False,
+                triton_meta=triton_meta,
+                filename="dummy.py",
+                inductor_meta=inductor_meta,
+            )
+
+        self.assertEqual(result, "decorator")
+        prepare.assert_called_once_with(
+            {"x": 1, "r0_": 1},
+            reduction_hint=False,
+            triton_meta=triton_meta,
+            filename="dummy.py",
+            inductor_meta=inductor_meta,
+        )
+        cached_autotune.assert_called_once_with(
+            None,
+            configs,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            filename="dummy.py",
+            heuristic_type=HeuristicType.PERSISTENT_REDUCTION,
         )
 
     def test_register_kernel_metadata_provider(self):
