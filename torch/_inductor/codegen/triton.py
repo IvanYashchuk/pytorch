@@ -2902,6 +2902,9 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
     ) -> str:
         raise NotImplementedError
 
+    def codegen_bool_load_cast(self, line: str) -> str:
+        raise NotImplementedError
+
     def codegen_store(
         self, name: str, var: str, index: str, value: str, mask: str | None = None
     ) -> str:
@@ -3975,7 +3978,7 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
                 # Workaround for https://github.com/triton-lang/triton/issues/2151
                 # tl.load returns int8 when loading from pointer to int1
                 # NOTE: Currently causes hangs on bool UTs for ROCm
-                line += ".to(tl.int1)"
+                line = self.codegen_bool_load_cast(line)
                 dtype = torch.bool
 
         load_buffer = self.get_load_buffer(indexing)
@@ -6465,6 +6468,9 @@ class TritonKernel(TileKernel):
         self, value: Any, dtype: torch.dtype | None = None
     ) -> str:
         return f"other={value}" if value is not None else ""
+
+    def codegen_bool_load_cast(self, line: str) -> str:
+        return f"{line}.to(tl.int1)"
 
     def codegen_store(
         self, name: str, var: str, index: str, value: str, mask: str | None = None

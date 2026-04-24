@@ -309,6 +309,12 @@ class BackendExtensionAPITests(TestCase):
         self.assertIs(TritonScheduling.kernel_type, TritonKernel)
         self.assertEqual(TritonKernel.backend(), "triton")
 
+    def test_triton_bool_load_cast_is_backend_hook(self):
+        kernel = TritonKernel.__new__(TritonKernel)
+
+        self.assertTrue(hasattr(TileKernel, "codegen_bool_load_cast"))
+        self.assertEqual(kernel.codegen_bool_load_cast("tmp0"), "tmp0.to(tl.int1)")
+
     def test_register_constexpr_syntax(self):
         self.assertEqual(
             common.ArgName("BLOCK", is_constexpr=True).full_name(),
