@@ -234,6 +234,8 @@ class TestStandaloneInductor(TestCase):
     def test_inductor_cpp_prefix_header_precompiles_from_source_tree(self):
         if _IS_WINDOWS:
             self.skipTest("CppBuilder does not support precompiled headers on Windows")
+        if not inductor.config.cpp_cache_precompile_headers:
+            self.skipTest("Inductor C++ precompiled headers are disabled")
 
         header = _get_cpp_prefix_header("cpu")
         self.assertIsNotNone(header)
@@ -242,12 +244,13 @@ class TestStandaloneInductor(TestCase):
             name="o", sources="i.cpp", BuildOption=build_option
         ).get_command_line()
 
-        _precompile_header(
+        precompiled_header = _precompile_header(
             header,
             cmd_line,
             device_type="cpu",
             vec_isa=pick_vec_isa(),
         )
+        self.assertTrue(os.path.exists(precompiled_header), precompiled_header)
 
 
 if __name__ == "__main__":
