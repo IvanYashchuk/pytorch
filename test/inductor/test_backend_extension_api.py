@@ -12,6 +12,7 @@ from torch._inductor.async_compile import (
 )
 from torch._inductor.codegen import common
 from torch._inductor.codegen.cuda_combined_scheduling import CUDACombinedScheduling
+from torch._inductor.codegen.triton import TritonScheduling
 
 
 class BackendExtensionAPITests(unittest.TestCase):
@@ -102,6 +103,19 @@ class BackendExtensionAPITests(unittest.TestCase):
             register_async_compile_backend(
                 "dummy_async_backend", other_dummy_async_backend
             )
+
+    def test_cuda_combined_scheduling_kernel_scheduler_is_overridable(self):
+        class DummyKernelScheduling(TritonScheduling):
+            pass
+
+        class DummyCombinedScheduling(CUDACombinedScheduling):
+            kernel_scheduling_class = DummyKernelScheduling
+
+        scheduling = DummyCombinedScheduling(None)
+
+        self.assertIsInstance(
+            scheduling._kernel_scheduling, DummyKernelScheduling
+        )
 
 
 if __name__ == "__main__":

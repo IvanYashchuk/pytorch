@@ -41,16 +41,18 @@ class CUDACombinedScheduling(BaseScheduling):
     this would also be the place to do it.
     """
 
+    kernel_scheduling_class: type[BaseScheduling] = TritonScheduling
+
     def __init__(self, scheduler: Scheduler | None) -> None:
         super().__init__(scheduler)
-        self._triton_scheduling = TritonScheduling(scheduler)
+        self._kernel_scheduling = self.kernel_scheduling_class(scheduler)
         self._cutlass_scheduling = CUTLASSScheduling(scheduler)
         self._rocm_cpp_scheduling = ROCmCPPScheduling(scheduler)
         self._cutedsl_scheduling = CuteDSLScheduling(scheduler)
         self._nv_universal_gemm_scheduling = NVUniversalGemmScheduling(scheduler)
 
     def get_backend_features(self, device: torch.device) -> OrderedSet[BackendFeature]:
-        return self._triton_scheduling.get_backend_features(device)
+        return self._kernel_scheduling.get_backend_features(device)
 
     def choose_node_backend(self, node: BaseSchedulerNode) -> BaseScheduling:
         if self._cutlass_scheduling.is_cutlass_template(node):
@@ -61,7 +63,7 @@ class CUDACombinedScheduling(BaseScheduling):
             return self._cutedsl_scheduling
         if self._nv_universal_gemm_scheduling.is_nv_universal_gemm_template(node):
             return self._nv_universal_gemm_scheduling
-        return self._triton_scheduling
+        return self._kernel_scheduling
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -82,7 +84,7 @@ class CUDACombinedScheduling(BaseScheduling):
             node1
         ) or self._nv_universal_gemm_scheduling.is_nv_universal_gemm_template(node2):
             return False
-        return self._triton_scheduling.can_fuse_vertical(node1, node2)
+        return self._kernel_scheduling.can_fuse_vertical(node1, node2)
 
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -100,12 +102,12 @@ class CUDACombinedScheduling(BaseScheduling):
                 return self._nv_universal_gemm_scheduling.can_fuse_horizontal(
                     node1, node2
                 )  # always False at the moment
-        return self._triton_scheduling.can_fuse_horizontal(node1, node2)
+        return self._kernel_scheduling.can_fuse_horizontal(node1, node2)
 
     def group_fn(
         self, sizes: Sequence[Sequence[_IntLike]]
     ) -> tuple[tuple[_IntLike, ...], ...]:
-        return self._triton_scheduling.group_fn(sizes)
+        return self._kernel_scheduling.group_fn(sizes)
 
     def codegen_template(
         self,
@@ -141,32 +143,32 @@ class CUDACombinedScheduling(BaseScheduling):
                 template_node, epilogue_nodes, prologue_nodes
             )
         else:
-            return self._triton_scheduling.codegen_template(
+            return self._kernel_scheduling.codegen_template(
                 template_node, epilogue_nodes, prologue_nodes
             )
 
     def codegen_mix_order_reduction(self, node):
-        return self._triton_scheduling.codegen_mix_order_reduction(node)
+        return self._kernel_scheduling.codegen_mix_order_reduction(node)
 
     def codegen_node(self, node: FusedSchedulerNode | SchedulerNode) -> None:
-        return self._triton_scheduling.codegen_node(node)
+        return self._kernel_scheduling.codegen_node(node)
 
     def codegen_sync(self) -> None:
-        return self._triton_scheduling.codegen_sync()
+        return self._kernel_scheduling.codegen_sync()
 
     def flush(self) -> None:
-        return self._triton_scheduling.flush()
+        return self._kernel_scheduling.flush()
 
     def codegen_combo_kernel(self, *args: Any, **kwargs: Any) -> None:
-        return self._triton_scheduling.codegen_combo_kernel(*args, **kwargs)
+        return self._kernel_scheduling.codegen_combo_kernel(*args, **kwargs)
 
     def benchmark_fused_nodes(
         self, nodes: Sequence[BaseSchedulerNode]
     ) -> tuple[float, str]:
-        return self._triton_scheduling.benchmark_fused_nodes(nodes)
+        return self._kernel_scheduling.benchmark_fused_nodes(nodes)
 
     def benchmark_codegened_module(self, module):
-        return self._triton_scheduling.benchmark_codegened_module(module)
+        return self._kernel_scheduling.benchmark_codegened_module(module)
 
     def generate_kernel_code_from_nodes(
         self,
@@ -174,13 +176,13 @@ class CUDACombinedScheduling(BaseScheduling):
         benchmark_kernel: bool = False,
         hint_override: int | None = None,
     ) -> str:
-        return self._triton_scheduling.generate_kernel_code_from_nodes(
+        return self._kernel_scheduling.generate_kernel_code_from_nodes(
             nodes, benchmark_kernel, hint_override=hint_override
         )
 
     def benchmark_combo_kernel(
         self, node_list: Sequence[BaseSchedulerNode], node_benchmark_results
     ) -> tuple[float, float, list[str | None]]:
-        return self._triton_scheduling.benchmark_combo_kernel(
+        return self._kernel_scheduling.benchmark_combo_kernel(
             node_list, node_benchmark_results
         )
