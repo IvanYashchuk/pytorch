@@ -2,11 +2,12 @@
 
 import sys
 import tempfile
+from types import ModuleType
 from unittest import mock
 from pathlib import Path
 
 import torch
-from torch._inductor import config
+from torch._inductor import config, metrics, wrapper_benchmark
 from torch._inductor.async_compile import (
     _async_compile_backends,
     AsyncCompile,
@@ -32,6 +33,10 @@ class BackendExtensionAPITests(TestCase):
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
         common._dtype_propagation_backends.pop("dummy_dtype_backend", None)
         common._backend_wrapper_imports.pop("dummy_wrapper_backend", None)
+        metrics._kernel_metadata_providers.pop("dummy_metrics_backend", None)
+        wrapper_benchmark._kernel_benchmark_providers.pop(
+            "dummy_benchmark_backend", None
+        )
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -325,6 +330,75 @@ class BackendExtensionAPITests(TestCase):
             heuristic_type=HeuristicType.REDUCTION,
             filename="dummy.py",
         )
+
+    def test_register_kernel_metadata_provider(self):
+        row = {
+            "kernel_name": "dummy_kernel",
+            "kernel_path": "dummy.py",
+            "kernel_category": "pointwise",
+            "size_hints": "{'x': 16}",
+            "reduction_hint": None,
+            "line_of_code": 1,
+            "num_load": 1,
+            "num_store": 1,
+            "num_for_loop": 0,
+            "num_atomic_add": 0,
+            "num_args": 2,
+            "xnumel": 16,
+            "ynumel": None,
+            "rnumel": None,
+            "kernel_args_num_gb": None,
+        }
+
+        def provider(kernel_name, kernel_path, kernel_module_code, kernel_category):
+            self.assertEqual(kernel_name, "dummy_kernel")
+            self.assertEqual(kernel_path, "dummy.py")
+            self.assertEqual(kernel_module_code, "dummy source")
+            self.assertEqual(kernel_category, "unknown")
+            return row
+
+        metrics.register_kernel_metadata_provider("dummy_metrics_backend", provider)
+        metrics.register_kernel_metadata_provider("dummy_metrics_backend", provider)
+
+        with mock.patch.object(
+            metrics.get_metric_table("kernel_metadata"), "add_row"
+        ) as add_row:
+            metrics.log_kernel_metadata("dummy_kernel", "dummy.py", "dummy source")
+
+        add_row.assert_called_once()
+        self.assertEqual(add_row.call_args.args[0](), row)
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            metrics.register_kernel_metadata_provider(
+                "dummy_metrics_backend", lambda *args: None
+            )
+
+    def test_register_kernel_benchmark_provider(self):
+        mod = ModuleType("dummy_module")
+        info = wrapper_benchmark.KernelBenchmarkInfo(
+            kernel=object(),
+            device_type="cuda",
+            arg_names=["in_ptr0", "out_ptr0"],
+            category="pointwise",
+            num_gb=1.0,
+        )
+
+        def provider(candidate):
+            return info if candidate is mod else None
+
+        wrapper_benchmark.register_kernel_benchmark_provider(
+            "dummy_benchmark_backend", provider
+        )
+        wrapper_benchmark.register_kernel_benchmark_provider(
+            "dummy_benchmark_backend", provider
+        )
+
+        self.assertIs(wrapper_benchmark.get_kernel_benchmark_info(mod), info)
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            wrapper_benchmark.register_kernel_benchmark_provider(
+                "dummy_benchmark_backend", lambda candidate: None
+            )
 
 
 if __name__ == "__main__":

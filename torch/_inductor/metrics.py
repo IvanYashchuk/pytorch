@@ -5,6 +5,7 @@ import dataclasses
 import inspect
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -16,8 +17,6 @@ from torch.utils._ordered_set import OrderedSet
 
 # Prevent circular import
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from torch._inductor.runtime.triton_compat import Config
     from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -137,6 +136,35 @@ class CachedMetricsHelper:
 
 
 REGISTERED_METRIC_TABLES: dict[str, MetricTable] = {}
+
+KernelMetadataProvider = Callable[
+    [str, str, str, str], dict[str, str | float | None] | None
+]
+_kernel_metadata_providers: dict[str, KernelMetadataProvider] = {}
+
+
+def _validate_backend_name(name: str) -> None:
+    if not name:
+        raise ValueError("Backend name must be non-empty")
+    if not name.isidentifier():
+        raise ValueError(f"Backend name must be a valid Python identifier: {name!r}")
+
+
+def register_kernel_metadata_provider(
+    backend: str, provider: KernelMetadataProvider
+) -> None:
+    """
+    Register backend-specific row extraction for the ``kernel_metadata`` table.
+
+    Providers receive ``(kernel_name, kernel_path, kernel_module_code,
+    kernel_category)`` and should return a complete row dictionary, or ``None``
+    when the module is not owned by that backend.
+    """
+    _validate_backend_name(backend)
+    existing = _kernel_metadata_providers.get(backend)
+    if existing is not None and existing is not provider:
+        raise ValueError(f"Kernel metadata provider {backend!r} is already registered")
+    _kernel_metadata_providers[backend] = provider
 
 
 @dataclass
@@ -310,7 +338,7 @@ def _parse_size_hints(kernel_module_code: str, kernel_category: str) -> str | No
     if kernel_category == "foreach":
         # foreach kernel does not have size_hints
         return None
-    m = re.search(r"size_hints=(\[[0-9, ]*\]),", kernel_module_code)
+    m = re.search(r"size_hints=({[^}]*}|\[[0-9, ]*\]|None),", kernel_module_code)
     assert m, "size_hints missing!"
     return m.group(1)
 
@@ -386,6 +414,12 @@ def log_kernel_metadata(
     from .wrapper_benchmark import get_kernel_category_by_source_code
 
     kernel_category = get_kernel_category_by_source_code(kernel_module_code)
+    for provider in _kernel_metadata_providers.values():
+        row = provider(kernel_name, kernel_path, kernel_module_code, kernel_category)
+        if row is not None:
+            get_metric_table("kernel_metadata").add_row(lambda: row)
+            return
+
     reduction_hint = _parse_reduction_hint(kernel_category, kernel_module_code)
     size_hints = _parse_size_hints(kernel_module_code, kernel_category)
     kernel_fn_code = _parse_kernel_fn_code(kernel_module_code)

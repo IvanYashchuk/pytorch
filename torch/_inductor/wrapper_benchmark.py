@@ -5,7 +5,7 @@ import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Pattern, Protocol
+from typing import Any, Callable, Pattern, Protocol
 
 import torch
 from torch.autograd import DeviceType
@@ -19,6 +19,19 @@ class BenchmarkCallableType(Protocol):
     def __call__(self, times: int, repeat: int) -> float: ...
 
 
+@dataclass(frozen=True)
+class KernelBenchmarkInfo:
+    kernel: Any
+    device_type: str
+    arg_names: list[str]
+    category: str
+    num_gb: float | None = None
+    launcher: Any | None = None
+
+
+KernelBenchmarkProvider = Callable[[ModuleType], KernelBenchmarkInfo | None]
+
+
 _kernel_category_choices = [
     "foreach",
     "persistent_reduction",
@@ -27,6 +40,33 @@ _kernel_category_choices = [
     "split_scan",
     "template",
 ]
+
+_kernel_benchmark_providers: dict[str, KernelBenchmarkProvider] = {}
+
+
+def _validate_backend_name(name: str) -> None:
+    if not name:
+        raise ValueError("Backend name must be non-empty")
+    if not name.isidentifier():
+        raise ValueError(f"Backend name must be a valid Python identifier: {name!r}")
+
+
+def register_kernel_benchmark_provider(
+    backend: str, provider: KernelBenchmarkProvider
+) -> None:
+    """
+    Register backend-specific generated-kernel discovery for wrapper benchmarks.
+
+    Providers should return ``None`` when a module does not contain their
+    backend's kernel. This keeps Triton as the built-in default while allowing
+    out-of-tree backends to make ``output_code.py --benchmark-kernels`` work
+    without PyTorch importing backend-specific runtime classes.
+    """
+    _validate_backend_name(backend)
+    existing = _kernel_benchmark_providers.get(backend)
+    if existing is not None and existing is not provider:
+        raise ValueError(f"Kernel benchmark provider {backend!r} is already registered")
+    _kernel_benchmark_providers[backend] = provider
 _kernel_category_source_patterns: list[tuple[Pattern[str], str]] = [
     (re.compile(re.escape(f"@triton_heuristics.{choice}")), choice)
     for choice in _kernel_category_choices
@@ -99,6 +139,37 @@ def get_triton_kernel(mod: ModuleType):  # type: ignore[no-untyped-def]
     return cand_list[0]
 
 
+def _get_triton_kernel_benchmark_info(
+    mod: ModuleType,
+) -> KernelBenchmarkInfo | None:
+    try:
+        triton_kernel = get_triton_kernel(mod)
+    except AssertionError:
+        return None
+    launcher = (
+        triton_kernel.launchers[0] if len(triton_kernel.launchers) == 1 else None
+    )
+    return KernelBenchmarkInfo(
+        kernel=triton_kernel,
+        device_type=triton_kernel.device_props.type,
+        arg_names=list(triton_kernel.fn.arg_names),
+        category=get_kernel_category(mod),
+        num_gb=triton_kernel.inductor_meta.get("kernel_num_gb", None),
+        launcher=launcher,
+    )
+
+
+def get_kernel_benchmark_info(mod: ModuleType) -> KernelBenchmarkInfo:
+    for provider in _kernel_benchmark_providers.values():
+        info = provider(mod)
+        if info is not None:
+            return info
+
+    info = _get_triton_kernel_benchmark_info(mod)
+    assert info is not None
+    return info
+
+
 def benchmark_all_kernels(
     benchmark_name: str, benchmark_all_configs: dict[Any, Any] | None
 ) -> None:
@@ -119,18 +190,16 @@ def benchmark_all_kernels(
         if not hasattr(kernel_mod, "get_args") or not hasattr(kernel_mod, "call"):
             continue
 
-        triton_kernel = get_triton_kernel(kernel_mod)
-        device_type = triton_kernel.device_props.type
-        kernel_category = get_kernel_category(kernel_mod)
+        kernel_info = get_kernel_benchmark_info(kernel_mod)
         args = kernel_mod.get_args()
         num_in_out_ptrs = len(
             [
                 arg_name
-                for arg_name in triton_kernel.fn.arg_names
+                for arg_name in kernel_info.arg_names
                 if arg_name.startswith("in_out_ptr")
             ]
         )
-        num_gb = triton_kernel.inductor_meta.get("kernel_num_gb", None)
+        num_gb = kernel_info.num_gb
         if num_gb is None:
             num_gb = get_num_bytes(*args, num_in_out_args=num_in_out_ptrs) / 1e9
 
@@ -154,7 +223,7 @@ def benchmark_all_kernels(
             )
 
         kernel_desc = (
-            f"{benchmark_name:20} {kernel_category[:3].upper()} {kernel_key[:10]}"
+            f"{benchmark_name:20} {kernel_info.category[:3].upper()} {kernel_key[:10]}"
         )
         if benchmark_all_configs:
             assert hasattr(kernel_mod, "benchmark_all_configs")
@@ -167,19 +236,16 @@ def benchmark_all_kernels(
         else:
             ms = benchmarker.benchmark(
                 lambda: kernel_mod.call(args),
-                device=device_type,
+                device=kernel_info.device_type,
                 rep=40,
             )
-            assert len(triton_kernel.launchers) == 1, (
-                "Autotuner should have selected the best config"
-            )
-            launcher = triton_kernel.launchers[0]
+            launcher = kernel_info.launcher
             print(
                 get_info_str(
                     ms,
-                    launcher.n_regs,
-                    launcher.n_spills,
-                    launcher.shared,
+                    getattr(launcher, "n_regs", None),
+                    getattr(launcher, "n_spills", None),
+                    getattr(launcher, "shared", None),
                     prefix=f"{kernel_desc} ",
                 )
             )
