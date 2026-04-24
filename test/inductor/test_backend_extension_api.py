@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 
+import contextlib
+import os
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -7,7 +9,7 @@ from unittest import mock
 from pathlib import Path
 
 import torch
-from torch._inductor import config, metrics, wrapper_benchmark
+from torch._inductor import config, metrics, select_algorithm, wrapper_benchmark
 from torch._inductor.async_compile import (
     _async_compile_backends,
     AsyncCompile,
@@ -35,6 +37,45 @@ from torch.utils._ordered_set import OrderedSet
 
 
 class BackendExtensionAPITests(TestCase):
+    class _FakeBuffer:
+        def __init__(
+            self,
+            size,
+            *,
+            dtype=torch.float32,
+            device=torch.device("cuda"),
+        ):
+            self._size = list(size)
+            self._dtype = dtype
+            self._device = device
+
+        def get_dtype(self):
+            return self._dtype
+
+        def get_device(self):
+            return self._device
+
+        def get_size(self):
+            return self._size
+
+        def get_stride(self):
+            stride = []
+            running = 1
+            for size in reversed(self._size):
+                stride.append(running)
+                running *= size
+            return list(reversed(stride))
+
+    class _DummyChoice:
+        def __init__(self, name, description=""):
+            self.name = name
+            self.description = description
+            self.annotations = {}
+            self.failed = False
+
+        def output_node(self):
+            return f"{self.name}_node"
+
     def tearDown(self):
         common._cuda_backends.pop("dummy_cuda_backend", None)
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
@@ -50,6 +91,141 @@ class BackendExtensionAPITests(TestCase):
             delattr(AsyncCompile, "dummy_async_backend")
         common.init_backend_registration.cache_clear()
         super().tearDown()
+
+    def _run_tuned_mm_provider_harness(
+        self,
+        *,
+        is_nonzero=True,
+        out_dtype=None,
+        input_dtype=torch.float32,
+        active_backend="dummy_gemm_backend",
+        max_autotune=False,
+        max_autotune_gemm=True,
+        max_autotune_gemm_backends="DUMMY_GEMM_BACKEND",
+        enable_autoheuristic=False,
+        template_config_returns=(),
+        selector=None,
+    ):
+        class FakeChoices:
+            def __init__(self, returns):
+                self.returns = list(returns)
+
+            def get_template_configs(self, *args, **kwargs):
+                if self.returns:
+                    return self.returns.pop(0)
+                return []
+
+        mat1 = self._FakeBuffer([16, 32], dtype=input_dtype)
+        mat2 = self._FakeBuffer([32, 8], dtype=input_dtype)
+        layout = SimpleNamespace(
+            device=torch.device("cuda"),
+            dtype=out_dtype or input_dtype,
+        )
+
+        if selector is None:
+
+            def selector(name, choices, input_nodes, layout, **kwargs):
+                return "selected_node", None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                config.patch(
+                    cuda_backend=active_backend,
+                    max_autotune=max_autotune,
+                    max_autotune_gemm=max_autotune_gemm,
+                    max_autotune_gemm_backends=max_autotune_gemm_backends,
+                    remote_gemm_autotune_cache=False,
+                )
+            )
+            stack.enter_context(
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "TORCHINDUCTOR_AUTOHEURISTIC_USE": "mm"
+                        if enable_autoheuristic
+                        else "",
+                        "TORCHINDUCTOR_AUTOHEURISTIC_COLLECT": "",
+                    },
+                )
+            )
+            stack.enter_context(
+                mm_kernel.V.set_choices_handler(FakeChoices(template_config_returns))
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_native_matmul", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "mm_args",
+                    return_value=(16, 8, 32, layout, mat1, mat2),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "_is_static_problem",
+                    return_value=(True, is_nonzero),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_aten_gemm_kernels", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "use_triton_template",
+                    return_value=enable_autoheuristic,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_decompose_k_choice", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "use_triton_blackwell_tma_template",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_triton_tma_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_cutlass_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_ck_gemm_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel, "use_ck_tile_gemm_template", return_value=False
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel, "use_nv_universal_gemm_template", return_value=False
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_cpp_gemm_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel.distributed_autotune,
+                    "maybe_autotune_remote",
+                    return_value=None,
+                )
+            )
+            stack.enter_context(mock.patch.object(mm_kernel, "is_triton", return_value=True))
+            stack.enter_context(mock.patch.object(mm_kernel, "mm_autoheuristic", return_value=[]))
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "autotune_select_algorithm", selector)
+            )
+
+            return mm_kernel.tuned_mm.__wrapped__(
+                mat1, mat2, out_dtype=out_dtype
+            )
 
     def test_register_cuda_backend_before_init(self):
         class DummyCudaScheduling(CUDACombinedScheduling):
@@ -308,6 +484,197 @@ class BackendExtensionAPITests(TestCase):
             ),
             [],
         )
+
+    def test_tuned_mm_gemm_provider_choice_reaches_selection(self):
+        provider_choice = self._DummyChoice("dummy_provider", "provider")
+        ah_choice = self._DummyChoice("autoheuristic", "autoheuristic")
+        provider_contexts = []
+        selector_choices = []
+
+        def dummy_gemm_provider(context):
+            provider_contexts.append(context)
+            return [provider_choice]
+
+        def selector(name, choices, input_nodes, layout, **kwargs):
+            selector_choices.extend(choices)
+            return choices[-1].output_node(), choices[-1]
+
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+
+        result = self._run_tuned_mm_provider_harness(
+            enable_autoheuristic=True,
+            template_config_returns=([], [ah_choice]),
+            selector=selector,
+        )
+
+        self.assertEqual(result, "dummy_provider_node")
+        self.assertEqual(selector_choices, [provider_choice])
+        self.assertEqual(len(provider_contexts), 1)
+        context = provider_contexts[0]
+        self.assertEqual(context.op_name, "mm")
+        self.assertEqual(context.m, 16)
+        self.assertEqual(context.n, 8)
+        self.assertEqual(context.k, 32)
+        self.assertIsNone(context.out_dtype)
+        self.assertTrue(context.static_shape)
+        self.assertTrue(context.is_nonzero)
+        self.assertEqual(
+            provider_choice.annotations[
+                select_algorithm.GEMM_TEMPLATE_PROVIDER_ANNOTATION
+            ],
+            "dummy_gemm_backend",
+        )
+
+    def test_tuned_mm_gemm_provider_negative_gates(self):
+        def run_case(
+            *,
+            register_provider=True,
+            provider_result=(),
+            provider_expected_calls=0,
+            expected_choices=(),
+            **harness_kwargs,
+        ):
+            provider_calls = []
+            selector_choices = []
+
+            def dummy_gemm_provider(context):
+                provider_calls.append(context)
+                return provider_result
+
+            def selector(name, choices, input_nodes, layout, **kwargs):
+                selector_choices.extend(choices)
+                return "selected_node", None
+
+            mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
+            if register_provider:
+                mm_kernel.register_gemm_template_provider(
+                    "dummy_gemm_backend", dummy_gemm_provider
+                )
+            try:
+                self._run_tuned_mm_provider_harness(
+                    selector=selector,
+                    **harness_kwargs,
+                )
+            finally:
+                mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
+
+            self.assertEqual(len(provider_calls), provider_expected_calls)
+            self.assertEqual(selector_choices, list(expected_choices))
+
+        provider_choice = self._DummyChoice("dummy_provider")
+        cases = {
+            "default_config": {
+                "max_autotune": False,
+                "max_autotune_gemm": False,
+            },
+            "wrong_active_backend": {
+                "active_backend": "other_gemm_backend",
+            },
+            "wrong_max_autotune_backend": {
+                "max_autotune_gemm_backends": "TRITON",
+            },
+            "zero_size": {
+                "is_nonzero": False,
+            },
+            "out_dtype": {
+                "input_dtype": torch.float16,
+                "out_dtype": torch.float32,
+            },
+            "no_registered_provider": {
+                "register_provider": False,
+            },
+            "provider_returns_no_choices": {
+                "provider_result": (),
+                "provider_expected_calls": 1,
+            },
+            "provider_returns_choice": {
+                "provider_result": [provider_choice],
+                "provider_expected_calls": 1,
+                "expected_choices": [provider_choice],
+            },
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name=name):
+                run_case(**kwargs)
+
+    def test_remote_gemm_best_config_keeps_non_triton_provider_choice(self):
+        class DummyTritonChoice(select_algorithm.ir.TritonTemplateCallerBase):
+            def __init__(self, description, *, provider_backend=None):
+                super().__init__("dummy_triton", [], None, description)
+                if provider_backend is not None:
+                    self.annotations[
+                        select_algorithm.GEMM_TEMPLATE_PROVIDER_ANNOTATION
+                    ] = provider_backend
+
+            def call_name(self):
+                return "dummy_triton"
+
+            def to_callable(self):
+                raise AssertionError("not used")
+
+            def hash_key(self):
+                return "dummy_triton"
+
+            def output_node(self):
+                return "dummy_triton_node"
+
+            def get_make_kernel_render(self):
+                return None
+
+        best_config = {
+            "ACC_TYPE": "tl.float32",
+            "ALLOW_TF32": True,
+            "BLOCK_K": 32,
+            "BLOCK_M": 16,
+            "BLOCK_N": 8,
+            "EVEN_K": True,
+            "GROUP_M": 8,
+            "USE_FAST_ACCUM": False,
+            "num_stages": 3,
+            "num_warps": 4,
+            "num_consumer_groups": 0,
+            "num_buffers_warp_spec": 0,
+        }
+        matching_desc = " ".join(
+            f"{key}={best_config[key]}"
+            for key in select_algorithm._REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS
+        )
+        triton_match = DummyTritonChoice(matching_desc)
+        triton_miss = DummyTritonChoice("BLOCK_M=999")
+        cutile_provider_miss = DummyTritonChoice(
+            "provider triton", provider_backend="cutile"
+        )
+        dummy_provider_miss = DummyTritonChoice(
+            "provider dummy", provider_backend="dummy_gemm_backend"
+        )
+        triton_provider_miss = DummyTritonChoice(
+            "provider triton", provider_backend="triton"
+        )
+        provider_choice = self._DummyChoice("dummy_provider", "provider")
+        provider_choice.annotations[
+            select_algorithm.GEMM_TEMPLATE_PROVIDER_ANNOTATION
+        ] = "dummy_gemm_backend"
+
+        filtered = select_algorithm._filter_choices_by_remote_gemm_best_config(
+            [
+                triton_match,
+                triton_miss,
+                provider_choice,
+                cutile_provider_miss,
+                dummy_provider_miss,
+                triton_provider_miss,
+            ],
+            best_config,
+        )
+
+        self.assertIn(triton_match, filtered)
+        self.assertIn(provider_choice, filtered)
+        self.assertIn(cutile_provider_miss, filtered)
+        self.assertIn(dummy_provider_miss, filtered)
+        self.assertNotIn(triton_miss, filtered)
+        self.assertNotIn(triton_provider_miss, filtered)
 
     def test_register_gemm_template_provider_rejects_conflicting_duplicate(self):
         def dummy_gemm_provider(context):

@@ -106,6 +106,21 @@ log = logging.getLogger(__name__)
 VERIFY: dict[str, Any] = {}
 PRINT_AUTOTUNE = True
 DEBUG = False
+GEMM_TEMPLATE_PROVIDER_ANNOTATION = "gemm_template_provider_backend"
+_REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS = (
+    "ACC_TYPE",
+    "ALLOW_TF32",
+    "BLOCK_K",
+    "BLOCK_M",
+    "BLOCK_N",
+    "EVEN_K",
+    "GROUP_M",
+    "USE_FAST_ACCUM",
+    "num_stages",
+    "num_warps",
+    "num_consumer_groups",
+    "num_buffers_warp_spec",
+)
 
 
 if TYPE_CHECKING:
@@ -3424,6 +3439,32 @@ class DataProcessorChoiceCallerWrapper:
         return f"DataProcessorChoiceCallerWrapper({self._wrapped})"
 
 
+def _is_non_triton_gemm_provider_choice(choice: ChoiceCaller) -> bool:
+    annotations = getattr(choice, "annotations", None)
+    if not isinstance(annotations, dict):
+        return False
+    backend = annotations.get(GEMM_TEMPLATE_PROVIDER_ANNOTATION)
+    return isinstance(backend, str) and backend.lower() != "triton"
+
+
+def _filter_choices_by_remote_gemm_best_config(
+    choices: list[ChoiceCaller],
+    best_config: dict[str, Any],
+) -> list[ChoiceCaller]:
+    filtered_choices = []
+    for choice in choices:
+        if _is_non_triton_gemm_provider_choice(choice):
+            filtered_choices.append(choice)
+        elif all(
+            f"{k}={best_config[k]}" in choice.description
+            for k in _REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS
+        ):
+            filtered_choices.extend(
+                choice for _ in _REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS
+            )
+    return filtered_choices
+
+
 class DataProcessorTemplateWrapper:
     """
     A wrapper class for a kernel template.
@@ -4201,30 +4242,7 @@ class AlgorithmSelectorCache(PersistentCache):
 
         if best_config_future is not None:
             best_config = await_sync(best_config_future)
-
-            important_keys = [
-                "ACC_TYPE",
-                "ALLOW_TF32",
-                "BLOCK_K",
-                "BLOCK_M",
-                "BLOCK_N",
-                "EVEN_K",
-                "GROUP_M",
-                "USE_FAST_ACCUM",
-                "num_stages",
-                "num_warps",
-                "num_consumer_groups",
-                "num_buffers_warp_spec",
-            ]
-            choices = [
-                choice
-                for choice in choices
-                if all(
-                    f"{k}={best_config[k]}" in choice.description
-                    for k in important_keys
-                )
-                for k in important_keys
-            ]
+            choices = _filter_choices_by_remote_gemm_best_config(choices, best_config)
             log.info("Filtered to %d choices based on best_config", len(choices))
 
         has_autotuned: bool = False

@@ -39,6 +39,7 @@ from ..lowering import (
 from ..select_algorithm import (
     autotune_select_algorithm,
     ExternKernelChoice,
+    GEMM_TEMPLATE_PROVIDER_ANNOTATION,
     KernelTemplate,
     realize_inputs,
     TritonTemplate,
@@ -141,7 +142,12 @@ def get_backend_gemm_template_choices(
     if not _use_autotune_backend(backend):
         return []
     choices = provider(context)
-    return list(choices or ())
+    choices = list(choices or ())
+    for choice in choices:
+        annotations = getattr(choice, "annotations", None)
+        if isinstance(annotations, dict):
+            annotations[GEMM_TEMPLATE_PROVIDER_ANNOTATION] = backend
+    return choices
 
 
 # We define each template kernel in a separate file which is the name of the input to load_kernel_template
