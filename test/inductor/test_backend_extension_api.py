@@ -24,6 +24,7 @@ class BackendExtensionAPITests(unittest.TestCase):
     def tearDown(self):
         common._cuda_backends.pop("dummy_cuda_backend", None)
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
+        common._dtype_propagation_backends.pop("dummy_dtype_backend", None)
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -168,6 +169,25 @@ class BackendExtensionAPITests(unittest.TestCase):
             common.ArgName(
                 "BLOCK", is_constexpr=True, backend="missing_backend"
             ).full_name()
+
+    def test_register_dtype_propagation_backend(self):
+        self.assertFalse(common._uses_dtype_propagation("dummy_dtype_backend"))
+
+        common.register_dtype_propagation_backend("dummy_dtype_backend")
+        common.register_dtype_propagation_backend("dummy_dtype_backend")
+
+        self.assertTrue(common._uses_dtype_propagation("dummy_dtype_backend"))
+        self.assertTrue(common._requires_output_dtype("dummy_dtype_backend"))
+
+    def test_register_dtype_propagation_backend_rejects_conflicting_duplicate(self):
+        common.register_dtype_propagation_backend(
+            "dummy_dtype_backend", require_output_dtype=True
+        )
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            common.register_dtype_propagation_backend(
+                "dummy_dtype_backend", require_output_dtype=False
+            )
 
 
 if __name__ == "__main__":
