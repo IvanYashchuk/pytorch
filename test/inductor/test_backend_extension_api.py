@@ -12,7 +12,12 @@ from torch._inductor.async_compile import (
 )
 from torch._inductor.codegen import common
 from torch._inductor.codegen.cuda_combined_scheduling import CUDACombinedScheduling
-from torch._inductor.codegen.triton import TritonScheduling
+from torch._inductor.codegen.triton import (
+    TileKernel,
+    TileKernelScheduling,
+    TritonKernel,
+    TritonScheduling,
+)
 
 
 class BackendExtensionAPITests(unittest.TestCase):
@@ -117,6 +122,12 @@ class BackendExtensionAPITests(unittest.TestCase):
         self.assertIsInstance(
             scheduling._kernel_scheduling, DummyKernelScheduling
         )
+
+    def test_triton_tile_kernel_base_classes_are_exposed(self):
+        self.assertTrue(issubclass(TritonKernel, TileKernel))
+        self.assertTrue(issubclass(TritonScheduling, TileKernelScheduling))
+        self.assertIs(TritonScheduling.kernel_type, TritonKernel)
+        self.assertEqual(TritonKernel.backend(), "triton")
 
     def test_register_constexpr_syntax(self):
         self.assertEqual(

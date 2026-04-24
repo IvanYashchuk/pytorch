@@ -95,6 +95,7 @@ from .common import (
     IndentedBuffer,
     InplacedBuffer,
     is_buffer_removed,
+    KernelArgType,
     OpOverrides,
     PythonPrinter,
     RemovedArg,
@@ -2524,7 +2525,7 @@ class TMACompatibilityChecker:
     Checks if the TMA API can be used for load / store triton operations.
     """
 
-    kernel: TritonKernel
+    kernel: TileKernel
     dtype: torch.dtype
     for_store: bool
     force: bool
@@ -2779,15 +2780,12 @@ class TMACompatibilityChecker:
         return self.force
 
 
-class TritonKernel(SIMDKernel[TritonCSEVariable]):
-    """A class to represent a triton kernel and helpers to generate
-    triton kernel programmatically
+class TileKernel(SIMDKernel[TritonCSEVariable]):
+    """A class to represent a tile kernel and helpers to generate
+    tile kernel programmatically
     """
 
-    overrides = TritonKernelOverrides  # type: ignore[assignment]
     helper_functions: HelperFunctions
-    kexpr: Callable[[sympy.Expr], str] = texpr
-    allow_block_ptr = True
     tma_compatibility_checker_cls = TMACompatibilityChecker
     block_ptr_options_cls: type[BlockPtrOptions] = BlockPtrOptions
     tensor_descriptor_options_cls: type[TensorDescriptorOptions] = (
@@ -2848,6 +2846,70 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
 
+    def prefix(self) -> str:
+        raise NotImplementedError
+
+    @staticmethod
+    def backend() -> str:
+        raise NotImplementedError
+
+    def gen_common_backend_imports(self) -> str:
+        raise NotImplementedError
+
+    def jit_decorator(self) -> str:
+        raise NotImplementedError
+
+    def heuristics_decorator(self) -> str:
+        return "@" + self.backend() + "_heuristics"
+
+    def codegen_driver_setup(self, code: IndentedBuffer) -> None:
+        """Generate backend-specific driver setup code."""
+
+    def constexpr_in_signature(self) -> bool:
+        raise NotImplementedError
+
+    def constexpr_suffix(self) -> str:
+        raise NotImplementedError
+
+    def signature_to_meta(
+        self,
+        signature: list[KernelArgType],
+        *,
+        size_dtype: str | None,
+        argdefs: list[ArgName],
+    ) -> dict[str, str]:
+        raise NotImplementedError
+
+    def codegen_program_id(self) -> str:
+        raise NotImplementedError
+
+    def codegen_num_programs(self) -> str:
+        raise NotImplementedError
+
+    def codegen_load(
+        self,
+        var: str,
+        index: Any,
+        mask: str | None = None,
+        ep: str | None = "",
+        other: str | None = "",
+        cachemod: str | None = "",
+    ) -> str:
+        raise NotImplementedError
+
+    def codegen_load_padding(
+        self, value: Any, dtype: torch.dtype | None = None
+    ) -> str:
+        raise NotImplementedError
+
+    def codegen_store(
+        self, name: str, var: str, index: str, value: str, mask: str | None = None
+    ) -> str:
+        raise NotImplementedError
+
+    def codegen_arange(self, end: str) -> str:
+        raise NotImplementedError
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -2883,7 +2945,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
-        return triton_type(dtype)
+        raise NotImplementedError
 
     def should_use_cooperative_reduction(self) -> bool:
         return self.inside_reduction and V.choices.should_use_cooperative_reduction(
@@ -3878,11 +3940,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
                 shape = indexing.final_shape
             elif is_sympy_integer_like(original_index):
-                line = f"tl.load({var} + ({original_index}))"
+                line = self.codegen_load(var, original_index)
                 append_broadcast = indexing.expand_str
                 shape = ()
             else:
-                line = f"tl.load({var} + ({indexing.index_str}), {indexing.mask_str}{ep}{other}{cachemod})"
+                line = self.codegen_load(
+                    var,
+                    indexing.index_str,
+                    indexing.mask_str,
+                    ep,
+                    other,
+                    cachemod,
+                )
 
                 # The block shape of tl.load depends on the indexing expression.
                 # Inferring shape solely from the mask may miss cases where the mask is constant.
@@ -3897,7 +3966,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 dtype in (torch.float16, torch.bfloat16)
                 and config.triton.codegen_upcast_to_fp32
             ):
-                line += ".to(tl.float32)"
+                line = self.overrides.to_dtype(line, torch.float32)  # type: ignore[arg-type]
                 dtype = torch.float32
             if dtype == torch.bool and torch.version.hip is None:
                 # Workaround for https://github.com/triton-lang/triton/issues/2151
@@ -4010,7 +4079,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 ):
                     value_shape = ", ".join(map(str, value.shape))
                     indexing_str += f".broadcast_to({value_shape})"
-            line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str})"
+            line = self.codegen_store(
+                name, var, indexing_str, str(value), indexing.mask_str
+            )
         elif mode == "atomic_add":
             self.atomic_add_found = True
             indexing_str = indexing.index_str
@@ -5629,12 +5700,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             size_hints[prefix] = size_hint
 
         if name is None:
-            code.splice(self.gen_common_triton_imports())
-            device_type = V.graph.get_current_device_or_throw().type
-            if device_type == "cpu":
-                code.splice("triton_helpers.set_driver_to_cpu()")
-            else:
-                code.splice("triton_helpers.set_driver_to_gpu()")
+            code.splice(self.gen_common_backend_imports())
+            self.codegen_driver_setup(code)
 
             if config.benchmark_kernel:
                 code.splice(self.imports_for_benchmark_kernel())
@@ -5701,10 +5768,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # argdefs.append(f"{tree.prefix}numel: tl.constexpr")
 
         def add_constexpr_arg(arg_name):
-            # new versions (but not old versions) of Triton need constexprs included in the signature
-            if triton_version_uses_attrs_dict():
+            if self.constexpr_in_signature():
                 signature.append(ConstexprArg(arg_name))
-            argdefs.append(ArgName(arg_name, is_constexpr=True))
+            argdefs.append(
+                ArgName(arg_name, is_constexpr=True, backend=self.backend())
+            )
 
         for tree in self.range_trees:
             if tree.is_reduction and self.persistent_reduction:
@@ -5722,7 +5790,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             add_constexpr_arg("RSPLIT_SIZE")
             add_constexpr_arg("NUM_STAGES")
 
-        triton_meta_signature = signature_to_meta(
+        triton_meta_signature = self.signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
         )
         triton_meta: dict[str, Any] = {
@@ -5870,25 +5938,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if self.fixed_config:
             heuristics_line = f"""
-                @triton_heuristics.{self._get_heuristic()}(
+                {self.heuristics_decorator()}.{self._get_heuristic()}(
                     config={self.fixed_config.config!r},
                     filename=__file__,
                     triton_meta={triton_meta!r},
                     inductor_meta={inductor_meta!r}
                 )
-                @triton.jit
+                {self.jit_decorator()}
             """
         elif self.inside_reduction:
             reduction_hint = self.features.get_reduction_hint(self.tiling_scores)
             heuristics_line = f"""
-                @triton_heuristics.{self._get_heuristic()}(
+                {self.heuristics_decorator()}.{self._get_heuristic()}(
                     size_hints={size_hints!r},
                     reduction_hint={reduction_hint},
                     filename=__file__,
                     triton_meta={triton_meta!r},
                     inductor_meta={inductor_meta!r}
                 )
-                @triton.jit
+                {self.jit_decorator()}
             """
         else:
             tile_hint = ""
@@ -5900,14 +5968,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 else:
                     tile_hint = "tile_hint=TileHint.DEFAULT,"
             heuristics_line = f"""
-                @triton_heuristics.{self._get_heuristic()}(
+                {self.heuristics_decorator()}.{self._get_heuristic()}(
                     size_hints={size_hints!r}, {tile_hint}
                     filename=__file__,
                     triton_meta={triton_meta!r},
                     inductor_meta={inductor_meta!r},
                     min_elem_per_thread={self.min_elem_per_thread}
                 )
-                @triton.jit
+                {self.jit_decorator()}
             """
         code.splice(heuristics_line)
         kernel_name = name or str(Placeholder.KERNEL_NAME)
@@ -5949,7 +6017,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     @staticmethod
     def has_persistent_RBLOCK(rnumel):
         try:
-            TritonKernel._get_persistent_RBLOCK(rnumel)
+            TileKernel._get_persistent_RBLOCK(rnumel)
             return True
         except ValueError:
             return False
@@ -5991,10 +6059,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         # tl.dot only supports shapes >= 16
                         val = max(val, 16)
 
-                code.writeline(f"{tree.prefix.upper()}BLOCK: tl.constexpr = {val}")
+                code.writeline(
+                    f"{tree.prefix.upper()}BLOCK{self.constexpr_suffix()} = {val}"
+                )
 
             if tree.prefix == "x" and self.no_x_dim:
-                code.writeline("XBLOCK: tl.constexpr = 1")
+                code.writeline(f"XBLOCK{self.constexpr_suffix()} = 1")
 
     def _get_grid_type(self) -> type[triton_heuristics.GridExpr]:
         n = sum([int(not tree.is_reduction) for tree in self.range_trees])
@@ -6091,15 +6161,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             and self.triton_tensor_ndim() == 4
         ):
             size = ""
-        index_dtype = self.index_dtype
-        suffix = f".to({index_dtype})" if index_dtype != "tl.int32" else ""
+        result = f"{self.codegen_arange(entry.prefix.upper() + 'BLOCK')}{size}"
+        if self.index_dtype != self.dtype_to_str(torch.int32):
+            result = self.overrides.to_dtype(
+                result, self.get_index_dtype_as_torch_dtype()
+            )  # type: ignore[arg-type]
         if (
             self.cooperative_reduction
             and self.persistent_reduction
             and entry.is_reduction
         ):
-            suffix = f"{suffix} + rsplit_start"
-        return f"tl.arange(0, {entry.prefix.upper()}BLOCK){size}{suffix}"
+            result = f"{result} + rsplit_start"
+        return result
 
     def iteration_ranges_scalar_code(
         self, entry: IterationRangesRoot, value: Any
@@ -6111,25 +6184,27 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def iteration_ranges_get_pid(self, entry: IterationRangesRoot) -> str:
         assert entry.grid_dim is not None
-        key = f"tl.program_id({entry.grid_dim})"
+        key = f"{self.codegen_program_id()}({entry.grid_dim})"
         # y_grid has a limit, so express it in terms of y and z in case of overflow.
         # z grid is only exercised when max_tiles == 3 (off by default).
         if self.needs_yz_grid_overflow(entry):
             # For ynumel larger than max_ygrid, we need to use zdim.
             # For each z dimension, there are tl.num_programs(1) yblocks which is passed by grad(x,y,z).
             # So, we need to add tl.program_id(z) * tl.num_programs(y) *YBLOCK to get the correct yoffset.
-            key = f"({key} + tl.program_id({entry.grid_dim + 1}) * tl.num_programs({entry.grid_dim}))"
+            key = f"({key} + {self.codegen_program_id()}({entry.grid_dim + 1}) * {self.codegen_num_programs()}({entry.grid_dim}))"
 
         # For batched matmul, we intentionally remap program_id axes so that the
         # batch dimension is placed on CUDA gridDim.x (the fastest-varying launch axis).
         # - gridDim.x scales to much larger sizes than gridDim.z (limited to 65536 in CUDA)
         if self.is_native_matmul and self.triton_tensor_ndim() == 4:
             reversed_pid_map = {0: 2, 1: 1, 2: 0}
-            key = f"tl.program_id({reversed_pid_map[entry.grid_dim]})"
+            key = f"{self.codegen_program_id()}({reversed_pid_map[entry.grid_dim]})"
 
         pid = entry.pid_cache.get(key, key)
-        if self.index_dtype != "tl.int32":
-            return f"{pid}.to({self.index_dtype})"
+        if self.index_dtype != self.dtype_to_str(torch.int32):
+            return self.overrides.to_dtype(
+                pid, self.get_index_dtype_as_torch_dtype()
+            )  # type: ignore[arg-type]
         return pid
 
     def needs_yz_grid_overflow(self, entry: IterationRangesRoot) -> bool:
@@ -6244,7 +6319,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if tree.is_reduction
         ]
         rblock = sympy_product(rn_blocks)
-        buffer.splice(f"RBLOCK: tl.constexpr = {self.kexpr(rblock)}")
+        buffer.splice(f"RBLOCK{self.constexpr_suffix()} = {self.kexpr(rblock)}")
 
     def _get_reduction_symbols(self, suffix: str, **kwargs) -> list[sympy.Symbol]:
         """
@@ -6319,6 +6394,86 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         elif not (x == "x" and self.mix_order_reduction):
             # mix order reduction should generate xmask inside the loop
             code.writeline(f"{x}mask = {entry.name} < {x}numel")
+
+
+class TritonKernel(TileKernel):
+    """A class to represent a Triton kernel and helpers to generate it."""
+
+    overrides = TritonKernelOverrides  # type: ignore[assignment]
+    kexpr: Callable[[sympy.Expr], str] = texpr
+    allow_block_ptr = True
+
+    def prefix(self) -> str:
+        return "tl"
+
+    @staticmethod
+    def backend() -> str:
+        return "triton"
+
+    def gen_common_backend_imports(self) -> str:
+        return self.gen_common_triton_imports()
+
+    def jit_decorator(self) -> str:
+        return "@triton.jit"
+
+    def codegen_driver_setup(self, code: IndentedBuffer) -> None:
+        device_type = V.graph.get_current_device_or_throw().type
+        if device_type == "cpu":
+            code.splice("triton_helpers.set_driver_to_cpu()")
+        else:
+            code.splice("triton_helpers.set_driver_to_gpu()")
+
+    def constexpr_in_signature(self) -> bool:
+        return triton_version_uses_attrs_dict()
+
+    def constexpr_suffix(self) -> str:
+        return " : tl.constexpr"
+
+    def signature_to_meta(
+        self,
+        signature: list[KernelArgType],
+        *,
+        size_dtype: str | None,
+        argdefs: list[ArgName],
+    ) -> dict[str, str]:
+        return signature_to_meta(signature, size_dtype=size_dtype, argdefs=argdefs)
+
+    def codegen_program_id(self) -> str:
+        return "tl.program_id"
+
+    def codegen_num_programs(self) -> str:
+        return "tl.num_programs"
+
+    def codegen_load(
+        self,
+        var: str,
+        index: Any,
+        mask: str | None = None,
+        ep: str | None = "",
+        other: str | None = "",
+        cachemod: str | None = "",
+    ) -> str:
+        if mask is not None:
+            return f"tl.load({var} + ({index}), {mask}{ep}{other}{cachemod})"
+        return f"tl.load({var} + ({index}))"
+
+    def codegen_load_padding(
+        self, value: Any, dtype: torch.dtype | None = None
+    ) -> str:
+        return f"other={value}" if value is not None else ""
+
+    def codegen_store(
+        self, name: str, var: str, index: str, value: str, mask: str | None = None
+    ) -> str:
+        if mask is not None:
+            return f"tl.store({var} + ({index}), {value}, {mask})"
+        return f"tl.store({var} + ({index}), {value})"
+
+    def codegen_arange(self, end: str) -> str:
+        return f"tl.arange(0, {end})"
+
+    def dtype_to_str(self, dtype: torch.dtype) -> str:
+        return triton_type(dtype)
 
 
 class FusedUserDefinedTritonKernel(TritonKernel):
@@ -6454,10 +6609,10 @@ class FusedUserDefinedTritonKernel(TritonKernel):
         return "\n".join(new_src_lines)
 
 
-class TritonScheduling(SIMDScheduling):
-    """Scheduling backend for Triton kernel code generation."""
+class TileKernelScheduling(SIMDScheduling):
+    """Base scheduling backend for tile kernel code generation."""
 
-    kernel_type: type[Any] = TritonKernel
+    kernel_type: type[TileKernel]
     backend_features = OrderedSet(
         [
             BackendFeature.FOREACH,
@@ -6523,6 +6678,9 @@ class TritonScheduling(SIMDScheduling):
             )
             wrapper.write_provenance_debug_handle(kernel_name, debug_handle)
 
+    def codegen_compile_wrapper_close(self, compile_wrapper: IndentedBuffer) -> None:
+        raise NotImplementedError
+
     def _emit_kernel_to_wrapper(
         self,
         wrapper,
@@ -6547,18 +6705,18 @@ class TritonScheduling(SIMDScheduling):
             return  # External handler handled it
 
         compile_wrapper = IndentedBuffer()
+        backend_name = self.kernel_type.backend()
 
         if async_compile.use_process_pool():
             # The process pool is warm, we can shell out to workers right away. This
-            # allows us to save the result in async_compile.CompiledTritonKernels,
-            # so that the second time we call async_compile.triton, we do no work.
-            async_compile.triton(subs_name, src_code)
+            # allows us to save the result in the backend compile cache, so that the
+            # second time we call async_compile.<backend>, we do no work.
+            getattr(async_compile, backend_name)(subs_name, src_code)
 
-        compile_wrapper.writeline(f"async_compile.triton({subs_name!r}, '''")
+        compile_wrapper.writeline(f"async_compile.{backend_name}({subs_name!r}, '''")
 
         compile_wrapper.splice(src_code, strip=True)
-        current_device = V.graph.get_current_device_or_throw()
-        compile_wrapper.writeline(f"''', device_str='{current_device.type}')")
+        self.codegen_compile_wrapper_close(compile_wrapper)
 
         metadata_comment = f"# kernel path: {kernel_path}"
         origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
@@ -6578,8 +6736,9 @@ class TritonScheduling(SIMDScheduling):
             if fused_name:
                 fused_name = V.choices.customize_fused_kernel_name(fused_name, src_code)
             kernel_category = get_kernel_category_by_source_code(src_code)[:3]
+            backend_name = self.kernel_type.backend()
             kernel_name = "_".join(
-                ["triton", kernel_category, fused_name, wrapper.next_kernel_suffix()]
+                [backend_name, kernel_category, fused_name, wrapper.next_kernel_suffix()]
             )
             if config.aot_inductor.model_name_for_generated_files:
                 # When AOTI compiles multiple submodules, we need to use the model name to
@@ -6588,11 +6747,13 @@ class TritonScheduling(SIMDScheduling):
 
             # use the original src_code as the key
             wrapper.src_to_kernel[src_code] = kernel_name
-            subs_name = kernel_name if config.triton.unique_kernel_names else "triton_"
+            subs_name = (
+                kernel_name if config.triton.unique_kernel_names else f"{backend_name}_"
+            )
 
             # DESCRIPTIVE_NAME is used for profiling purposes; it shows the full kernel name
             # even when unique_kernel_names is turned off. Meanwhile, KERNEL_NAME is sometimes set
-            # to "triton_" to maximize caching opportunities (when unique_kernel_names = False).
+            # to a stable backend prefix to maximize caching opportunities.
             src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
             src_code = src_code.replace(str(Placeholder.KERNEL_NAME), subs_name)
 
@@ -6672,7 +6833,7 @@ class TritonScheduling(SIMDScheduling):
 
             args = mod.get_args()
             call = mod.call
-            wrapped_jit_function = mod.triton_
+            wrapped_jit_function = getattr(mod, f"{self.kernel_type.backend()}_")
             # call once to trigger the compilation
             try:
                 call(wrapped_jit_function.clone_args(*args)[0])
@@ -6726,12 +6887,12 @@ class TritonScheduling(SIMDScheduling):
         kernel_features: SIMDKernelFeatures,
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
-    ) -> list[TritonKernel]:
+    ) -> list[TileKernel]:
         is_scan = kernel_features.contains_op("scan")
         is_split_scan = is_scan and any(
             node.is_split_scan() for node in kernel_features.scheduler_nodes()
         )
-        kernel_type: type[TritonKernel] = self.kernel_type
+        kernel_type: type[TileKernel] = self.kernel_type
         if is_split_scan:
             from .triton_split_scan import TritonSplitScanKernel
 
@@ -6747,7 +6908,7 @@ class TritonScheduling(SIMDScheduling):
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 
-        if not TritonKernel.has_persistent_RBLOCK(kernel_features.reduction_numel):
+        if not kernel_type.has_persistent_RBLOCK(kernel_features.reduction_numel):
             # Cannot use persistent reduction with unknown dynamic rnumel
             assert not kernel_kwargs.get("override_persistent_reduction")
             kernel_kwargs["override_persistent_reduction"] = False
@@ -6760,11 +6921,11 @@ class TritonScheduling(SIMDScheduling):
 
     def add_multi_kernel_choices(
         self,
-        kernel: TritonKernel,
+        kernel: TileKernel,
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
-    ) -> list[TritonKernel]:
-        kernels: list[TritonKernel] = [kernel]
+    ) -> list[TileKernel]:
+        kernels: list[TileKernel] = [kernel]
         if not config.triton.multi_kernel:
             return kernels
 
@@ -6871,7 +7032,9 @@ class TritonScheduling(SIMDScheduling):
                 continue
 
             assert src_code is not None
-            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), "triton_")
+            src_code = src_code.replace(
+                str(Placeholder.KERNEL_NAME), f"{self.kernel_type.backend()}_"
+            )
             mod = PyCodeCache.load(src_code)
 
             log.debug(
@@ -6888,7 +7051,7 @@ class TritonScheduling(SIMDScheduling):
 
             args = mod.get_args()
             call = mod.call
-            wrapped_jit_function = mod.triton_
+            wrapped_jit_function = getattr(mod, f"{self.kernel_type.backend()}_")
 
             # call once to trigger the compilation
             call(wrapped_jit_function.clone_args(*args)[0])
@@ -6924,6 +7087,16 @@ class TritonScheduling(SIMDScheduling):
         V.graph.removed_buffers = removed_buffers_orig
         V.graph.inplaced_to_remove = inplaced_to_remove_orig
         return total_ms, total_clone_ms, file_list
+
+
+class TritonScheduling(TileKernelScheduling):
+    """Scheduling backend for Triton kernel code generation."""
+
+    kernel_type = TritonKernel
+
+    def codegen_compile_wrapper_close(self, compile_wrapper: IndentedBuffer) -> None:
+        current_device = V.graph.get_current_device_or_throw()
+        compile_wrapper.writeline(f"''', device_str='{current_device.type}')")
 
 
 def debug_triton_code(node: BaseSchedulerNode) -> list[str]:
