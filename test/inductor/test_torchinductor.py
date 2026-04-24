@@ -1022,6 +1022,13 @@ def is_triton_backend(device):
     return config.cuda_backend == "triton"
 
 
+def is_cutile_backend(device):
+    device_type = getattr(device, "type", device)
+    if device_type in ("cpu", "mps"):
+        return False
+    return config.cuda_backend == "cutile"
+
+
 def is_triton_cpu_backend(device):
     return getattr(device, "type", device) == "cpu" and config.cpu_backend == "triton"
 
@@ -11082,9 +11089,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ):
             self.assertEqual(fw_code.count("halide_helpers.rand"), 1)
             self.assertEqual(bw_code.count("halide_helpers.rand"), 0)
-        elif self.device == GPU_TYPE and not torch._inductor.config.align_random_eager:
+        elif (
+            self.device == GPU_TYPE
+            and is_triton_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
             self.assertEqual(fw_code.count("tl.rand"), 1)
             self.assertEqual(bw_code.count("tl.rand"), 0)
+        elif (
+            self.device == GPU_TYPE
+            and is_cutile_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
+            self.assertEqual(fw_code.count("= _cutile_rand("), 1)
+            self.assertEqual(bw_code.count("= _cutile_rand("), 0)
         g2 = weight.grad.clone()
         check(r2, g2)
 
@@ -11129,7 +11147,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ):
             self.assertEqual(fw_code.count("halide_helpers.rand"), 2)
             self.assertEqual(bw_code.count("halide_helpers.rand"), 0)
-        elif self.device == GPU_TYPE and not torch._inductor.config.align_random_eager:
+        elif (
+            self.device == GPU_TYPE
+            and is_triton_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
             # the load_seed_offset arg can be 1 or non-1; depending on whether
             # the triton signature specializes on 1 vs non-1, you might get 1
             # or 2 kernels. In newer versions of triton, there's no specialization
@@ -11140,13 +11162,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 torch._inductor.metrics.generated_kernel_count,
                 4 if not config.triton.native_matmul else 6,
             )
+        elif (
+            self.device == GPU_TYPE
+            and is_cutile_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
+            self.assertEqual(fw_code.count("= _cutile_rand("), 2)
+            self.assertEqual(bw_code.count("= _cutile_rand("), 0)
         else:
             self.assertEqual(
                 torch._inductor.metrics.generated_kernel_count,
                 4,
             )
 
-    @xfail_if_mps  # Only works for triton
+    @xfail_if_mps
     def test_randint_kernel_count(self):
         if self.device != GPU_TYPE:
             raise unittest.SkipTest("Only valid for GPU!")
@@ -11166,7 +11195,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # the triton signature specializes on 1 vs non-1, you might get 1
         # or 2 kernels. In newer versions of triton, there's no specialization
         # so we get only 1 kernel.
-        self.assertEqual(source_codes[0].count("async_compile.triton"), 2)
+        if is_triton_backend(self.device):
+            self.assertEqual(source_codes[0].count("async_compile.triton"), 2)
+        elif is_cutile_backend(self.device):
+            self.assertEqual(source_codes[0].count("async_compile.cutile"), 2)
+        else:
+            raise unittest.SkipTest(
+                f"Only valid for triton or cutile backend on {self.device}"
+            )
 
     def test_roll(self):
         def fn(a):
