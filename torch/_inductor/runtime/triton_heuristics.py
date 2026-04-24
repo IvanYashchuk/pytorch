@@ -3898,15 +3898,20 @@ def filter_reduction_configs_for_determinism(
     return configs
 
 
-def reduction(
+def _prepare_reduction(
     size_hints,
     reduction_hint=False,
     triton_meta=None,
     filename=None,
     inductor_meta=None,
-    return_configs=False,
 ):
-    """args to @triton.heuristics()"""
+    """
+    Common reduction heuristic setup shared by tile backends.
+
+    Returns ``(configs, size_hints, inductor_meta)``. ``size_hints`` is ``None``
+    for combo-kernel per-subkernel configs to preserve the existing autotune
+    cache behavior.
+    """
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
     if inductor_meta.get("no_x_dim"):
@@ -3920,14 +3925,7 @@ def reduction(
         reduction_hint=reduction_hint,
     )
     if configs is not None:
-        return cached_autotune(
-            None,
-            configs,
-            triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
-            heuristic_type=HeuristicType.REDUCTION,
-            filename=filename,
-        )
+        return configs, None, inductor_meta
 
     assert triton_meta is not None
 
@@ -3945,6 +3943,25 @@ def reduction(
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    return configs, size_hints, inductor_meta
+
+
+def reduction(
+    size_hints,
+    reduction_hint=False,
+    triton_meta=None,
+    filename=None,
+    inductor_meta=None,
+    return_configs=False,
+):
+    """args to @triton.heuristics()"""
+    configs, size_hints, inductor_meta = _prepare_reduction(
+        size_hints,
+        reduction_hint=reduction_hint,
+        triton_meta=triton_meta,
+        filename=filename,
+        inductor_meta=inductor_meta,
+    )
 
     if return_configs:
         return configs

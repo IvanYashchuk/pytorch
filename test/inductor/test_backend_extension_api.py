@@ -18,6 +18,9 @@ from torch._inductor.codegen.triton import (
     TritonKernel,
     TritonScheduling,
 )
+from torch._inductor.runtime import triton_heuristics
+from torch._inductor.runtime.hints import HeuristicType
+from torch._inductor.runtime.triton_compat import Config
 
 
 class BackendExtensionAPITests(unittest.TestCase):
@@ -188,6 +191,46 @@ class BackendExtensionAPITests(unittest.TestCase):
             common.register_dtype_propagation_backend(
                 "dummy_dtype_backend", require_output_dtype=False
             )
+
+    def test_reduction_heuristic_uses_shared_prepare(self):
+        configs = [Config({"XBLOCK": 1, "R0_BLOCK": 1})]
+        inductor_meta = {"kernel_name": "dummy"}
+        triton_meta = {"signature": {}}
+
+        with (
+            mock.patch.object(
+                triton_heuristics,
+                "_prepare_reduction",
+                return_value=(configs, {"x": 1, "r0_": 1}, inductor_meta),
+            ) as prepare,
+            mock.patch.object(
+                triton_heuristics, "cached_autotune", return_value="decorator"
+            ) as cached_autotune,
+        ):
+            result = triton_heuristics.reduction(
+                {"x": 1, "r0_": 1},
+                reduction_hint=False,
+                triton_meta=triton_meta,
+                filename="dummy.py",
+                inductor_meta=inductor_meta,
+            )
+
+        self.assertEqual(result, "decorator")
+        prepare.assert_called_once_with(
+            {"x": 1, "r0_": 1},
+            reduction_hint=False,
+            triton_meta=triton_meta,
+            filename="dummy.py",
+            inductor_meta=inductor_meta,
+        )
+        cached_autotune.assert_called_once_with(
+            {"x": 1, "r0_": 1},
+            configs=configs,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            heuristic_type=HeuristicType.REDUCTION,
+            filename="dummy.py",
+        )
 
 
 if __name__ == "__main__":
