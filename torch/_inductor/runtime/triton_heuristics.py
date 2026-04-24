@@ -3210,17 +3210,20 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
-def pointwise(
+def _prepare_pointwise(
     size_hints,
     triton_meta,
     tile_hint=None,
     filename=None,
     min_elem_per_thread=0,
     inductor_meta=None,
-    return_configs=False,
 ):
     """
-    Construct @triton.heuristics() based on size_hints.
+    Common pointwise heuristic setup shared by tile backends.
+
+    Returns ``(configs, size_hints, inductor_meta)``. ``size_hints`` is ``None``
+    for combo-kernel per-subkernel configs to preserve the existing autotune
+    cache behavior.
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
 
@@ -3233,14 +3236,7 @@ def pointwise(
         min_elem_per_thread=min_elem_per_thread,
     )
     if configs is not None:
-        return cached_autotune(
-            None,
-            configs,
-            triton_meta=triton_meta,
-            inductor_meta=inductor_meta,
-            heuristic_type=HeuristicType.POINTWISE,
-            filename=filename,
-        )
+        return configs, None, inductor_meta
 
     assert not inductor_meta.get("no_x_dim")
 
@@ -3385,6 +3381,29 @@ def pointwise(
         raise NotImplementedError(f"size_hints: {size_hints}")
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
+    return configs, size_hints, inductor_meta
+
+
+def pointwise(
+    size_hints,
+    triton_meta,
+    tile_hint=None,
+    filename=None,
+    min_elem_per_thread=0,
+    inductor_meta=None,
+    return_configs=False,
+):
+    """
+    Construct @triton.heuristics() based on size_hints.
+    """
+    configs, size_hints, inductor_meta = _prepare_pointwise(
+        size_hints,
+        triton_meta,
+        tile_hint=tile_hint,
+        filename=filename,
+        min_elem_per_thread=min_elem_per_thread,
+        inductor_meta=inductor_meta,
+    )
     if return_configs:
         return configs
 
