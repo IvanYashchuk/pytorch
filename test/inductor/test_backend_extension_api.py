@@ -18,6 +18,7 @@ from torch._inductor.codegen.triton import TritonScheduling
 class BackendExtensionAPITests(unittest.TestCase):
     def tearDown(self):
         common._cuda_backends.pop("dummy_cuda_backend", None)
+        common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -116,6 +117,46 @@ class BackendExtensionAPITests(unittest.TestCase):
         self.assertIsInstance(
             scheduling._kernel_scheduling, DummyKernelScheduling
         )
+
+    def test_register_constexpr_syntax(self):
+        self.assertEqual(
+            common.ArgName("BLOCK", is_constexpr=True).full_name(),
+            "BLOCK : tl.constexpr",
+        )
+
+        common.register_constexpr_syntax(
+            "dummy_constexpr_backend", " : dummy.Constant"
+        )
+        common.register_constexpr_syntax(
+            "dummy_constexpr_backend", " : dummy.Constant"
+        )
+
+        self.assertEqual(
+            common.ArgName(
+                "BLOCK", is_constexpr=True, backend="dummy_constexpr_backend"
+            ).full_name(),
+            "BLOCK : dummy.Constant",
+        )
+        self.assertEqual(
+            common.ArgName("arg", backend="dummy_constexpr_backend").full_name(),
+            "arg",
+        )
+
+    def test_register_constexpr_syntax_rejects_conflicting_duplicate(self):
+        common.register_constexpr_syntax(
+            "dummy_constexpr_backend", " : dummy.Constant"
+        )
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            common.register_constexpr_syntax(
+                "dummy_constexpr_backend", " : other.Constant"
+            )
+
+    def test_unknown_constexpr_syntax_has_actionable_error(self):
+        with self.assertRaisesRegex(KeyError, "Available constexpr syntax backends"):
+            common.ArgName(
+                "BLOCK", is_constexpr=True, backend="missing_backend"
+            ).full_name()
 
 
 if __name__ == "__main__":
