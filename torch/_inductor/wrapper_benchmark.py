@@ -1,10 +1,11 @@
 import argparse
 import datetime
+import re
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Any, Pattern, Protocol
 
 import torch
 from torch.autograd import DeviceType
@@ -26,6 +27,30 @@ _kernel_category_choices = [
     "split_scan",
     "template",
 ]
+_kernel_category_source_patterns: list[tuple[Pattern[str], str]] = [
+    (re.compile(re.escape(f"@triton_heuristics.{choice}")), choice)
+    for choice in _kernel_category_choices
+]
+
+
+def register_kernel_category_pattern(
+    pattern: str | Pattern[str],
+    category: str,
+) -> None:
+    """
+    Register a source-code pattern used to classify generated kernels.
+
+    Out-of-tree backends can use this to make wrapper benchmarks and metadata
+    recognize their generated source without patching this module.
+    """
+    compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+    entry = (compiled, category)
+    if any(
+        existing.pattern == compiled.pattern and existing_category == category
+        for existing, existing_category in _kernel_category_source_patterns
+    ):
+        return
+    _kernel_category_source_patterns.append(entry)
 
 
 def get_kernel_category_by_source_code(src_code: str) -> str:
@@ -34,7 +59,9 @@ def get_kernel_category_by_source_code(src_code: str) -> str:
     if we have not compile the src_code to module yet.
     """
     choices = [
-        ch for ch in _kernel_category_choices if f"@triton_heuristics.{ch}" in src_code
+        category
+        for pattern, category in _kernel_category_source_patterns
+        if pattern.search(src_code)
     ]
     if len(choices) == 1:
         return choices[0]

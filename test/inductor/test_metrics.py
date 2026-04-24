@@ -3,7 +3,10 @@ import torch
 from torch._inductor import config, metrics
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import collect_defined_kernels
-from torch._inductor.wrapper_benchmark import get_kernel_category_by_source_code
+from torch._inductor.wrapper_benchmark import (
+    get_kernel_category_by_source_code,
+    register_kernel_category_pattern,
+)
 from torch.testing._internal.common_device_type import largeTensorTest
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
@@ -74,6 +77,20 @@ class TestMetrics(TestCase):
         self.assertEqual("reduction", kernel_category)
         self.assertEqual(
             "INNER", metrics._parse_reduction_hint(kernel_category, example_kernel)
+        )
+
+    def test_register_kernel_category_pattern(self):
+        register_kernel_category_pattern(r"@dummy_heuristics\.pointwise", "pointwise")
+
+        self.assertEqual(
+            "pointwise",
+            get_kernel_category_by_source_code(
+                """
+                @dummy_heuristics.pointwise()
+                def dummy_kernel():
+                    pass
+                """
+            ),
         )
 
     @config.patch("fx_graph_remote_cache", False)
