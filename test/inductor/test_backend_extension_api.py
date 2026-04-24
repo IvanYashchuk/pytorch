@@ -1,6 +1,5 @@
 # Owner(s): ["module: inductor"]
 
-import unittest
 from unittest import mock
 
 import torch
@@ -21,9 +20,10 @@ from torch._inductor.codegen.triton import (
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.runtime.hints import HeuristicType
 from torch._inductor.runtime.triton_compat import Config
+from torch.testing._internal.common_utils import TestCase
 
 
-class BackendExtensionAPITests(unittest.TestCase):
+class BackendExtensionAPITests(TestCase):
     def tearDown(self):
         common._cuda_backends.pop("dummy_cuda_backend", None)
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
@@ -79,6 +79,14 @@ class BackendExtensionAPITests(unittest.TestCase):
                 "dummy_cuda_backend", OtherDummyCudaScheduling
             )
 
+    def test_register_cuda_backend_rejects_invalid_name(self):
+        class DummyCudaScheduling(CUDACombinedScheduling):
+            pass
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_cuda_backend(name, DummyCudaScheduling)
+
     def test_unknown_cuda_backend_has_actionable_error(self):
         common.init_backend_registration()
 
@@ -113,6 +121,14 @@ class BackendExtensionAPITests(unittest.TestCase):
             register_async_compile_backend(
                 "dummy_async_backend", other_dummy_async_backend
             )
+
+    def test_register_async_compile_backend_rejects_invalid_name(self):
+        def dummy_async_backend(self, kernel_name: str, source_code: str):
+            return kernel_name, source_code
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                register_async_compile_backend(name, dummy_async_backend)
 
     def test_cuda_combined_scheduling_kernel_scheduler_is_overridable(self):
         class DummyKernelScheduling(TritonScheduling):
@@ -167,6 +183,11 @@ class BackendExtensionAPITests(unittest.TestCase):
                 "dummy_constexpr_backend", " : other.Constant"
             )
 
+    def test_register_constexpr_syntax_rejects_invalid_name(self):
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_constexpr_syntax(name, " : dummy.Constant")
+
     def test_unknown_constexpr_syntax_has_actionable_error(self):
         with self.assertRaisesRegex(KeyError, "Available constexpr syntax backends"):
             common.ArgName(
@@ -191,6 +212,11 @@ class BackendExtensionAPITests(unittest.TestCase):
             common.register_dtype_propagation_backend(
                 "dummy_dtype_backend", require_output_dtype=False
             )
+
+    def test_register_dtype_propagation_backend_rejects_invalid_name(self):
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_dtype_propagation_backend(name)
 
     def test_reduction_heuristic_uses_shared_prepare(self):
         configs = [Config({"XBLOCK": 1, "R0_BLOCK": 1})]

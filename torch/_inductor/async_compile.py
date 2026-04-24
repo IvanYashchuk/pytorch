@@ -4,6 +4,7 @@ from __future__ import annotations
 import atexit
 import functools
 import json
+import keyword
 import logging
 import multiprocessing
 import os
@@ -76,6 +77,15 @@ log = logging.getLogger(__name__)
 
 _triton_kernel_metrics: dict[str, dict[str, Any]] | None = None
 _async_compile_backends: dict[str, Callable[..., Any]] = {}
+
+
+def _validate_async_compile_backend_name(name: str) -> None:
+    if not name:
+        raise ValueError("async compile backend name must be non-empty")
+    if not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(
+            f"async compile backend name must be a valid Python identifier; got {name!r}"
+        )
 
 size_hints_regex = re.compile(
     r"size_hints=(\{.*?\})",
@@ -768,8 +778,7 @@ def register_async_compile_backend(
     for example ``async_compile.triton(...)``. This hook lets external backends
     add methods such as ``async_compile.cutile(...)`` without monkey-patching.
     """
-    if not name:
-        raise ValueError("async compile backend name must be non-empty")
+    _validate_async_compile_backend_name(name)
     if (
         existing := _async_compile_backends.get(name)
     ) is not None and existing is not compile_fn:

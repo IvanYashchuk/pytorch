@@ -6,6 +6,7 @@ import dataclasses
 import enum
 import functools
 import itertools
+import keyword
 import logging
 import math
 import operator
@@ -374,6 +375,15 @@ device_op_overrides_dict: dict[str, DeviceOpOverrides] = {}
 _device_op_overrides_initialized = False
 custom_backend_passes: dict[str, CustomGraphModulePass | None] = {}
 custom_backend_codegen_configs: dict[str, ConfigModule | None] = {}
+
+
+def _validate_backend_name(kind: str, name: str) -> None:
+    if not name:
+        raise ValueError(f"{kind} backend name must be non-empty")
+    if not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(
+            f"{kind} backend name must be a valid Python identifier; got {name!r}"
+        )
 _cuda_backends: dict[str, SchedulingConstructor] = {}
 _constexpr_syntaxes: dict[str, str] = {"triton": " : tl.constexpr"}
 _dtype_propagation_backends: dict[str, bool] = {
@@ -441,8 +451,7 @@ def register_cuda_backend(
     process-wide ``"cuda"`` device registration and losing the standard CUDA
     template/fallback path.
     """
-    if not name:
-        raise ValueError("CUDA backend name must be non-empty")
+    _validate_backend_name("CUDA", name)
     if (
         existing := _cuda_backends.get(name)
     ) is not None and existing is not device_scheduling:
@@ -470,8 +479,7 @@ def register_dtype_propagation_backend(
     This is needed by out-of-tree SIMD-style backends whose op overrides return
     strings, so CSE variables still receive dtype and shape metadata.
     """
-    if not name:
-        raise ValueError("dtype propagation backend name must be non-empty")
+    _validate_backend_name("dtype propagation", name)
     if (
         existing := _dtype_propagation_backends.get(name)
     ) is not None and existing != require_output_dtype:
@@ -496,8 +504,7 @@ def register_constexpr_syntax(name: str, suffix: str) -> None:
     Triton uses ``" : tl.constexpr"`` while other tile DSLs may use different
     syntax, for example cuTile's ``" : ct.Constant"``.
     """
-    if not name:
-        raise ValueError("constexpr backend name must be non-empty")
+    _validate_backend_name("constexpr", name)
     if (
         existing := _constexpr_syntaxes.get(name)
     ) is not None and existing != suffix:
