@@ -47,6 +47,9 @@ class XPUCombinedScheduling(BaseScheduling):
     def get_backend_features(self, device: torch.device) -> OrderedSet[BackendFeature]:
         return self._triton_scheduling.get_backend_features(device)
 
+    def supports_combo_kernels(self) -> bool:
+        return self._triton_scheduling.supports_combo_kernels()
+
     def choose_node_backend(self, node: BaseSchedulerNode) -> BaseScheduling:
         if self._cutlass_scheduling.is_cutlass_template(node):
             return self._cutlass_scheduling

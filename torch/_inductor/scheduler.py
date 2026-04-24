@@ -5089,6 +5089,18 @@ class Scheduler:
                 continue
             if num_ck_nodes is not None and count > num_ck_nodes:
                 break
+            device = node_list[0].get_device()
+            assert device is not None
+            backend = self.get_backend(device)
+            if not backend.supports_combo_kernels():
+                log.debug(
+                    "ComboKernels: backend %s does not support combo kernels "
+                    "for %s; skipping %d-th group",
+                    type(backend).__name__,
+                    device,
+                    num,
+                )
+                continue
             if not self.speedup_by_combo_kernel(node_list):
                 log.debug("ComboKernels: Not speeding up %d-th group", num)
                 continue
@@ -8093,6 +8105,9 @@ class BaseScheduling:  # noqa: docstring_linter
     def get_backend_features(self, device: torch.device) -> OrderedSet[BackendFeature]:
         """Return a set of .codegen.common.BackendFeature()"""
         return OrderedSet()
+
+    def supports_combo_kernels(self) -> bool:
+        return False
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode

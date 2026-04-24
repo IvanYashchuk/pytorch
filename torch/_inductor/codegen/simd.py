@@ -1313,6 +1313,11 @@ class SIMDScheduling(BaseScheduling):
 
     kernel_type: type[Any] = SIMDKernel  # override in subclass
 
+    def supports_combo_kernels(self) -> bool:
+        from .triton import TritonKernel
+
+        return issubclass(self.kernel_type, TritonKernel)
+
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
@@ -2319,11 +2324,14 @@ class SIMDScheduling(BaseScheduling):
 
         Returns a list of (src_code, kernel, node_group) tuples.
         """
-        from .triton import TritonKernel
-        from .triton_combo_kernel import ComboKernel
+        if not self.supports_combo_kernels():
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support combo kernels with "
+                f"kernel type {self.kernel_type.__name__}. Combo kernels "
+                "currently require a TritonKernel-compatible kernel type."
+            )
 
-        # This is currently the only type supported by this method
-        assert issubclass(self.kernel_type, TritonKernel)
+        from .triton_combo_kernel import ComboKernel
 
         fused_node_lists = [node.get_nodes() for node in subkernel_nodes]
         node_schedule_map: dict[Any, NodeInfo] = {}

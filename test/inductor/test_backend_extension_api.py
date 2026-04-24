@@ -24,6 +24,11 @@ from torch._inductor.codegen.triton import (
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.runtime.hints import HeuristicType
 from torch._inductor.runtime.triton_compat import Config
+from torch._inductor.scheduler import (
+    BaseScheduling,
+    ForeachKernelSchedulerNode,
+    Scheduler,
+)
 from torch.testing._internal.common_utils import TestCase
 
 
@@ -302,6 +307,62 @@ class BackendExtensionAPITests(TestCase):
         self.assertIsInstance(
             scheduling._kernel_scheduling, DummyKernelScheduling
         )
+
+    def test_combo_kernel_support_capability(self):
+        class DummyTileKernelScheduling(TileKernelScheduling):
+            pass
+
+        class DummyCombinedScheduling(CUDACombinedScheduling):
+            kernel_scheduling_class = DummyTileKernelScheduling
+
+        self.assertFalse(BaseScheduling(None).supports_combo_kernels())
+        self.assertFalse(DummyTileKernelScheduling(None).supports_combo_kernels())
+        self.assertTrue(TritonScheduling(None).supports_combo_kernels())
+        self.assertTrue(CUDACombinedScheduling(None).supports_combo_kernels())
+        self.assertFalse(DummyCombinedScheduling(None).supports_combo_kernels())
+
+    def test_create_combo_kernel_nodes_skips_unsupported_backend(self):
+        device = torch.device("cuda")
+
+        class DummyNode:
+            def __init__(self, name, min_order):
+                self._name = name
+                self.min_order = min_order
+
+            def get_device(self):
+                return device
+
+            def get_name(self):
+                return self._name
+
+            def is_template(self):
+                return False
+
+            def is_reduction(self):
+                return False
+
+        nodes = [DummyNode("node0", 0), DummyNode("node1", 1)]
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.nodes = nodes[:]
+        scheduler.node_to_stream = {}
+        scheduler.name_to_fused_node = {}
+        scheduler.get_backend = mock.Mock(return_value=BaseScheduling(None))
+        scheduler.speedup_by_combo_kernel = mock.Mock(
+            side_effect=AssertionError("unsupported backend should skip benchmarking")
+        )
+        scheduler.topological_sort_schedule = lambda nodes: list(nodes)
+        scheduler.prune_redundant_deps = mock.Mock()
+
+        with mock.patch.object(
+            ForeachKernelSchedulerNode,
+            "group_algorithm_for_combo_kernels",
+            lambda scheduler: [nodes],
+        ):
+            Scheduler.create_combo_kernel_nodes(scheduler)
+
+        self.assertEqual(scheduler.nodes, nodes)
+        scheduler.get_backend.assert_called_once_with(device)
+        scheduler.speedup_by_combo_kernel.assert_not_called()
 
     def test_triton_tile_kernel_base_classes_are_exposed(self):
         self.assertTrue(issubclass(TritonKernel, TileKernel))
