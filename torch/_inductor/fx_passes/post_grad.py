@@ -24,7 +24,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config, ir, pattern_matcher  # noqa: F401
-from ..codegen.common import custom_backend_passes
+from ..codegen.common import BackendFeature, custom_backend_passes, has_backend_feature
 from ..comms import remove_fsdp2_unsharded_param_graph_input_usage
 from ..fx_utils import FakeTensorUpdater, get_fake_args_kwargs, get_node_storage
 from ..lowering import lowerings as L
@@ -423,13 +423,14 @@ def prepare_softmax_replacement(x, dim):
 
 def prepare_softmax_extra_check(match):
     """
-    We only have triton online softmax kernels currently.
+    Only apply the online softmax replacement for backends that can lower
+    ``online_softmax_reduce``.
     """
     device_type = match.kwargs["x"].meta["val"].device.type
     return (
         config.online_softmax
         and device_type in ["cuda", "xpu"]
-        and getattr(config, f"{device_type}_backend") == "triton"
+        and has_backend_feature(device_type, BackendFeature.ONLINE_SOFTMAX)
     )
 
 

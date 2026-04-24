@@ -558,6 +558,7 @@ class BackendFeature(Enum):
     BUCKETIZE = auto()
     INPLACE_BUFFERS = auto()
     MASKED_SCATTER_WITH_INDEX = auto()
+    ONLINE_SOFTMAX = auto()
     SCAN = auto()
     SORT = auto()
     TUPLE_REDUCTION = auto()

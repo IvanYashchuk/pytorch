@@ -7133,6 +7133,9 @@ class TileKernelScheduling(SIMDScheduling):
 class TritonScheduling(TileKernelScheduling):
     """Scheduling backend for Triton kernel code generation."""
 
+    backend_features = OrderedSet(
+        [*TileKernelScheduling.backend_features, BackendFeature.ONLINE_SOFTMAX]
+    )
     kernel_type = TritonKernel
 
     def codegen_compile_wrapper_close(self, compile_wrapper: IndentedBuffer) -> None:

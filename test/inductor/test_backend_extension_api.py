@@ -2,7 +2,7 @@
 
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from torch._inductor.scheduler import (
     Scheduler,
 )
 from torch.testing._internal.common_utils import TestCase
+from torch.utils._ordered_set import OrderedSet
 
 
 class BackendExtensionAPITests(TestCase):
@@ -320,6 +321,52 @@ class BackendExtensionAPITests(TestCase):
         self.assertTrue(TritonScheduling(None).supports_combo_kernels())
         self.assertTrue(CUDACombinedScheduling(None).supports_combo_kernels())
         self.assertFalse(DummyCombinedScheduling(None).supports_combo_kernels())
+
+    def test_online_softmax_gate_uses_cuda_backend_feature(self):
+        from torch._inductor.fx_passes.post_grad import prepare_softmax_extra_check
+
+        match = SimpleNamespace(
+            kwargs={
+                "x": SimpleNamespace(
+                    meta={"val": SimpleNamespace(device=torch.device("cuda"))}
+                )
+            }
+        )
+
+        class NoOnlineSoftmaxScheduling(BaseScheduling):
+            pass
+
+        class OnlineSoftmaxScheduling(BaseScheduling):
+            def get_backend_features(self, device):
+                return OrderedSet([common.BackendFeature.ONLINE_SOFTMAX])
+
+        self.assertNotIn(
+            common.BackendFeature.ONLINE_SOFTMAX,
+            TileKernelScheduling(None).get_backend_features(torch.device("cuda")),
+        )
+        self.assertIn(
+            common.BackendFeature.ONLINE_SOFTMAX,
+            TritonScheduling(None).get_backend_features(torch.device("cuda")),
+        )
+
+        common.register_cuda_backend(
+            "dummy_cuda_backend", NoOnlineSoftmaxScheduling
+        )
+        with config.patch(cuda_backend="dummy_cuda_backend"):
+            self.assertFalse(prepare_softmax_extra_check(match))
+
+        common._cuda_backends.pop("dummy_cuda_backend")
+        common.register_cuda_backend(
+            "dummy_cuda_backend", OnlineSoftmaxScheduling
+        )
+        with config.patch(cuda_backend="dummy_cuda_backend"):
+            self.assertTrue(prepare_softmax_extra_check(match))
+
+        with config.patch(
+            cuda_backend="dummy_cuda_backend",
+            online_softmax=False,
+        ):
+            self.assertFalse(prepare_softmax_extra_check(match))
 
     def test_create_combo_kernel_nodes_skips_unsupported_backend(self):
         device = torch.device("cuda")
