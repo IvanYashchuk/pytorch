@@ -7,8 +7,9 @@ from unittest import mock
 
 import torch
 from torch import _dynamo as dynamo, _inductor as inductor
-from torch._inductor.codecache import write
-from torch._inductor.cpp_builder import CppBuilder, CppOptions
+from torch._inductor.codecache import _get_cpp_prefix_header, _precompile_header, write
+from torch._inductor.cpu_vec_isa import pick_vec_isa
+from torch._inductor.cpp_builder import CppBuilder, CppOptions, CppTorchDeviceOptions
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import gen_gm_and_inputs
 from torch.fx import symbolic_trace
@@ -229,6 +230,24 @@ class TestStandaloneInductor(TestCase):
             pass  # MacOS not sure that if it should be works.
         else:
             check_linux_debug_section(binary_path)
+
+    def test_inductor_cpp_prefix_header_precompiles_from_source_tree(self):
+        if _IS_WINDOWS:
+            self.skipTest("CppBuilder does not support precompiled headers on Windows")
+
+        header = _get_cpp_prefix_header("cpu")
+        self.assertIsNotNone(header)
+        build_option = CppTorchDeviceOptions(device_type="cpu", vec_isa=pick_vec_isa())
+        cmd_line = CppBuilder(
+            name="o", sources="i.cpp", BuildOption=build_option
+        ).get_command_line()
+
+        _precompile_header(
+            header,
+            cmd_line,
+            device_type="cpu",
+            vec_isa=pick_vec_isa(),
+        )
 
 
 if __name__ == "__main__":

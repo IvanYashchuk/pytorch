@@ -1220,6 +1220,15 @@ def _get_torch_related_args(
 
     libraries = []
     include_dirs = include_paths()
+    pytorch_root = Path(_TORCH_PATH).parent
+    if (pytorch_root / "torch/csrc/inductor/cpp_prefix.h").exists():
+        include_dirs.append(str(pytorch_root))
+    aten_src = pytorch_root / "aten/src"
+    if (aten_src / "ATen/NumericUtils.h").exists():
+        include_dirs.append(str(aten_src))
+    build_aten_src = pytorch_root / "build/aten/src"
+    if (build_aten_src / "ATen").exists():
+        include_dirs.append(str(build_aten_src))
 
     if config.aot_inductor.link_libtorch:
         libraries_dirs = [TORCH_LIB_PATH]
