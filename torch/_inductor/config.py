@@ -2468,9 +2468,10 @@ class rocm:
 # Backend to use for CPU codegen either "cpp" or "triton" (experimental) or "halide" (experimental) or "pallas" (experimental)
 cpu_backend: Literal["cpp", "triton", "halide", "pallas"] = "cpp"
 
-# Backend to use for CUDA codegen either
-# "triton", "halide" (experimental) or "pallas" (experimental)
-cuda_backend: Literal["triton", "halide", "pallas"] = "triton"
+# Backend to use for CUDA codegen. Built-in values are "triton",
+# "halide" (experimental), and "pallas" (experimental). Out-of-tree
+# backends may register additional values with register_cuda_backend().
+cuda_backend: str = "triton"
 
 # Backend to use for TPU codegen
 tpu_backend: Literal["pallas"] = "pallas"
