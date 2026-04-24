@@ -385,6 +385,16 @@ def _validate_backend_name(kind: str, name: str) -> None:
         raise ValueError(
             f"{kind} backend name must be a valid Python identifier; got {name!r}"
         )
+
+
+def _same_registered_symbol(existing: object, candidate: object) -> bool:
+    return existing is candidate or (
+        getattr(existing, "__module__", None) == getattr(candidate, "__module__", None)
+        and getattr(existing, "__qualname__", None)
+        == getattr(candidate, "__qualname__", None)
+    )
+
+
 _cuda_backends: dict[str, SchedulingConstructor] = {}
 _constexpr_syntaxes: dict[str, str] = {"triton": " : tl.constexpr"}
 _dtype_propagation_backends: dict[str, bool] = {
@@ -455,7 +465,7 @@ def register_cuda_backend(
     _validate_backend_name("CUDA", name)
     if (
         existing := _cuda_backends.get(name)
-    ) is not None and existing is not device_scheduling:
+    ) is not None and not _same_registered_symbol(existing, device_scheduling):
         raise ValueError(f"CUDA backend {name!r} is already registered")
     _cuda_backends[name] = device_scheduling
 

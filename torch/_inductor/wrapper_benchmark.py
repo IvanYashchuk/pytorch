@@ -51,6 +51,14 @@ def _validate_backend_name(name: str) -> None:
         raise ValueError(f"Backend name must be a valid Python identifier: {name!r}")
 
 
+def _same_registered_symbol(existing: object, candidate: object) -> bool:
+    return existing is candidate or (
+        getattr(existing, "__module__", None) == getattr(candidate, "__module__", None)
+        and getattr(existing, "__qualname__", None)
+        == getattr(candidate, "__qualname__", None)
+    )
+
+
 def register_kernel_benchmark_provider(
     backend: str, provider: KernelBenchmarkProvider
 ) -> None:
@@ -64,9 +72,11 @@ def register_kernel_benchmark_provider(
     """
     _validate_backend_name(backend)
     existing = _kernel_benchmark_providers.get(backend)
-    if existing is not None and existing is not provider:
+    if existing is not None and not _same_registered_symbol(existing, provider):
         raise ValueError(f"Kernel benchmark provider {backend!r} is already registered")
     _kernel_benchmark_providers[backend] = provider
+
+
 _kernel_category_source_patterns: list[tuple[Pattern[str], str]] = [
     (re.compile(re.escape(f"@triton_heuristics.{choice}")), choice)
     for choice in _kernel_category_choices

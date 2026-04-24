@@ -87,6 +87,15 @@ def _validate_async_compile_backend_name(name: str) -> None:
             f"async compile backend name must be a valid Python identifier; got {name!r}"
         )
 
+
+def _same_registered_symbol(existing: object, candidate: object) -> bool:
+    return existing is candidate or (
+        getattr(existing, "__module__", None) == getattr(candidate, "__module__", None)
+        and getattr(existing, "__qualname__", None)
+        == getattr(candidate, "__qualname__", None)
+    )
+
+
 size_hints_regex = re.compile(
     r"size_hints=(\{.*?\})",
 )
@@ -781,11 +790,11 @@ def register_async_compile_backend(
     _validate_async_compile_backend_name(name)
     if (
         existing := _async_compile_backends.get(name)
-    ) is not None and existing is not compile_fn:
+    ) is not None and not _same_registered_symbol(existing, compile_fn):
         raise ValueError(f"async compile backend {name!r} is already registered")
     if (
         current := getattr(AsyncCompile, name, None)
-    ) is not None and current is not compile_fn:
+    ) is not None and not _same_registered_symbol(current, compile_fn):
         raise ValueError(f"AsyncCompile already has an attribute named {name!r}")
     setattr(AsyncCompile, name, compile_fn)
     _async_compile_backends[name] = compile_fn

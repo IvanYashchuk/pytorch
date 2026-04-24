@@ -96,6 +96,93 @@ class BackendExtensionAPITests(TestCase):
             with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
                 common.register_cuda_backend(name, DummyCudaScheduling)
 
+    def test_backend_registries_accept_reloaded_equivalent_symbols(self):
+        class DummyCudaScheduling(CUDACombinedScheduling):
+            pass
+
+        class ReloadedDummyCudaScheduling(CUDACombinedScheduling):
+            pass
+
+        ReloadedDummyCudaScheduling.__module__ = DummyCudaScheduling.__module__
+        ReloadedDummyCudaScheduling.__qualname__ = DummyCudaScheduling.__qualname__
+
+        def dummy_async_backend(self, kernel_name: str, source_code: str):
+            return "original", kernel_name, source_code
+
+        def reloaded_dummy_async_backend(self, kernel_name: str, source_code: str):
+            return "reloaded", kernel_name, source_code
+
+        reloaded_dummy_async_backend.__module__ = dummy_async_backend.__module__
+        reloaded_dummy_async_backend.__qualname__ = dummy_async_backend.__qualname__
+
+        def dummy_metadata_provider(*args):
+            return None
+
+        def reloaded_dummy_metadata_provider(*args):
+            return None
+
+        reloaded_dummy_metadata_provider.__module__ = (
+            dummy_metadata_provider.__module__
+        )
+        reloaded_dummy_metadata_provider.__qualname__ = (
+            dummy_metadata_provider.__qualname__
+        )
+
+        def dummy_benchmark_provider(*args):
+            return None
+
+        def reloaded_dummy_benchmark_provider(*args):
+            return None
+
+        reloaded_dummy_benchmark_provider.__module__ = (
+            dummy_benchmark_provider.__module__
+        )
+        reloaded_dummy_benchmark_provider.__qualname__ = (
+            dummy_benchmark_provider.__qualname__
+        )
+
+        common.register_cuda_backend("dummy_cuda_backend", DummyCudaScheduling)
+        common.register_cuda_backend(
+            "dummy_cuda_backend", ReloadedDummyCudaScheduling
+        )
+        self.assertIs(
+            common._cuda_backends["dummy_cuda_backend"],
+            ReloadedDummyCudaScheduling,
+        )
+
+        register_async_compile_backend("dummy_async_backend", dummy_async_backend)
+        register_async_compile_backend(
+            "dummy_async_backend", reloaded_dummy_async_backend
+        )
+        self.assertEqual(
+            AsyncCompile().dummy_async_backend("kernel0", "source"),
+            ("reloaded", "kernel0", "source"),
+        )
+
+        metrics.register_kernel_metadata_provider(
+            "dummy_metrics_backend", dummy_metadata_provider
+        )
+        metrics.register_kernel_metadata_provider(
+            "dummy_metrics_backend", reloaded_dummy_metadata_provider
+        )
+        self.assertIs(
+            metrics._kernel_metadata_providers["dummy_metrics_backend"],
+            reloaded_dummy_metadata_provider,
+        )
+
+        wrapper_benchmark.register_kernel_benchmark_provider(
+            "dummy_benchmark_backend", dummy_benchmark_provider
+        )
+        wrapper_benchmark.register_kernel_benchmark_provider(
+            "dummy_benchmark_backend", reloaded_dummy_benchmark_provider
+        )
+        self.assertIs(
+            wrapper_benchmark._kernel_benchmark_providers[
+                "dummy_benchmark_backend"
+            ],
+            reloaded_dummy_benchmark_provider,
+        )
+
     def test_register_backend_wrapper_import(self):
         common.register_backend_wrapper_import(
             "dummy_wrapper_backend", "import dummy_backend"
