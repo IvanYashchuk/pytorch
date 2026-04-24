@@ -75,6 +75,7 @@ kernel_code_log = torch._logging.getArtifactLogger(__name__, "kernel_code")
 log = logging.getLogger(__name__)
 
 _triton_kernel_metrics: dict[str, dict[str, Any]] | None = None
+_async_compile_backends: dict[str, Callable[..., Any]] = {}
 
 size_hints_regex = re.compile(
     r"size_hints=(\{.*?\})",
@@ -754,6 +755,31 @@ class AsyncCompile:
                     "to cause compilation to occur in the main process."
                 ) from e
             pbar.update(1)
+
+
+def register_async_compile_backend(
+    name: str,
+    compile_fn: Callable[..., Any],
+) -> None:
+    """
+    Register an ``AsyncCompile`` method for an out-of-tree codegen backend.
+
+    Generated Inductor wrappers call methods on an ``AsyncCompile`` instance,
+    for example ``async_compile.triton(...)``. This hook lets external backends
+    add methods such as ``async_compile.cutile(...)`` without monkey-patching.
+    """
+    if not name:
+        raise ValueError("async compile backend name must be non-empty")
+    if (
+        existing := _async_compile_backends.get(name)
+    ) is not None and existing is not compile_fn:
+        raise ValueError(f"async compile backend {name!r} is already registered")
+    if (
+        current := getattr(AsyncCompile, name, None)
+    ) is not None and current is not compile_fn:
+        raise ValueError(f"AsyncCompile already has an attribute named {name!r}")
+    setattr(AsyncCompile, name, compile_fn)
+    _async_compile_backends[name] = compile_fn
 
 
 def maybe_warm_pool() -> None:
