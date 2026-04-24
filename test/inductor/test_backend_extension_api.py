@@ -315,6 +315,21 @@ class BackendExtensionAPITests(TestCase):
         self.assertTrue(hasattr(TileKernel, "codegen_bool_load_cast"))
         self.assertEqual(kernel.codegen_bool_load_cast("tmp0"), "tmp0.to(tl.int1)")
 
+    def test_triton_looped_reduction_syntax_is_backend_hook(self):
+        kernel = TritonKernel.__new__(TritonKernel)
+        kernel.index_to_str = lambda expr: "ADVANCE"
+
+        self.assertTrue(hasattr(TileKernel, "codegen_looped_reduction_range"))
+        self.assertTrue(hasattr(TileKernel, "codegen_block_ptr_advance"))
+        self.assertEqual(
+            kernel.codegen_looped_reduction_range("r0", "0", "r0numel"),
+            "for r0offset in tl.range(0, r0numel, R0BLOCK):",
+        )
+        self.assertEqual(
+            kernel.codegen_block_ptr_advance("ptr", [1]),
+            "ptr = tl.advance(ptr, ADVANCE)",
+        )
+
     def test_register_constexpr_syntax(self):
         self.assertEqual(
             common.ArgName("BLOCK", is_constexpr=True).full_name(),

@@ -2913,6 +2913,16 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
     def codegen_arange(self, end: str) -> str:
         raise NotImplementedError
 
+    def codegen_looped_reduction_range(
+        self, prefix: str, loop_start: str, loop_end: str
+    ) -> str:
+        raise NotImplementedError
+
+    def codegen_block_ptr_advance(
+        self, block_ptr: str, advancement: list[sympy.Expr]
+    ) -> str:
+        raise NotImplementedError
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -5344,14 +5354,10 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
                     loop_end = (
                         "rsplit_end" if self.cooperative_reduction else f"{prefix}numel"
                     )
-                    # Conditionalize pipelining on HIP for Triton due to
-                    # reports of numerical inaccuracies on older Triton
-                    if torch.version.hip and get_triton_version() > (3, 2):
-                        num_stages = ", num_stages = 2"
-                    else:
-                        num_stages = ""
                     self.body.writeline(
-                        f"for {prefix}offset in tl.range({loop_start}, {loop_end}, {prefix.upper()}BLOCK{num_stages}):"
+                        self.codegen_looped_reduction_range(
+                            prefix, loop_start, loop_end
+                        )
                     )
                 with self.body.indent(offset=level + 1):
                     self.iteration_ranges_codegen_header(tree, self.body)
@@ -5391,7 +5397,9 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
                         self.body.writeline(
                             DeferredLine(
                                 self.block_ptr_to_buffer[block_ptr],
-                                f"{block_ptr} = tl.advance({block_ptr}, {V.kernel.index_to_str(advancement)})",
+                                self.codegen_block_ptr_advance(
+                                    block_ptr, advancement
+                                ),
                             )
                         )
 
@@ -6481,6 +6489,28 @@ class TritonKernel(TileKernel):
 
     def codegen_arange(self, end: str) -> str:
         return f"tl.arange(0, {end})"
+
+    def codegen_looped_reduction_range(
+        self, prefix: str, loop_start: str, loop_end: str
+    ) -> str:
+        # Conditionalize pipelining on HIP for Triton due to reports of
+        # numerical inaccuracies on older Triton.
+        if torch.version.hip and get_triton_version() > (3, 2):
+            num_stages = ", num_stages = 2"
+        else:
+            num_stages = ""
+        return (
+            f"for {prefix}offset in tl.range({loop_start}, {loop_end}, "
+            f"{prefix.upper()}BLOCK{num_stages}):"
+        )
+
+    def codegen_block_ptr_advance(
+        self, block_ptr: str, advancement: list[sympy.Expr]
+    ) -> str:
+        return (
+            f"{block_ptr} = tl.advance({block_ptr}, "
+            f"{self.index_to_str(advancement)})"
+        )
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return triton_type(dtype)
