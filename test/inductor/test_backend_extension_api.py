@@ -230,6 +230,7 @@ class BackendExtensionAPITests(TestCase):
     def _run_tuned_addmm_provider_harness(
         self,
         *,
+        is_nonzero=True,
         alpha=1,
         beta=1,
         active_backend="dummy_gemm_backend",
@@ -279,7 +280,7 @@ class BackendExtensionAPITests(TestCase):
                 mock.patch.object(
                     mm_kernel,
                     "_is_static_problem",
-                    return_value=(True, True),
+                    return_value=(True, is_nonzero),
                 )
             )
             stack.enter_context(
@@ -651,6 +652,74 @@ class BackendExtensionAPITests(TestCase):
             ],
             "dummy_gemm_backend",
         )
+
+    def test_tuned_addmm_gemm_provider_negative_gates(self):
+        def run_case(
+            *,
+            register_provider=True,
+            provider_result=(),
+            provider_expected_calls=0,
+            expected_choices=(),
+            **harness_kwargs,
+        ):
+            provider_calls = []
+            selector_choices = []
+
+            def dummy_gemm_provider(context):
+                provider_calls.append(context)
+                return provider_result
+
+            def selector(name, choices, input_nodes, layout, **kwargs):
+                selector_choices.extend(choices)
+                return "selected_node", None
+
+            mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
+            if register_provider:
+                mm_kernel.register_gemm_template_provider(
+                    "dummy_gemm_backend", dummy_gemm_provider
+                )
+            try:
+                self._run_tuned_addmm_provider_harness(
+                    selector=selector,
+                    **harness_kwargs,
+                )
+            finally:
+                mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
+
+            self.assertEqual(len(provider_calls), provider_expected_calls)
+            self.assertEqual(selector_choices, list(expected_choices))
+
+        provider_choice = self._DummyChoice("dummy_provider")
+        cases = {
+            "default_config": {
+                "max_autotune": False,
+                "max_autotune_gemm": False,
+            },
+            "wrong_active_backend": {
+                "active_backend": "other_gemm_backend",
+            },
+            "wrong_max_autotune_backend": {
+                "max_autotune_gemm_backends": "TRITON",
+            },
+            "zero_size": {
+                "is_nonzero": False,
+            },
+            "no_registered_provider": {
+                "register_provider": False,
+            },
+            "provider_returns_no_choices": {
+                "provider_result": (),
+                "provider_expected_calls": 1,
+            },
+            "provider_returns_choice": {
+                "provider_result": [provider_choice],
+                "provider_expected_calls": 1,
+                "expected_choices": [provider_choice],
+            },
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name=name):
+                run_case(**kwargs)
 
     def test_tuned_mm_gemm_provider_negative_gates(self):
         def run_case(
