@@ -138,7 +138,7 @@ class CachedMetricsHelper:
 REGISTERED_METRIC_TABLES: dict[str, MetricTable] = {}
 
 KernelMetadataProvider = Callable[
-    [str, str, str, str], dict[str, str | float | None] | None
+    [str, str, str, str], dict[str, str | int | float | None] | None
 ]
 _kernel_metadata_providers: dict[str, KernelMetadataProvider] = {}
 
@@ -174,7 +174,9 @@ class MetricTable:
 
     num_rows_added: int = 0
 
-    def add_row(self, row_fn: Callable[[], dict[str, str | float | None]]) -> None:
+    def add_row(
+        self, row_fn: Callable[[], dict[str, str | int | float | None]]
+    ) -> None:
         if self.table_name not in enabled_metric_tables():
             return
 
@@ -189,7 +191,7 @@ class MetricTable:
         bn = get_benchmark_name()
         # assert bn is not None
         row = [bn] + [row_dict[column_name] for column_name in self.column_names]
-        assert all(isinstance(i, (str, float, type(None))) for i in row)
+        assert all(isinstance(i, (str, int, float, type(None))) for i in row)
         self._write_row(row)
 
     def output_filename(self) -> str:
@@ -201,7 +203,7 @@ class MetricTable:
             writer = csv.writer(fd, lineterminator="\n")
             writer.writerow(["model_name"] + self.column_names)
 
-    def _write_row(self, row: list[str | float | None]) -> None:
+    def _write_row(self, row: list[str | int | float | None]) -> None:
         filename = self.output_filename()
         if self.num_rows_added == 0 and not os.path.exists(filename):
             self.write_header()
