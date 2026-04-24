@@ -97,6 +97,9 @@ class GemmTemplateProviderContext:
     out_dtype: torch.dtype | None
     static_shape: bool
     is_nonzero: bool
+    inp: Buffer | None = None
+    alpha: Any = 1
+    beta: Any = 1
 
 
 GemmTemplateProvider = Callable[
@@ -109,10 +112,11 @@ def register_gemm_template_provider(
     backend: str, provider: GemmTemplateProvider
 ) -> None:
     """
-    Register a backend-owned GEMM template provider for ``aten.mm`` lowering.
+    Register a backend-owned GEMM template provider for GEMM lowerings.
 
-    Providers are called from ``tuned_mm`` for the active CUDA backend and may
-    return additional ``ChoiceCaller`` objects for autotuning. This keeps
+    Providers are called from supported GEMM lowerings such as ``tuned_mm`` and
+    ``tuned_addmm`` for the active CUDA backend and may return additional
+    ``ChoiceCaller`` objects for autotuning. This keeps
     out-of-tree backends from advertising Triton template support only to inject
     their own GEMM templates.
     """
@@ -830,6 +834,28 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
             beta=beta,
             has_bias=True,
         )
+
+    choices.extend(
+        get_backend_gemm_template_choices(
+            get_current_backend(layout.device.type),
+            context=GemmTemplateProviderContext(
+                op_name=name,
+                kernel_inputs=kernel_inputs,
+                layout=layout,
+                mat1=mat1,
+                mat2=mat2,
+                m=m,
+                n=n,
+                k=k,
+                out_dtype=None,
+                static_shape=static_shape,
+                is_nonzero=is_nonzero,
+                inp=inp_expanded,
+                alpha=alpha,
+                beta=beta,
+            ),
+        )
+    )
 
     node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
     return node

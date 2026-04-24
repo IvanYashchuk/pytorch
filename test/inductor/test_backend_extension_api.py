@@ -227,6 +227,84 @@ class BackendExtensionAPITests(TestCase):
                 mat1, mat2, out_dtype=out_dtype
             )
 
+    def _run_tuned_addmm_provider_harness(
+        self,
+        *,
+        alpha=1,
+        beta=1,
+        active_backend="dummy_gemm_backend",
+        max_autotune=False,
+        max_autotune_gemm=True,
+        max_autotune_gemm_backends="DUMMY_GEMM_BACKEND",
+        selector=None,
+    ):
+        class FakeChoices:
+            def get_template_configs(self, *args, **kwargs):
+                return []
+
+        inp = self._FakeBuffer([16, 8])
+        mat1 = self._FakeBuffer([16, 32])
+        mat2 = self._FakeBuffer([32, 8])
+        inp_expanded = self._FakeBuffer([16, 8])
+        layout = SimpleNamespace(device=torch.device("cuda"), dtype=torch.float32)
+
+        if selector is None:
+
+            def selector(name, choices, input_nodes, layout, **kwargs):
+                return "selected_node", None
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                config.patch(
+                    cuda_backend=active_backend,
+                    max_autotune=max_autotune,
+                    max_autotune_gemm=max_autotune_gemm,
+                    max_autotune_gemm_backends=max_autotune_gemm_backends,
+                )
+            )
+            stack.enter_context(
+                mm_kernel.V.set_choices_handler(FakeChoices())
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_native_matmul", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "mm_args",
+                    return_value=(16, 8, 32, layout, mat1, mat2, inp_expanded),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    mm_kernel,
+                    "_is_static_problem",
+                    return_value=(True, True),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_aten_gemm_kernels", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_triton_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_cutlass_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_ck_gemm_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "use_cpp_gemm_template", return_value=False)
+            )
+            stack.enter_context(
+                mock.patch.object(mm_kernel, "autotune_select_algorithm", selector)
+            )
+
+            return mm_kernel.tuned_addmm.__wrapped__(
+                inp, mat1, mat2, alpha=alpha, beta=beta
+            )
+
     def test_register_cuda_backend_before_init(self):
         class DummyCudaScheduling(CUDACombinedScheduling):
             pass
@@ -518,6 +596,53 @@ class BackendExtensionAPITests(TestCase):
         self.assertEqual(context.n, 8)
         self.assertEqual(context.k, 32)
         self.assertIsNone(context.out_dtype)
+        self.assertTrue(context.static_shape)
+        self.assertTrue(context.is_nonzero)
+        self.assertEqual(
+            provider_choice.annotations[
+                select_algorithm.GEMM_TEMPLATE_PROVIDER_ANNOTATION
+            ],
+            "dummy_gemm_backend",
+        )
+
+    def test_tuned_addmm_gemm_provider_choice_reaches_selection(self):
+        provider_choice = self._DummyChoice("dummy_provider", "provider")
+        provider_contexts = []
+        selector_choices = []
+        selector_input_nodes = []
+
+        def dummy_gemm_provider(context):
+            provider_contexts.append(context)
+            return [provider_choice]
+
+        def selector(name, choices, input_nodes, layout, **kwargs):
+            selector_choices.extend(choices)
+            selector_input_nodes.extend(input_nodes)
+            return choices[-1].output_node(), choices[-1]
+
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+
+        result = self._run_tuned_addmm_provider_harness(
+            alpha=1,
+            beta=1,
+            selector=selector,
+        )
+
+        self.assertEqual(result, "dummy_provider_node")
+        self.assertEqual(selector_choices, [provider_choice])
+        self.assertEqual(len(provider_contexts), 1)
+        context = provider_contexts[0]
+        self.assertEqual(context.op_name, "addmm")
+        self.assertIs(context.inp, selector_input_nodes[0])
+        self.assertIs(context.mat1, selector_input_nodes[1])
+        self.assertIs(context.mat2, selector_input_nodes[2])
+        self.assertEqual(context.alpha, 1)
+        self.assertEqual(context.beta, 1)
+        self.assertEqual(context.m, 16)
+        self.assertEqual(context.n, 8)
+        self.assertEqual(context.k, 32)
         self.assertTrue(context.static_shape)
         self.assertTrue(context.is_nonzero)
         self.assertEqual(
