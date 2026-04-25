@@ -5622,9 +5622,12 @@ class ChoiceCaller:
         self.failed = True
 
 
-class TritonTemplateCallerBase(ChoiceCaller):
+class TemplateChoiceCallerBase(ChoiceCaller):
     def get_make_kernel_render(self) -> Any:
         raise NotImplementedError
+
+
+TritonTemplateCallerBase = TemplateChoiceCallerBase
 
 
 class MultiTemplateBuffer(TritonTemplateBuffer):
@@ -5655,7 +5658,7 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
         self._choices: list[ChoiceCaller] = unfiltered_choices
         self.original_inputs = inputs
         self._output_plannable = all(
-            isinstance(choice, TritonTemplateCallerBase)
+            isinstance(choice, TemplateChoiceCallerBase)
             or (
                 isinstance(choice, torch._inductor.select_algorithm.ExternKernelCaller)
                 and choice.has_out_variant
@@ -5683,10 +5686,9 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
         return self._choice_timings[hint_override]
 
     @contextlib.contextmanager
-    def swap_as_triton_caller(self, caller: TritonTemplateCallerBase) -> Iterator[None]:
-        assert isinstance(
-            caller, torch._inductor.select_algorithm.TritonTemplateCaller
-        ), type(caller)
+    def swap_as_template_caller(
+        self, caller: TemplateChoiceCallerBase
+    ) -> Iterator[None]:
         assert self.layout == caller.layout
 
         render = self.make_kernel_render
@@ -5696,13 +5698,20 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
         finally:
             self.make_kernel_render = render
 
-    def finalize_as_triton_caller(self, caller: TritonTemplateCallerBase) -> None:
-        assert isinstance(
-            caller, torch._inductor.select_algorithm.TritonTemplateCaller
-        ), type(caller)
+    @contextlib.contextmanager
+    def swap_as_triton_caller(self, caller: TritonTemplateCallerBase) -> Iterator[None]:
+        with self.swap_as_template_caller(caller):
+            yield
+
+    def finalize_as_template_caller(
+        self, caller: TemplateChoiceCallerBase
+    ) -> None:
         assert self.get_size() == caller.layout.size
         assert self.get_stride() == caller.layout.stride
         self.make_kernel_render = caller.get_make_kernel_render()
+
+    def finalize_as_triton_caller(self, caller: TritonTemplateCallerBase) -> None:
+        self.finalize_as_template_caller(caller)
 
     def get_min_choice(
         self, hint_override: int | None = None
@@ -5711,8 +5720,8 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
         min_choice = min(timings, key=timings.get)  # type: ignore[arg-type]
         return (min_choice, timings[min_choice])
 
-    def finalize_as_triton_callers(
-        self, callers: dict[int | None, TritonTemplateCallerBase]
+    def finalize_as_template_callers(
+        self, callers: dict[int | None, TemplateChoiceCallerBase]
     ) -> None:
         """Finalize with multiple callers for different hint overrides"""
         for hint_override, caller in callers.items():
@@ -5720,6 +5729,11 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
 
         # Set the default to be the one without hint override
         self.make_kernel_render = self._make_kernel_renders[None]
+
+    def finalize_as_triton_callers(
+        self, callers: dict[int | None, TritonTemplateCallerBase]
+    ) -> None:
+        self.finalize_as_template_callers(callers)
 
 
 class CUTLASSTemplateBuffer(TemplateBuffer):

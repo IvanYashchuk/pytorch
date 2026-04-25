@@ -724,6 +724,128 @@ class BackendExtensionAPITests(TestCase):
             [],
         )
 
+    def test_gemm_provider_backend_neutral_template_caller_reaches_multi_template_buffer(
+        self,
+    ):
+        class DummyBenchmarkRequest:
+            module_path = "/tmp/dummy_template.py"
+            module_cache_key = "dummy_cache_key"
+            num_stages = 1
+            num_warps = 2
+            n_regs = None
+
+            def benchmark(self, *args, **kwargs):
+                raise AssertionError("not used")
+
+        class DummyTemplateCaller(select_algorithm.TemplateCaller):
+            backend = "Dummy"
+
+        class FakeGraph:
+            def __init__(self):
+                self.next_buffer_index = 0
+                self.operations = []
+
+            def register_buffer(self, buffer):
+                name = f"buf{self.next_buffer_index}"
+                self.next_buffer_index += 1
+                return name
+
+            def register_operation(self, operation):
+                self.operations.append(operation)
+
+        layout = select_algorithm.ir.FixedLayout(
+            torch.device("cuda"), torch.float32, [16, 8]
+        )
+
+        def make_kernel_render():
+            return "dummy-render"
+
+        provider_choice = DummyTemplateCaller(
+            "dummy_template_0",
+            (),
+            layout,
+            make_kernel_render,
+            "provider",
+            DummyBenchmarkRequest(),
+            log_info={"tile_shape": "(16, 32, 8)"},
+            allowed_prologue_inps=OrderedSet(["arg0"]),
+        )
+
+        def dummy_gemm_provider(context):
+            return [provider_choice]
+
+        mm_kernel.register_gemm_template_provider(
+            "dummy_gemm_backend", dummy_gemm_provider
+        )
+        context = mm_kernel.GemmTemplateProviderContext(
+            op_name="mm",
+            kernel_inputs="kernel_inputs",
+            layout=layout,
+            mat1=self._FakeBuffer([16, 32]),
+            mat2=self._FakeBuffer([32, 8]),
+            m=16,
+            n=8,
+            k=32,
+            out_dtype=None,
+            static_shape=True,
+            is_nonzero=True,
+        )
+
+        with config.patch(
+            max_autotune_gemm=True,
+            max_autotune_gemm_backends="DUMMY_GEMM_BACKEND",
+        ):
+            choices = mm_kernel.get_backend_gemm_template_choices(
+                "dummy_gemm_backend",
+                context=context,
+            )
+
+        self.assertEqual(choices, [provider_choice])
+        self.assertEqual(
+            provider_choice.annotations[
+                select_algorithm.GEMM_TEMPLATE_PROVIDER_ANNOTATION
+            ],
+            "dummy_gemm_backend",
+        )
+        self.assertIsInstance(
+            provider_choice, select_algorithm.ir.TritonTemplateCallerBase
+        )
+        self.assertNotIsInstance(
+            provider_choice, select_algorithm.TritonTemplateCaller
+        )
+
+        with select_algorithm.ir.V.set_graph_handler(FakeGraph()):
+            multi_template_buffer = select_algorithm.ir.MultiTemplateBuffer(
+                layout=layout,
+                inputs=(),
+                choice_timings_fn=lambda hint_override: {provider_choice: 1.0},
+                unfiltered_choices=choices,
+                allowed_prologue_inps=OrderedSet(["arg0"]),
+            )
+
+            self.assertTrue(multi_template_buffer.output_plannable)
+            multi_template_buffer.finalize_as_template_caller(provider_choice)
+            self.assertIs(
+                multi_template_buffer.make_kernel_render, make_kernel_render
+            )
+            multi_template_buffer.finalize_as_triton_caller(provider_choice)
+            self.assertIs(
+                multi_template_buffer.make_kernel_render, make_kernel_render
+            )
+
+            multi_template_buffer.make_kernel_render = None
+            with multi_template_buffer.swap_as_template_caller(provider_choice):
+                self.assertIs(
+                    multi_template_buffer.make_kernel_render, make_kernel_render
+                )
+            self.assertIsNone(multi_template_buffer.make_kernel_render)
+
+            with multi_template_buffer.swap_as_triton_caller(provider_choice):
+                self.assertIs(
+                    multi_template_buffer.make_kernel_render, make_kernel_render
+                )
+            self.assertIsNone(multi_template_buffer.make_kernel_render)
+
     def test_tuned_mm_gemm_provider_choice_reaches_selection(self):
         provider_choice = self._DummyChoice("dummy_provider", "provider")
         ah_choice = self._DummyChoice("autoheuristic", "autoheuristic")

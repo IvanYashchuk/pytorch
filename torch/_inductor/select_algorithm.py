@@ -2758,6 +2758,78 @@ class TritonTemplate(KernelTemplate):
             kernel_options,
         )
 
+    def _make_benchmark_request(
+        self,
+        *,
+        layout: ir.Layout,
+        module_path: str,
+        module_cache_key: str,
+        kernel_name: str,
+        extra_args: list[Any],
+        num_stages: int,
+        num_warps: int,
+        num_consumer_groups: int,
+        num_buffers_warp_spec: int,
+        matrix_instr_nonkdim: int,
+        waves_per_eu: int,
+        kpack: int,
+        workspace_size: int | None,
+        workspace_zero_fill: bool,
+        input_tensor_meta: TensorMeta | list[TensorMeta],
+        output_tensor_meta: TensorMeta | list[TensorMeta],
+    ) -> TritonBenchmarkRequest:
+        bmreq_cls: type[TritonBenchmarkRequest]
+        if layout.device.type == "cpu":
+            bmreq_cls = TritonCPUBenchmarkRequest
+        else:
+            bmreq_cls = TritonGPUBenchmarkRequest
+        return bmreq_cls(
+            module_path=module_path,
+            module_cache_key=module_cache_key,
+            kernel_name=kernel_name,
+            extra_args=extra_args,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            num_consumer_groups=num_consumer_groups,
+            num_buffers_warp_spec=num_buffers_warp_spec,
+            matrix_instr_nonkdim=matrix_instr_nonkdim,
+            waves_per_eu=waves_per_eu,
+            kpack=kpack,
+            workspace_size=workspace_size,
+            workspace_zero_fill=workspace_zero_fill,
+            input_tensor_meta=input_tensor_meta,
+            output_tensor_meta=output_tensor_meta,
+        )
+
+    def _make_template_caller(
+        self,
+        *,
+        name: str,
+        input_nodes: tuple[ir.IRNode, ...],
+        layout: ir.Layout,
+        make_kernel_render: Callable[..., Any],
+        description: str,
+        bmreq: Any,
+        log_info: dict[str, PrimitiveInfoType | list[PrimitiveInfoType]],
+        mutated_inputs: list[ir.IRNode] | None,
+        workspace_arg: WorkspaceArg | None,
+        allowed_prologue_inps: OrderedSet[str],
+        hint_override: int | None,
+    ) -> ir.ChoiceCaller:
+        return TritonTemplateCaller(
+            name,
+            input_nodes,
+            layout,
+            make_kernel_render,
+            description,
+            bmreq,
+            log_info=log_info,
+            mutated_inputs=mutated_inputs,
+            workspace_arg=workspace_arg,
+            allowed_prologue_inps=allowed_prologue_inps,
+            hint_override=hint_override,
+        )
+
     def generate(  # type: ignore[override]
         self,
         input_nodes: tuple[ir.IRNode, ...],
@@ -2923,12 +2995,8 @@ class TritonTemplate(KernelTemplate):
             ),
             kwargs,
         )
-        bmreq_cls: type[TritonBenchmarkRequest]
-        if layout.device.type == "cpu":
-            bmreq_cls = TritonCPUBenchmarkRequest
-        else:
-            bmreq_cls = TritonGPUBenchmarkRequest
-        bmreq = bmreq_cls(
+        bmreq = self._make_benchmark_request(
+            layout=layout,
             module_path=result.mod.__file__,
             module_cache_key=result.mod.key,
             kernel_name=f"triton_{self.name}",
@@ -2961,13 +3029,13 @@ class TritonTemplate(KernelTemplate):
             "UNROLL",
         ]
 
-        return TritonTemplateCaller(
-            kernel_hash_name,
-            codegen_input_nodes,
-            layout,
-            make_kernel_render,
-            result.extra.strip("-").replace("-", ", "),
-            bmreq,
+        return self._make_template_caller(
+            name=kernel_hash_name,
+            input_nodes=codegen_input_nodes,
+            layout=layout,
+            make_kernel_render=make_kernel_render,
+            description=result.extra.strip("-").replace("-", ", "),
+            bmreq=bmreq,
             log_info={
                 "tile_shape": str(
                     (
@@ -3111,10 +3179,12 @@ class ExternKernelChoice:
         return None
 
 
-class TritonTemplateCaller(ir.TritonTemplateCallerBase):
+class TemplateCaller(ir.TemplateChoiceCallerBase):
     """
-    Represents a ChoiceCaller for a TritonTemplate
+    Backend-neutral ChoiceCaller for generated template kernels.
     """
+
+    backend = "Template"
 
     def __init__(
         self,
@@ -3132,15 +3202,15 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
         self.make_kernel_render = make_kernel_render
-        self.bmreq: TritonBenchmarkRequest = bmreq
+        self.bmreq: Any = bmreq
         if log_info is None:
             log_info = {}
         self.log_info: dict[str, Any] = log_info
         self.log_info.update(
             {
-                "backend": "Triton",
-                "num_stages": self.bmreq.num_stages,
-                "num_warps": self.bmreq.num_warps,
+                "backend": self.backend,
+                "num_stages": getattr(self.bmreq, "num_stages", 0),
+                "num_warps": getattr(self.bmreq, "num_warps", 0),
             }
         )
         self.mutated_inputs = mutated_inputs
@@ -3165,12 +3235,13 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
 
     def precompile(self):
         assert self.bmreq is not None
-        self.bmreq.precompile()
+        if hasattr(self.bmreq, "precompile"):
+            self.bmreq.precompile()
 
-        self.n_regs = self.bmreq.n_regs
+        self.n_regs = getattr(self.bmreq, "n_regs", None)
 
     def __str__(self) -> str:
-        return f"TritonTemplateCaller({self.bmreq.module_path}, {self.description})"
+        return f"{type(self).__name__}({self.bmreq.module_path}, {self.description})"
 
     def call_name(self):
         return f"template_kernels.{self.name}"
@@ -3202,6 +3273,17 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
 
     def get_make_kernel_render(self):
         return self.make_kernel_render
+
+    def autoheuristic_id(self):
+        return "unsupported_choice"
+
+
+class TritonTemplateCaller(TemplateCaller):
+    """
+    Represents a ChoiceCaller for a TritonTemplate
+    """
+
+    backend = "Triton"
 
     def autoheuristic_id(self):
         type_name = "triton"
@@ -3630,7 +3712,7 @@ def _classify_kernel_operation(
     # First, try to classify from choice types
     if choices:
         for choice in choices:
-            if isinstance(choice, TritonTemplateCaller):
+            if isinstance(choice, ir.TemplateChoiceCallerBase):
                 # Extract template name (e.g., "mm" from "mm_1", "convolution2d" from "convolution2d_3")
                 template_name = choice.name.rsplit("_", 1)[0]
 
@@ -3952,7 +4034,9 @@ class AlgorithmSelectorCache(PersistentCache):
             # choices which don't support the whole union.
             allowed_prologue_inps: OrderedSet[str] = OrderedSet()
             for c in choices:
-                if isinstance(c, TritonTemplateCaller):
+                if isinstance(c, ir.TemplateChoiceCallerBase) and hasattr(
+                    c, "allowed_prologue_inps"
+                ):
                     allowed_prologue_inps |= c.allowed_prologue_inps
 
             # No single winning choice yet; selection is deferred to benchmark fusion
@@ -5228,9 +5312,14 @@ class AlgorithmSelectorCache(PersistentCache):
             if isinstance(choice, ExternKernelCaller):
                 return {"type": "cublas", "time": timings[choice]}
 
-            if isinstance(choice, TritonTemplateCaller):
+            if isinstance(choice, ir.TemplateChoiceCallerBase):
                 info = choice.info_dict()
-                tile = info["tile_shape"]
+                tile = info.get("tile_shape")
+                if tile is None:
+                    return {
+                        "type": str(info.get("backend", "template")).lower(),
+                        "time": timings[choice],
+                    }
 
                 tile_vals = eval(tile)  # type: ignore[arg-type]
                 BLOCK_M = tile_vals[0]
@@ -5238,7 +5327,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 BLOCK_N = tile_vals[2]
 
                 return {
-                    "type": "triton",
+                    "type": str(info.get("backend", "template")).lower(),
                     "time": timings[choice],
                     "BLOCK_M": BLOCK_M,
                     "BLOCK_K": BLOCK_K,
