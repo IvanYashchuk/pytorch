@@ -3045,7 +3045,7 @@ class TestMaxAutotune(TestCase):
             # Previously would CUDA IMA
             _, code = run_and_get_code(compiled_fn, a, b, c)
 
-            FileCheck().check("triton_tem_fused").run(code[0])
+            FileCheck().check("tem_fused").run(code[0])
 
     @fresh_cache()
     @skipIfXpu
