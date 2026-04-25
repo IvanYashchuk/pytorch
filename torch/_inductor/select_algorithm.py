@@ -3228,9 +3228,15 @@ class TemplateCaller(ir.TemplateChoiceCallerBase):
             config.profile_bandwidth_with_do_bench_using_profiling
             and not self._benchmark_with_cudagraphs
         ):
-            algo = self.bmreq.make_run_fn(*args, out=out)
+            if hasattr(self.bmreq, "make_run_fn"):
+                algo = self.bmreq.make_run_fn(*args, out=out)
+            else:
+                def algo():
+                    return self.bmreq.benchmark(*args, out=out)
+
             return do_bench_using_profiling(algo)
-        self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
+        if hasattr(self.bmreq, "benchmark_with_cudagraphs"):
+            self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
         return self.bmreq.benchmark(*args, out=out)
 
     def precompile(self):
@@ -3241,16 +3247,22 @@ class TemplateCaller(ir.TemplateChoiceCallerBase):
         self.n_regs = getattr(self.bmreq, "n_regs", None)
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}({self.bmreq.module_path}, {self.description})"
+        module_path = getattr(self.bmreq, "module_path", type(self.bmreq).__name__)
+        return f"{type(self).__name__}({module_path}, {self.description})"
 
     def call_name(self):
         return f"template_kernels.{self.name}"
 
     def hash_key(self):
+        module_cache_key = getattr(
+            self.bmreq,
+            "module_cache_key",
+            code_hash(f"{type(self.bmreq).__module__}.{type(self.bmreq).__qualname__}"),
+        )
         return "-".join(
             [
                 self.name.rsplit("_", 1)[0],
-                self.bmreq.module_cache_key,
+                module_cache_key,
             ]
         )
 
@@ -5314,30 +5326,29 @@ class AlgorithmSelectorCache(PersistentCache):
 
             if isinstance(choice, ir.TemplateChoiceCallerBase):
                 info = choice.info_dict()
+                choice_type = str(info.get("backend", "template")).lower()
+                result = {
+                    "type": choice_type,
+                    "time": timings[choice],
+                }
+                for key, value in info.items():
+                    if key == "backend":
+                        continue
+                    try:
+                        json.dumps(value)
+                        result[key] = value
+                    except (TypeError, ValueError):
+                        result[key] = str(value)
+
                 tile = info.get("tile_shape")
                 if tile is None:
-                    return {
-                        "type": str(info.get("backend", "template")).lower(),
-                        "time": timings[choice],
-                    }
+                    return result
 
                 tile_vals = eval(tile)  # type: ignore[arg-type]
-                BLOCK_M = tile_vals[0]
-                BLOCK_K = tile_vals[1]
-                BLOCK_N = tile_vals[2]
-
-                return {
-                    "type": str(info.get("backend", "template")).lower(),
-                    "time": timings[choice],
-                    "BLOCK_M": BLOCK_M,
-                    "BLOCK_K": BLOCK_K,
-                    "BLOCK_N": BLOCK_N,
-                    "num_stages": info["num_stages"],
-                    "num_warps": info["num_warps"],
-                    "waves_per_eu": info.get("waves_per_eu", 0),
-                    "matrix_instr_nonkdim": info.get("matrix_instr_nonkdim", 0),
-                    "kpack": info.get("kpack", 2),
-                }
+                result.setdefault("BLOCK_M", tile_vals[0])
+                result.setdefault("BLOCK_K", tile_vals[1])
+                result.setdefault("BLOCK_N", tile_vals[2])
+                return result
             return None
 
         out_dict = {

@@ -740,6 +740,10 @@ class BackendExtensionAPITests(TestCase):
         class DummyTemplateCaller(select_algorithm.TemplateCaller):
             backend = "Dummy"
 
+        class MinimalBenchmarkRequest:
+            def benchmark(self, *args, **kwargs):
+                return 3.14
+
         class FakeGraph:
             def __init__(self):
                 self.next_buffer_index = 0
@@ -845,6 +849,26 @@ class BackendExtensionAPITests(TestCase):
                     multi_template_buffer.make_kernel_render, make_kernel_render
                 )
             self.assertIsNone(multi_template_buffer.make_kernel_render)
+
+        minimal_choice = DummyTemplateCaller(
+            "dummy_minimal_0",
+            (),
+            layout,
+            make_kernel_render,
+            "minimal",
+            MinimalBenchmarkRequest(),
+        )
+        self.assertIn("MinimalBenchmarkRequest", str(minimal_choice))
+        self.assertIn("dummy_minimal", minimal_choice.hash_key())
+        with (
+            config.patch(profile_bandwidth_with_do_bench_using_profiling=True),
+            mock.patch.object(
+                select_algorithm,
+                "do_bench_using_profiling",
+                side_effect=lambda fn: fn(),
+            ),
+        ):
+            self.assertEqual(minimal_choice.benchmark(out=object()), 3.14)
 
     def test_tuned_mm_gemm_provider_choice_reaches_selection(self):
         provider_choice = self._DummyChoice("dummy_provider", "provider")
