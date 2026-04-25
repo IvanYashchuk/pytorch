@@ -19,6 +19,7 @@ from ..select_algorithm import (
 )
 from ..utils import (
     _use_cutlass_for_op,
+    get_current_backend,
     use_aten_gemm_kernels,
     use_ck_gemm_template,
     use_cpp_bmm_template,
@@ -33,6 +34,7 @@ from .mm_common import (
     mm_args,
     use_native_matmul,
 )
+from .mm import GemmTemplateProviderContext, get_backend_gemm_template_choices
 
 
 if TYPE_CHECKING:
@@ -210,7 +212,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
             kwarg_overrides=kwarg_overrides,
         )
     )
-    _, is_nonzero = _is_static_problem(layout)
+    static_shape, is_nonzero = _is_static_problem(layout)
     batch_stride_largest_or_zero = is_batch_stride_largest_or_zero(mat1, mat2, layout)
     if (
         batch_stride_largest_or_zero
@@ -241,6 +243,27 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
         add_nv_universal_gemm_choices(choices, layout, kernel_inputs)
 
+    if out_dtype is None and is_nonzero:
+        choices.extend(
+            get_backend_gemm_template_choices(
+                get_current_backend(layout.device.type),
+                context=GemmTemplateProviderContext(
+                    op_name=name,
+                    kernel_inputs=kernel_inputs,
+                    layout=layout,
+                    mat1=mat1,
+                    mat2=mat2,
+                    m=m,
+                    n=n,
+                    k=k,
+                    out_dtype=out_dtype,
+                    static_shape=static_shape,
+                    is_nonzero=is_nonzero,
+                    batch_size=batch_size,
+                ),
+            )
+        )
+
     node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
     return node
 
@@ -265,6 +288,7 @@ def tuned_baddbmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
 
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
     m, n, k, layout, mat1, mat2, inp = mm_args(mat1, mat2, inp, layout=layout)
+    static_shape, is_nonzero = _is_static_problem(layout)
 
     # Create MMKernelInputs for BadDBMM at the top
     kernel_inputs = MMKernelInputs(
@@ -302,6 +326,30 @@ def tuned_baddbmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     choices.extend(
         V.choices.get_template_configs(kernel_inputs, templates_to_use, name)
     )
+
+    if is_nonzero:
+        choices.extend(
+            get_backend_gemm_template_choices(
+                get_current_backend(layout.device.type),
+                context=GemmTemplateProviderContext(
+                    op_name=name,
+                    kernel_inputs=kernel_inputs,
+                    layout=layout,
+                    mat1=mat1,
+                    mat2=mat2,
+                    m=m,
+                    n=n,
+                    k=k,
+                    out_dtype=None,
+                    static_shape=static_shape,
+                    is_nonzero=is_nonzero,
+                    inp=inp,
+                    alpha=alpha,
+                    beta=beta,
+                    batch_size=batch_size,
+                ),
+            )
+        )
 
     node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
     return node

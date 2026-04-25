@@ -100,6 +100,7 @@ class GemmTemplateProviderContext:
     inp: Buffer | None = None
     alpha: Any = 1
     beta: Any = 1
+    batch_size: Any | None = None
 
 
 GemmTemplateProvider = Callable[
