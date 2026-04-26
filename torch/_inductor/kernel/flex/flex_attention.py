@@ -21,10 +21,16 @@ from ...ir import ComputedBuffer, ExternKernel, FixedLayout, TensorBox
 from ...lowering import empty, empty_strided, lowerings, register_lowering, to_dtype
 from ...select_algorithm import (
     autotune_select_algorithm,
+    # Re-exported from this module for backend extension registration.
+    FlexAttentionTemplateProvider,
+    FlexAttentionTemplateProviderContext,
+    get_backend_flex_attention_template_choices,
+    get_flex_attention_template_provider,
+    register_flex_attention_template_provider,
     SymbolicGridFn,
     TritonTemplate,
 )
-from ...utils import can_use_tma
+from ...utils import can_use_tma, get_current_backend
 from .common import (
     build_subgraph_buffer,
     create_indices_fake,
@@ -58,6 +64,24 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
 Expr = sympy.Expr
+
+
+def _use_builtin_triton_flex_template(
+    active_backend: str, flex_backend: _Backend
+) -> bool:
+    return active_backend == "triton" or flex_backend in ("TRITON", "TRITON_DECODE")
+
+
+def _raise_unsupported_flex_attention_backend(
+    op_name: str, active_backend: str
+) -> None:
+    raise NotImplementedError(
+        f"{op_name} has no template provider registered for backend "
+        f"{active_backend!r}. Register one with "
+        "torch._inductor.select_algorithm.register_flex_attention_template_provider(), "
+        "or select the built-in Triton FlexAttention path explicitly with "
+        "BACKEND='TRITON' or BACKEND='TRITON_DECODE'."
+    )
 
 
 def _sanitize_kernel_options_for_triton(
@@ -241,6 +265,7 @@ def flex_attention(
             mask_graph_buffer,
             score_mod_other_buffers,
             mask_mod_other_buffers,
+            flex_backend=backend,
         )
 
     (
@@ -394,6 +419,10 @@ def flex_attention(
     num_consumer_groups, num_buffers_warp_spec = 0, 0
 
     for conf in configs:
+        active_backend = get_current_backend(query.get_device().type)
+        if not _use_builtin_triton_flex_template(active_backend, backend):
+            break
+
         cur_kernel_options = original_kernel_options.copy()
         # Performance tuning
         # Triton parameters
@@ -470,6 +499,41 @@ def flex_attention(
         )
         if error is not None and len(configs) == 1:
             raise error
+
+    active_backend = get_current_backend(query.get_device().type)
+    provider_input_nodes = [
+        query,
+        key,
+        value,
+        logsumexp,
+        max_scores,
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+    ]
+    choices.extend(
+        get_backend_flex_attention_template_choices(
+            active_backend,
+            FlexAttentionTemplateProviderContext(
+                op_name="flex_attention",
+                input_nodes=provider_input_nodes,
+                layout=layout,
+                subgraphs=[
+                    subgraph_buffer,
+                    mask_graph_buffer,
+                ],
+                mutated_inputs=[
+                    logsumexp,
+                    max_scores,
+                ],
+                call_sizes=query.get_size(),
+                kernel_options=original_kernel_options.copy(),
+            ),
+        )
+    )
+    if not choices and not _use_builtin_triton_flex_template(active_backend, backend):
+        _raise_unsupported_flex_attention_backend("flex_attention", active_backend)
     inputs_for_autotuning = (
         [
             query,
@@ -911,6 +975,10 @@ def flex_attention_backward(*args, **kwargs):
     original_kernel_options = kernel_options.copy()
 
     for conf in configs:
+        active_backend = get_current_backend(query.get_device().type)
+        if not _use_builtin_triton_flex_template(active_backend, backend):
+            break
+
         if (
             SPARSE_KV_BLOCK_SIZE % conf.block_n1 != 0
             or SPARSE_Q_BLOCK_SIZE % conf.block_m1 != 0
@@ -992,6 +1060,52 @@ def flex_attention_backward(*args, **kwargs):
             ],
             call_sizes=query.get_size() + key.get_size()[1:3],
             **cur_kernel_options,
+        )
+    active_backend = get_current_backend(query.get_device().type)
+    provider_input_nodes = [
+        query,
+        key,
+        value,
+        logsumexp,
+        delta,
+        grad_out,
+        grad_query,
+        broadcasted_grad_value,
+        kv_num_blocks,
+        kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        full_q_num_blocks,
+        full_q_indices,
+    ]
+    choices.extend(
+        get_backend_flex_attention_template_choices(
+            active_backend,
+            FlexAttentionTemplateProviderContext(
+                op_name="flex_attention_backward",
+                input_nodes=provider_input_nodes,
+                layout=layout_broadcasted_k,
+                subgraphs=[
+                    fw_subgraph_buffer,
+                    joint_outputs.grad_input,
+                    mask_graph_buffer,
+                    joint_outputs.captured_grads_compute,
+                ],
+                mutated_inputs=[
+                    grad_query,
+                    broadcasted_grad_value,
+                    *joint_outputs.mutated_grads,
+                ],
+                call_sizes=query.get_size() + key.get_size()[1:3],
+                kernel_options=original_kernel_options.copy(),
+            ),
+        )
+    )
+    if not choices and not _use_builtin_triton_flex_template(active_backend, backend):
+        _raise_unsupported_flex_attention_backend(
+            "flex_attention_backward", active_backend
         )
     inputs_for_autotuning = (
         [

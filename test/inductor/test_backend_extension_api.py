@@ -9,7 +9,12 @@ from unittest import mock
 from pathlib import Path
 
 import torch
-from torch._inductor import config, metrics, select_algorithm, wrapper_benchmark
+from torch._inductor import (
+    config,
+    metrics,
+    select_algorithm,
+    wrapper_benchmark,
+)
 from torch._inductor.async_compile import (
     _async_compile_backends,
     AsyncCompile,
@@ -25,6 +30,7 @@ from torch._inductor.codegen.triton import (
 )
 from torch._inductor.kernel import bmm as bmm_kernel
 from torch._inductor.kernel import mm as mm_kernel
+from torch._inductor.kernel.flex import flex_attention as flex_attention_kernel
 from torch._inductor.runtime import triton_heuristics
 from torch._inductor.runtime.hints import HeuristicType
 from torch._inductor.runtime.triton_compat import Config
@@ -87,6 +93,9 @@ class BackendExtensionAPITests(TestCase):
             "dummy_benchmark_backend", None
         )
         mm_kernel._gemm_template_providers.pop("dummy_gemm_backend", None)
+        select_algorithm._flex_attention_template_providers.pop(
+            "dummy_flex_backend", None
+        )
         _async_compile_backends.pop("dummy_async_backend", None)
         if hasattr(AsyncCompile, "dummy_async_backend"):
             delattr(AsyncCompile, "dummy_async_backend")
@@ -722,6 +731,93 @@ class BackendExtensionAPITests(TestCase):
                 context=context,
             ),
             [],
+        )
+
+    def test_register_flex_attention_template_provider(self):
+        seen_context = None
+
+        def dummy_flex_provider(context):
+            nonlocal seen_context
+            seen_context = context
+            return (self._DummyChoice("dummy_flex_choice"),)
+
+        select_algorithm.register_flex_attention_template_provider(
+            "dummy_flex_backend", dummy_flex_provider
+        )
+        select_algorithm.register_flex_attention_template_provider(
+            "dummy_flex_backend", dummy_flex_provider
+        )
+
+        self.assertIs(
+            select_algorithm.get_flex_attention_template_provider(
+                "dummy_flex_backend"
+            ),
+            dummy_flex_provider,
+        )
+        context = select_algorithm.FlexAttentionTemplateProviderContext(
+            op_name="flex_attention",
+            input_nodes=["query", "key", "value"],
+            layout="layout",
+            subgraphs=["score_mod", "mask_mod"],
+            mutated_inputs=["logsumexp"],
+            call_sizes=[2, 4, 16, 32],
+            kernel_options={"BLOCK_M": 16},
+        )
+        choices = select_algorithm.get_backend_flex_attention_template_choices(
+            "dummy_flex_backend",
+            context=context,
+        )
+
+        self.assertIs(seen_context, context)
+        self.assertEqual(len(choices), 1)
+        self.assertEqual(
+            choices[0].annotations[
+                select_algorithm.FLEX_ATTENTION_TEMPLATE_PROVIDER_ANNOTATION
+            ],
+            "dummy_flex_backend",
+        )
+        self.assertEqual(
+            select_algorithm.get_backend_flex_attention_template_choices(
+                "missing_flex_backend",
+                context=context,
+            ),
+            [],
+        )
+
+    def test_register_flex_attention_template_provider_rejects_duplicate(self):
+        def dummy_flex_provider(context):
+            return ()
+
+        def other_dummy_flex_provider(context):
+            return ()
+
+        select_algorithm.register_flex_attention_template_provider(
+            "dummy_flex_backend", dummy_flex_provider
+        )
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            select_algorithm.register_flex_attention_template_provider(
+                "dummy_flex_backend", other_dummy_flex_provider
+            )
+
+    def test_builtin_triton_flex_template_gated_by_backend(self):
+        self.assertTrue(
+            flex_attention_kernel._use_builtin_triton_flex_template("triton", "AUTO")
+        )
+        self.assertTrue(
+            flex_attention_kernel._use_builtin_triton_flex_template(
+                "dummy_flex_backend", "TRITON"
+            )
+        )
+        self.assertTrue(
+            flex_attention_kernel._use_builtin_triton_flex_template(
+                "dummy_flex_backend", "TRITON_DECODE"
+            )
+        )
+        self.assertFalse(
+            flex_attention_kernel._use_builtin_triton_flex_template(
+                "dummy_flex_backend", "AUTO"
+            )
         )
 
     def test_gemm_provider_backend_neutral_template_caller_reaches_multi_template_buffer(

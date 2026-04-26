@@ -15,7 +15,7 @@ import sys
 import textwrap
 import time
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import as_completed, ThreadPoolExecutor
 from io import StringIO
 from pathlib import Path
@@ -55,6 +55,8 @@ from .autotune_process import (
 )
 from .codecache import code_hash, PersistentCache, PyCodeCache
 from .codegen.common import (
+    _same_registered_symbol,
+    _validate_backend_name,
     CSEVariable,
     IndentedBuffer,
     KernelTemplate,
@@ -107,6 +109,9 @@ VERIFY: dict[str, Any] = {}
 PRINT_AUTOTUNE = True
 DEBUG = False
 GEMM_TEMPLATE_PROVIDER_ANNOTATION = "gemm_template_provider_backend"
+FLEX_ATTENTION_TEMPLATE_PROVIDER_ANNOTATION = (
+    "flex_attention_template_provider_backend"
+)
 _REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS = (
     "ACC_TYPE",
     "ALLOW_TF32",
@@ -121,6 +126,65 @@ _REMOTE_GEMM_AUTOTUNE_CACHE_IMPORTANT_KEYS = (
     "num_consumer_groups",
     "num_buffers_warp_spec",
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class FlexAttentionTemplateProviderContext:
+    op_name: str
+    input_nodes: list[Any]
+    layout: Any
+    subgraphs: list[Any]
+    mutated_inputs: list[Any]
+    call_sizes: list[Any]
+    kernel_options: dict[str, Any]
+
+
+FlexAttentionTemplateProvider = Callable[
+    [FlexAttentionTemplateProviderContext], Iterable[Any] | None
+]
+_flex_attention_template_providers: dict[str, FlexAttentionTemplateProvider] = {}
+
+
+def register_flex_attention_template_provider(
+    backend: str, provider: FlexAttentionTemplateProvider
+) -> None:
+    """
+    Register a backend-owned FlexAttention template provider.
+
+    Providers are called from FlexAttention forward, backward, and decode
+    lowerings for the active backend and may return additional ``ChoiceCaller``
+    objects. This lets out-of-tree CUDA backends provide their own
+    FlexAttention templates without advertising Triton template support.
+    """
+    _validate_backend_name("FlexAttention template provider", backend)
+    if (
+        existing := _flex_attention_template_providers.get(backend)
+    ) is not None and not _same_registered_symbol(existing, provider):
+        raise ValueError(
+            f"FlexAttention template provider for backend {backend!r} is already registered"
+        )
+    _flex_attention_template_providers[backend] = provider
+
+
+def get_flex_attention_template_provider(
+    backend: str,
+) -> FlexAttentionTemplateProvider | None:
+    return _flex_attention_template_providers.get(backend)
+
+
+def get_backend_flex_attention_template_choices(
+    backend: str,
+    context: FlexAttentionTemplateProviderContext,
+) -> list[Any]:
+    provider = get_flex_attention_template_provider(backend)
+    if provider is None:
+        return []
+    choices = list(provider(context) or ())
+    for choice in choices:
+        annotations = getattr(choice, "annotations", None)
+        if isinstance(annotations, dict):
+            annotations[FLEX_ATTENTION_TEMPLATE_PROVIDER_ANNOTATION] = backend
+    return choices
 
 
 if TYPE_CHECKING:
@@ -5424,13 +5488,21 @@ class AlgorithmSelectorCache(PersistentCache):
         if isinstance(choice, torch._inductor.select_algorithm.ExternKernelCaller):
             return {"type": "extern", "time": timings[choice]}
 
-        assert isinstance(choice, torch._inductor.select_algorithm.TritonTemplateCaller)
-
         info = choice.info_dict()
         result = {
-            "type": "triton",
+            "type": "triton"
+            if isinstance(choice, torch._inductor.select_algorithm.TritonTemplateCaller)
+            else "template",
             "time": timings[choice],
         }
+        annotations = getattr(choice, "annotations", None)
+        provider_backend = (
+            annotations.get(FLEX_ATTENTION_TEMPLATE_PROVIDER_ANNOTATION)
+            if isinstance(annotations, dict)
+            else None
+        )
+        if provider_backend is not None:
+            result["provider_backend"] = provider_backend
 
         for key in AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS:
             if key in info:
