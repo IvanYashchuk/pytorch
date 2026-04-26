@@ -69,7 +69,22 @@ Expr = sympy.Expr
 def _use_builtin_triton_flex_template(
     active_backend: str, flex_backend: _Backend
 ) -> bool:
-    return active_backend == "triton" or flex_backend in ("TRITON", "TRITON_DECODE")
+    del flex_backend
+    return active_backend == "triton"
+
+
+def _is_explicit_triton_flex_backend(flex_backend: _Backend) -> bool:
+    return flex_backend in ("TRITON", "TRITON_DECODE")
+
+
+def _validate_explicit_triton_flex_backend(
+    active_backend: str, flex_backend: _Backend
+) -> None:
+    if _is_explicit_triton_flex_backend(flex_backend) and active_backend != "triton":
+        raise NotImplementedError(
+            f"BACKEND={flex_backend!r} requires config.cuda_backend='triton'; "
+            f"got cuda_backend={active_backend!r}."
+        )
 
 
 def _raise_unsupported_flex_attention_backend(
@@ -406,6 +421,8 @@ def flex_attention(
     configs: list[FlexConfig] = V.choices.get_flex_attention_fwd_configs(
         head_dim, dtype, query.get_device().type
     )
+    active_backend = get_current_backend(query.get_device().type)
+    _validate_explicit_triton_flex_backend(active_backend, backend)
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
     SPARSE_KV_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_KV_BLOCK_SIZE)
@@ -419,7 +436,6 @@ def flex_attention(
     num_consumer_groups, num_buffers_warp_spec = 0, 0
 
     for conf in configs:
-        active_backend = get_current_backend(query.get_device().type)
         if not _use_builtin_triton_flex_template(active_backend, backend):
             break
 
@@ -500,7 +516,6 @@ def flex_attention(
         if error is not None and len(configs) == 1:
             raise error
 
-    active_backend = get_current_backend(query.get_device().type)
     provider_input_nodes = [
         query,
         key,
@@ -512,26 +527,27 @@ def flex_attention(
         full_kv_num_blocks,
         full_kv_indices,
     ]
-    choices.extend(
-        get_backend_flex_attention_template_choices(
-            active_backend,
-            FlexAttentionTemplateProviderContext(
-                op_name="flex_attention",
-                input_nodes=provider_input_nodes,
-                layout=layout,
-                subgraphs=[
-                    subgraph_buffer,
-                    mask_graph_buffer,
-                ],
-                mutated_inputs=[
-                    logsumexp,
-                    max_scores,
-                ],
-                call_sizes=query.get_size(),
-                kernel_options=original_kernel_options.copy(),
-            ),
+    if not _is_explicit_triton_flex_backend(backend):
+        choices.extend(
+            get_backend_flex_attention_template_choices(
+                active_backend,
+                FlexAttentionTemplateProviderContext(
+                    op_name="flex_attention",
+                    input_nodes=provider_input_nodes,
+                    layout=layout,
+                    subgraphs=[
+                        subgraph_buffer,
+                        mask_graph_buffer,
+                    ],
+                    mutated_inputs=[
+                        logsumexp,
+                        max_scores,
+                    ],
+                    call_sizes=query.get_size(),
+                    kernel_options=original_kernel_options.copy(),
+                ),
+            )
         )
-    )
     if not choices and not _use_builtin_triton_flex_template(active_backend, backend):
         _raise_unsupported_flex_attention_backend("flex_attention", active_backend)
     inputs_for_autotuning = (
@@ -968,6 +984,8 @@ def flex_attention_backward(*args, **kwargs):
     configs: list[FlexBwDConfig] = V.choices.get_flex_attention_bwd_configs(
         head_dim, dtype, query.get_device().type
     )
+    active_backend = get_current_backend(query.get_device().type)
+    _validate_explicit_triton_flex_backend(active_backend, backend)
 
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
@@ -975,7 +993,6 @@ def flex_attention_backward(*args, **kwargs):
     original_kernel_options = kernel_options.copy()
 
     for conf in configs:
-        active_backend = get_current_backend(query.get_device().type)
         if not _use_builtin_triton_flex_template(active_backend, backend):
             break
 
@@ -1061,7 +1078,6 @@ def flex_attention_backward(*args, **kwargs):
             call_sizes=query.get_size() + key.get_size()[1:3],
             **cur_kernel_options,
         )
-    active_backend = get_current_backend(query.get_device().type)
     provider_input_nodes = [
         query,
         key,
@@ -1080,29 +1096,30 @@ def flex_attention_backward(*args, **kwargs):
         full_q_num_blocks,
         full_q_indices,
     ]
-    choices.extend(
-        get_backend_flex_attention_template_choices(
-            active_backend,
-            FlexAttentionTemplateProviderContext(
-                op_name="flex_attention_backward",
-                input_nodes=provider_input_nodes,
-                layout=layout_broadcasted_k,
-                subgraphs=[
-                    fw_subgraph_buffer,
-                    joint_outputs.grad_input,
-                    mask_graph_buffer,
-                    joint_outputs.captured_grads_compute,
-                ],
-                mutated_inputs=[
-                    grad_query,
-                    broadcasted_grad_value,
-                    *joint_outputs.mutated_grads,
-                ],
-                call_sizes=query.get_size() + key.get_size()[1:3],
-                kernel_options=original_kernel_options.copy(),
-            ),
+    if not _is_explicit_triton_flex_backend(backend):
+        choices.extend(
+            get_backend_flex_attention_template_choices(
+                active_backend,
+                FlexAttentionTemplateProviderContext(
+                    op_name="flex_attention_backward",
+                    input_nodes=provider_input_nodes,
+                    layout=layout_broadcasted_k,
+                    subgraphs=[
+                        fw_subgraph_buffer,
+                        joint_outputs.grad_input,
+                        mask_graph_buffer,
+                        joint_outputs.captured_grads_compute,
+                    ],
+                    mutated_inputs=[
+                        grad_query,
+                        broadcasted_grad_value,
+                        *joint_outputs.mutated_grads,
+                    ],
+                    call_sizes=query.get_size() + key.get_size()[1:3],
+                    kernel_options=original_kernel_options.copy(),
+                ),
+            )
         )
-    )
     if not choices and not _use_builtin_triton_flex_template(active_backend, backend):
         _raise_unsupported_flex_attention_backend(
             "flex_attention_backward", active_backend

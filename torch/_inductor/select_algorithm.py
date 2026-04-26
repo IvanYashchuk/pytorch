@@ -5503,6 +5503,8 @@ class AlgorithmSelectorCache(PersistentCache):
         )
         if provider_backend is not None:
             result["provider_backend"] = provider_backend
+        if "backend" in info:
+            result["backend"] = info["backend"]
 
         for key in AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS:
             if key in info:

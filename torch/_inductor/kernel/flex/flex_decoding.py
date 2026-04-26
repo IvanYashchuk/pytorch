@@ -39,6 +39,20 @@ prims = torch.ops.prims
 log = logging.getLogger(__name__)
 
 
+def _is_explicit_triton_flex_backend(flex_backend: str) -> bool:
+    return flex_backend in ("TRITON", "TRITON_DECODE")
+
+
+def _validate_explicit_triton_flex_backend(
+    active_backend: str, flex_backend: str
+) -> None:
+    if _is_explicit_triton_flex_backend(flex_backend) and active_backend != "triton":
+        raise NotImplementedError(
+            f"BACKEND={flex_backend!r} requires config.cuda_backend='triton'; "
+            f"got cuda_backend={active_backend!r}."
+        )
+
+
 def _use_flex_decoding(query, kv_indices, value, kernel_options, enable_gqa) -> bool:
     """Decide which kernel to use, return true if use flex decoding kernel.
     Note:
@@ -321,12 +335,11 @@ def create_flex_decoding_kernel(*args, **kwargs):
 
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
+    active_backend = get_current_backend(query.get_device().type)
+    _validate_explicit_triton_flex_backend(active_backend, flex_backend)
 
     for conf in configs:
-        active_backend = get_current_backend(query.get_device().type)
-        if not (
-            active_backend == "triton" or flex_backend in ("TRITON", "TRITON_DECODE")
-        ):
+        if active_backend != "triton":
             break
 
         if conf.block_n > SPARSE_KV_BLOCK_SIZE:
@@ -393,7 +406,6 @@ def create_flex_decoding_kernel(*args, **kwargs):
             **cur_kernel_options,
         )
 
-    active_backend = get_current_backend(query.get_device().type)
     provider_input_nodes = [
         query,
         key,
@@ -405,26 +417,25 @@ def create_flex_decoding_kernel(*args, **kwargs):
         full_kv_num_blocks,
         full_kv_indices,
     ]
-    choices.extend(
-        get_backend_flex_attention_template_choices(
-            active_backend,
-            FlexAttentionTemplateProviderContext(
-                op_name="flex_decoding",
-                input_nodes=provider_input_nodes,
-                layout=layout_acc,
-                subgraphs=[
-                    score_mod_subgraph,
-                    mask_mod_subgraph,
-                ],
-                mutated_inputs=[buf_M, buf_L],
-                call_sizes=query.get_size(),
-                kernel_options=original_kernel_options.copy(),
-            ),
+    if not _is_explicit_triton_flex_backend(flex_backend):
+        choices.extend(
+            get_backend_flex_attention_template_choices(
+                active_backend,
+                FlexAttentionTemplateProviderContext(
+                    op_name="flex_decoding",
+                    input_nodes=provider_input_nodes,
+                    layout=layout_acc,
+                    subgraphs=[
+                        score_mod_subgraph,
+                        mask_mod_subgraph,
+                    ],
+                    mutated_inputs=[buf_M, buf_L],
+                    call_sizes=query.get_size(),
+                    kernel_options=original_kernel_options.copy(),
+                ),
+            )
         )
-    )
-    if not choices and not (
-        active_backend == "triton" or flex_backend in ("TRITON", "TRITON_DECODE")
-    ):
+    if not choices and active_backend != "triton":
         raise NotImplementedError(
             f"flex_decoding has no template provider registered for backend "
             f"{active_backend!r}. Register one with "

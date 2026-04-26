@@ -806,10 +806,20 @@ class BackendExtensionAPITests(TestCase):
         )
         self.assertTrue(
             flex_attention_kernel._use_builtin_triton_flex_template(
-                "dummy_flex_backend", "TRITON"
+                "triton", "TRITON"
             )
         )
         self.assertTrue(
+            flex_attention_kernel._use_builtin_triton_flex_template(
+                "triton", "TRITON_DECODE"
+            )
+        )
+        self.assertFalse(
+            flex_attention_kernel._use_builtin_triton_flex_template(
+                "dummy_flex_backend", "TRITON"
+            )
+        )
+        self.assertFalse(
             flex_attention_kernel._use_builtin_triton_flex_template(
                 "dummy_flex_backend", "TRITON_DECODE"
             )
@@ -818,6 +828,16 @@ class BackendExtensionAPITests(TestCase):
             flex_attention_kernel._use_builtin_triton_flex_template(
                 "dummy_flex_backend", "AUTO"
             )
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "BACKEND='TRITON' requires config.cuda_backend='triton'",
+        ):
+            flex_attention_kernel._validate_explicit_triton_flex_backend(
+                "dummy_flex_backend", "TRITON"
+            )
+        flex_attention_kernel._validate_explicit_triton_flex_backend(
+            "triton", "TRITON"
         )
 
     def test_gemm_provider_backend_neutral_template_caller_reaches_multi_template_buffer(
