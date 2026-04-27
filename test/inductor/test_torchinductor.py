@@ -13282,6 +13282,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (input, offsets), check_lowp=False)
 
+    def test_bucketize_zero_stride_boundaries(self):
+        def fn(input, boundary_base, sequence_base, values):
+            boundaries = boundary_base.expand(3)
+            sequence = sequence_base.expand(2, 3)
+            return (
+                torch.bucketize(input, boundaries, out_int32=True, right=True),
+                torch.searchsorted(sequence, values, out_int32=True, right=True),
+            )
+
+        input = torch.tensor([-1.0, 0.25, 0.75, 2.0])
+        boundary_base = torch.tensor([0.5])
+        sequence_base = torch.tensor([[0.5], [1.0]])
+        values = torch.tensor([[-1.0, 0.75, 2.0], [-1.0, 1.25, 2.0]])
+
+        self.common(fn, (input, boundary_base, sequence_base, values), check_lowp=False)
+
     @parametrize(
         "dtype_input, dtype_boundaries",
         list(itertools.product(test_int_dtypes, test_int_dtypes)),
