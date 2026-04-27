@@ -2723,11 +2723,25 @@ class Sort(Loops):
         pointwise_ranges = [*size[:axis], *size[axis + 1 :]]
         sort_ranges = [size[axis]]
 
-        if not V.graph.has_feature(device, BackendFeature.SORT):
-            return [None] * len(dtypes)
-
         sizevars = V.graph.sizevars
         sort_numel = sizevars.simplify(sympy_product(sort_ranges))
+
+        # Sort with a single element is just a copy. Keep this before the
+        # backend SORT feature gate so backends without general sort support do
+        # not have to fall back to eager ATen for trivial helper-graph sorts.
+        if sizevars.statically_known_true(sympy.Le(sort_numel, 1)):
+            return [
+                Pointwise.create(
+                    device=device,
+                    dtype=dtypes[output_index],
+                    inner_fn=inner_fns[output_index],
+                    ranges=size,
+                )
+                for output_index in range(len(dtypes))
+            ]
+
+        if not V.graph.has_feature(device, BackendFeature.SORT):
+            return [None] * len(dtypes)
 
         # Heuristic, smallest rblock where triton usually outperforms aten.sort.
         # It also isn't bandwidth bound so fusion is unlikely to help.
@@ -2746,18 +2760,6 @@ class Sort(Loops):
             return [None] * len(dtypes)
 
         assert len(dtypes) == len(inner_fns)
-
-        # Sort with a single element is just a copy
-        if sizevars.statically_known_true(sympy.Le(sort_numel, 1)):
-            return [
-                Pointwise.create(
-                    device=device,
-                    dtype=dtypes[output_index],
-                    inner_fn=inner_fns[output_index],
-                    ranges=size,
-                )
-                for output_index in range(len(dtypes))
-            ]
 
         def reindex(index: Sequence[Expr], sort_index: Sequence[Expr]) -> list[Expr]:
             assert len(sort_index) == len(sort_ranges)
