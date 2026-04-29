@@ -1667,6 +1667,78 @@ class BackendExtensionAPITests(TestCase):
             scheduling._kernel_scheduling, DummyKernelScheduling
         )
 
+    def test_simd_scheduling_preferred_tilings_hook(self):
+        preferred = TritonScheduling.create_tiling(
+            [sympy.Integer(32), sympy.Integer(64)], [sympy.S.One]
+        )
+
+        class DummyKernelScheduling(TritonScheduling):
+            @classmethod
+            def preferred_tilings(cls, node_schedule, numel, reduction_numel):
+                return [preferred]
+
+        tiling, score = DummyKernelScheduling.get_tiling_and_scores(
+            [], sympy.Integer(2048), sympy.S.One
+        )
+
+        self.assertEqual(tiling, preferred)
+        self.assertIsNone(score)
+
+    def test_simd_scheduling_preferred_tilings_are_compatibility_filtered(self):
+        bad_tiling = TritonScheduling.create_tiling(
+            [sympy.Integer(31), sympy.Integer(64)], [sympy.S.One]
+        )
+        good_tiling = TritonScheduling.create_tiling(
+            [sympy.Integer(32), sympy.Integer(64)], [sympy.S.One]
+        )
+
+        class DummyKernelScheduling(TritonScheduling):
+            seen_tilings = []
+
+            @classmethod
+            def preferred_tilings(cls, node_schedule, numel, reduction_numel):
+                return [bad_tiling, good_tiling]
+
+            @classmethod
+            def tiling_is_compatible(
+                cls, node_schedule, numel, reduction_numel, tiling
+            ):
+                cls.seen_tilings.append(tiling)
+                return tiling == good_tiling
+
+        tiling, score = DummyKernelScheduling.get_tiling_and_scores(
+            [], sympy.Integer(2048), sympy.S.One
+        )
+
+        self.assertEqual(tiling, good_tiling)
+        self.assertIsNone(score)
+        self.assertEqual(DummyKernelScheduling.seen_tilings, [bad_tiling, good_tiling])
+
+    def test_simd_scheduling_preferred_tilings_precede_coalesce_analysis(self):
+        preferred = TritonScheduling.create_tiling(
+            [sympy.Integer(32), sympy.Integer(64)], [sympy.S.One]
+        )
+
+        class DummyKernelScheduling(TritonScheduling):
+            @classmethod
+            def preferred_tilings(cls, node_schedule, numel, reduction_numel):
+                return [preferred]
+
+            @classmethod
+            def compute_tiling_strategy(cls, *args, **kwargs):
+                raise AssertionError("preferred tiling should be tried first")
+
+        with config.patch("triton.coalesce_tiling_analysis", True):
+            tiling, score = DummyKernelScheduling.get_tiling_and_scores(
+                [],
+                sympy.Integer(2048),
+                sympy.S.One,
+                coalesce_analysis=object(),
+            )
+
+        self.assertEqual(tiling, preferred)
+        self.assertIsNone(score)
+
     def test_combo_kernel_support_capability(self):
         class DummyTileKernelScheduling(TileKernelScheduling):
             pass

@@ -3019,6 +3019,16 @@ class SIMDScheduling(BaseScheduling):
         return None
 
     @classmethod
+    def preferred_tilings(
+        cls,
+        node_schedule: list[NodeScheduleEntry],
+        numel: sympy.Expr,
+        reduction_numel: sympy.Expr,
+    ) -> list[dict[str, sympy.Expr]]:
+        """Backend hook for extra tiling candidates before generic heuristics."""
+        return []
+
+    @classmethod
     def select_tiling(
         cls,
         node_schedule,
@@ -3067,6 +3077,14 @@ class SIMDScheduling(BaseScheduling):
                     range_r = node_ranges[1]  # (K)
                     tiling = cls.create_tiling(range_y_x, range_r)
                     return tiling, None
+
+        preferred_tilings = cls.preferred_tilings(
+            node_schedule, numel, reduction_numel
+        )
+        if tiling := cls.get_first_compatible_tiling(
+            node_schedule, numel, reduction_numel, preferred_tilings
+        ):
+            return tiling, None
 
         # # TODO: enable by default
         if (
