@@ -3333,7 +3333,7 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
             and not self.is_indirect_indexing(index)
             and have_loop_vars
             # workaround https://github.com/triton-lang/triton/issues/2821
-            and self.index_dtype == "tl.int32"
+            and self.index_dtype == self.dtype_to_str(torch.int32)
         ):
 
             def match_affine_block(
