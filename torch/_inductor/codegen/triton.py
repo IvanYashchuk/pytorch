@@ -361,6 +361,45 @@ class IndexingOptions:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class TileIOAxis:
+    """Backend-neutral view of one active tile axis used by a memory access."""
+
+    prefix: str
+    tensor_dim: int | None
+    grid_dim: int | None
+    numel: sympy.Expr
+    block_size: sympy.Expr
+    block_offset: sympy.Expr
+
+
+@dataclasses.dataclass(frozen=True)
+class TileIODescriptor:
+    """Structured memory-access facts for out-of-tree tile backends."""
+
+    access_kind: str
+    buffer_name: str
+    arg_var: str
+    original_index: sympy.Expr
+    prepared_index: sympy.Expr
+    logical_size: tuple[sympy.Expr, ...]
+    logical_stride: tuple[sympy.Expr, ...]
+    storage_offset: sympy.Expr
+    logical_rank: int
+    axes: tuple[TileIOAxis, ...]
+    shape: tuple[sympy.Expr, ...]
+    block_shape: tuple[sympy.Expr, ...]
+    strides: tuple[sympy.Expr, ...]
+    offsets: tuple[sympy.Expr, ...]
+    constant_offset: sympy.Expr
+    mask_vars: tuple[str, ...]
+    boundary_check: tuple[int, ...] | None
+    broadcasting_dims: tuple[bool, ...]
+    final_shape: tuple[sympy.Expr, ...]
+    classification: str
+    statically_proven: bool
+
+
 @dataclasses.dataclass
 class BlockDescriptorOptions:
     """
@@ -384,6 +423,7 @@ class BlockDescriptorOptions:
     # Can we safely lift the constructor
     # to the top of the kernel?
     can_lift: bool = False
+    prepared_index: sympy.Expr | None = None
 
     @property
     def shape(self) -> list[sympy.Expr]:
@@ -2923,6 +2963,140 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
     ) -> str:
         raise NotImplementedError
 
+    def tile_io_descriptor(
+        self,
+        access_kind: str,
+        name: str,
+        var: str,
+        original_index: sympy.Expr,
+        indexing: IndexingOptions | BlockDescriptorOptions,
+    ) -> TileIODescriptor | None:
+        if not isinstance(indexing, BlockDescriptorOptions):
+            return None
+
+        graph = V.graph
+        sizevars = graph.sizevars
+        try:
+            buffer = graph.get_buffer(name)
+            logical_size = tuple(buffer.get_size())
+            logical_stride = tuple(buffer.get_stride())
+        except (AttributeError, NotImplementedError, RuntimeError):
+            return None
+
+        layout = None
+        try:
+            layout = (
+                buffer.maybe_get_layout()
+                if hasattr(buffer, "maybe_get_layout")
+                else None
+            )
+            if layout is None and hasattr(buffer, "get_layout"):
+                layout = buffer.get_layout()
+        except (AttributeError, NotImplementedError, RuntimeError):
+            layout = None
+
+        storage_offset = getattr(layout, "offset", sympy.S.Zero)
+
+        def statically_known_equals(lhs: sympy.Expr, rhs: sympy.Expr) -> bool:
+            return bool(sizevars.statically_known_equals(lhs, rhs))
+
+        def is_row_major_contiguous() -> bool:
+            expected_stride = sympy.S.One
+            for dim, stride in reversed(list(zip(logical_size, logical_stride))):
+                if not statically_known_equals(stride, expected_stride):
+                    return False
+                expected_stride *= dim
+            return True
+
+        if not statically_known_equals(storage_offset, sympy.S.Zero):
+            classification = "nonzero_offset"
+        elif any(
+            statically_known_equals(stride, sympy.S.Zero)
+            for stride in logical_stride
+        ):
+            classification = "broadcast"
+        elif any(indexing.broadcasting_dims):
+            classification = "broadcast"
+        elif not indexing.stride_sorter.is_identity:
+            classification = "transposed"
+        elif len(indexing.shape) != len(logical_size):
+            classification = "raw_view"
+        elif is_row_major_contiguous():
+            classification = "direct_contiguous"
+        else:
+            classification = "dynamic"
+
+        axes = tuple(
+            TileIOAxis(
+                prefix=tree.prefix,
+                tensor_dim=tree.tensor_dim,
+                grid_dim=tree.grid_dim,
+                numel=tree.numel,
+                block_size=TritonSymbols.get_block_size(tree),
+                block_offset=TritonSymbols.get_block_offset(tree),
+            )
+            for tree in self.active_range_trees()
+        )
+
+        return TileIODescriptor(
+            access_kind=access_kind,
+            buffer_name=name,
+            arg_var=var,
+            original_index=original_index,
+            prepared_index=(
+                original_index
+                if indexing.prepared_index is None
+                else indexing.prepared_index
+            ),
+            logical_size=logical_size,
+            logical_stride=logical_stride,
+            storage_offset=storage_offset,
+            logical_rank=len(logical_size),
+            axes=axes,
+            shape=tuple(indexing.shape),
+            block_shape=tuple(indexing.block_shape),
+            strides=tuple(indexing.strides),
+            offsets=tuple(indexing.offsets),
+            constant_offset=indexing.constant_offset,
+            mask_vars=tuple(str(mask) for mask in indexing.mask_vars),
+            boundary_check=(
+                tuple(indexing.boundary_check())
+                if indexing._boundary_check is not None
+                else None
+            ),
+            broadcasting_dims=tuple(indexing.broadcasting_dims),
+            final_shape=tuple(indexing.final_shape),
+            classification=classification,
+            statically_proven=classification == "direct_contiguous",
+        )
+
+    def maybe_codegen_tile_io_load(
+        self,
+        name: str,
+        var: str,
+        index: sympy.Expr,
+        descriptor: TileIODescriptor,
+        dtype: torch.dtype,
+        indexing: BlockDescriptorOptions,
+        ep: str,
+        other: str,
+        cachemod: str,
+    ) -> str | tuple[str, Any] | None:
+        return None
+
+    def maybe_codegen_tile_io_store(
+        self,
+        name: str,
+        var: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        descriptor: TileIODescriptor,
+        dtype: torch.dtype,
+        indexing: BlockDescriptorOptions,
+        mode: StoreMode,
+    ) -> str | None:
+        return None
+
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
         # These analysis is only needed in deterministic mode so far
@@ -3426,6 +3600,7 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
             # Return a block pointer, if indexing matches the pattern.
             options = match_block_expr()
             if options is not None:
+                options.prepared_index = index
                 return options
         expand_str = None
         expand_shape: BlockShapeType = None
@@ -3939,7 +4114,31 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
             shape = ()
 
         else:
-            if isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
+            tile_io_descriptor = self.tile_io_descriptor(
+                "load", name, var, original_index, indexing
+            )
+            tile_io_load = (
+                self.maybe_codegen_tile_io_load(
+                    name,
+                    var,
+                    original_index,
+                    tile_io_descriptor,
+                    dtype,
+                    indexing,
+                    ep,
+                    other,
+                    cachemod,
+                )
+                if tile_io_descriptor is not None
+                else None
+            )
+            if tile_io_load is not None:
+                if isinstance(tile_io_load, tuple):
+                    line, shape = tile_io_load
+                else:
+                    line = tile_io_load
+                    shape = tile_io_descriptor.final_shape
+            elif isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
                 block_descriptor, other = self.codegen_block_ptr(
                     name, var, indexing, other
                 )
@@ -4071,7 +4270,26 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
         if is_inplace and is_broadcasted:
             self.stores.writeline(DeferredLine(name, "tl.debug_barrier()"))
 
-        if isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
+        tile_io_descriptor = self.tile_io_descriptor(
+            "store", name, var, original_index, indexing
+        )
+        tile_io_store = (
+            self.maybe_codegen_tile_io_store(
+                name,
+                var,
+                original_index,
+                value,
+                tile_io_descriptor,
+                dtype,
+                indexing,
+                mode,
+            )
+            if tile_io_descriptor is not None
+            else None
+        )
+        if tile_io_store is not None:
+            line = tile_io_store
+        elif isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
             block_descriptor, other = self.codegen_block_ptr(name, var, indexing)
             # block_ptr / tma descriptor stores don't do implicit casting
             line = self.codegen_block_ptr_store_line(

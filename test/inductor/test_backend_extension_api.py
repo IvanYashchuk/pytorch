@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
+import sympy
 import torch
 from torch._inductor import (
     config,
@@ -23,8 +24,12 @@ from torch._inductor.async_compile import (
 from torch._inductor.codegen import common
 from torch._inductor.codegen.cuda_combined_scheduling import CUDACombinedScheduling
 from torch._inductor.codegen.triton import (
+    BlockDescriptorOptions,
+    BlockParameters,
     TileKernel,
+    TileIODescriptor,
     TileKernelScheduling,
+    TritonSymbols,
     TritonKernel,
     TritonScheduling,
 )
@@ -39,8 +44,10 @@ from torch._inductor.scheduler import (
     ForeachKernelSchedulerNode,
     Scheduler,
 )
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import TestCase
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.symbol import SymT
 
 
 class BackendExtensionAPITests(TestCase):
@@ -51,10 +58,14 @@ class BackendExtensionAPITests(TestCase):
             *,
             dtype=torch.float32,
             device=torch.device("cuda"),
+            stride=None,
+            offset=0,
         ):
             self._size = list(size)
             self._dtype = dtype
             self._device = device
+            self._stride = None if stride is None else list(stride)
+            self._layout = SimpleNamespace(offset=sympy.Integer(offset))
 
         def get_dtype(self):
             return self._dtype
@@ -66,12 +77,20 @@ class BackendExtensionAPITests(TestCase):
             return self._size
 
         def get_stride(self):
+            if self._stride is not None:
+                return self._stride
             stride = []
             running = 1
             for size in reversed(self._size):
                 stride.append(running)
                 running *= size
             return list(reversed(stride))
+
+        def get_layout(self):
+            return self._layout
+
+        def maybe_get_layout(self):
+            return self._layout
 
     class _DummyChoice:
         def __init__(self, name, description=""):
@@ -1775,6 +1794,153 @@ class BackendExtensionAPITests(TestCase):
         self.assertEqual(
             kernel.codegen_block_ptr_advance("ptr", [1]),
             "ptr = tl.advance(ptr, ADVANCE)",
+        )
+
+    def _make_tile_io_descriptor(
+        self,
+        *,
+        size=(32, 64),
+        stride=None,
+        offset=0,
+        broadcasting_dims=(False, False),
+        stride_sort_idx=(0, 1),
+        prepared_index=None,
+        prepare_indexing=None,
+    ):
+        xblock = TritonSymbols.block_sizes[SymT.XBLOCK]
+        yblock = TritonSymbols.block_sizes[SymT.YBLOCK]
+        xoffset = TritonSymbols.block_offsets[SymT.XBLOCK]
+        yoffset = TritonSymbols.block_offsets[SymT.YBLOCK]
+
+        buffer = self._FakeBuffer(size, stride=stride, offset=offset)
+
+        class FakeSizeVars:
+            @staticmethod
+            def statically_known_equals(lhs, rhs):
+                return sympy.simplify(lhs - rhs) == 0
+
+        class FakeGraph:
+            sizevars = FakeSizeVars()
+
+            @staticmethod
+            def get_buffer(name):
+                self.assertEqual(name, "buf")
+                return buffer
+
+        kernel = TileKernel.__new__(TileKernel)
+        kernel.prepare_indexing = (
+            (lambda index: index) if prepare_indexing is None else prepare_indexing
+        )
+
+        y_tree = SimpleNamespace(
+            prefix="y",
+            tensor_dim=0,
+            grid_dim=1,
+            numel=sympy.Integer(size[0]),
+            symt=SymT.YBLOCK,
+        )
+        x_tree = SimpleNamespace(
+            prefix="x",
+            tensor_dim=1,
+            grid_dim=0,
+            numel=sympy.Integer(size[1]),
+            symt=SymT.XBLOCK,
+        )
+        kernel.active_range_trees = lambda: [y_tree, x_tree]
+
+        indexing = BlockDescriptorOptions(
+            params=BlockParameters(
+                shape=[sympy.Integer(size[0]), sympy.Integer(size[1])],
+                block_shape=[yblock, xblock],
+                strides=[
+                    sympy.Integer(buffer.get_stride()[0]),
+                    sympy.Integer(buffer.get_stride()[1]),
+                ],
+                offsets=[yoffset, xoffset],
+            ),
+            constant_offset=sympy.S.Zero,
+            order=[1, 0],
+            mask_vars=OrderedSet(["ymask", "xmask"]),
+            broadcast_shape=[yblock, xblock],
+            broadcasting_dims=list(broadcasting_dims),
+            final_shape=[yblock, xblock],
+            stride_sorter=BlockParameters.StrideSorter(
+                original_strides=buffer.get_stride(),
+                sort_idx=list(stride_sort_idx),
+            ),
+            _boundary_check=[0, 1],
+            prepared_index=prepared_index,
+        )
+
+        original_index = 64 * sympy.Symbol("yindex") + sympy.Symbol("xindex")
+        with V.set_graph_handler(FakeGraph()):
+            return kernel.tile_io_descriptor(
+                "load",
+                "buf",
+                "in_ptr0",
+                original_index,
+                indexing,
+            )
+
+    def test_tile_io_descriptor_rank2_contiguous_access(self):
+        descriptor = self._make_tile_io_descriptor()
+
+        self.assertIsInstance(descriptor, TileIODescriptor)
+        self.assertEqual(descriptor.access_kind, "load")
+        self.assertEqual(descriptor.buffer_name, "buf")
+        self.assertEqual(descriptor.arg_var, "in_ptr0")
+        self.assertEqual(descriptor.logical_rank, 2)
+        self.assertEqual(descriptor.logical_size, (32, 64))
+        self.assertEqual(descriptor.logical_stride, (64, 1))
+        self.assertEqual(descriptor.storage_offset, 0)
+        self.assertEqual(descriptor.classification, "direct_contiguous")
+        self.assertTrue(descriptor.statically_proven)
+        self.assertEqual(
+            tuple(str(dim) for dim in descriptor.block_shape),
+            ("YBLOCK", "XBLOCK"),
+        )
+        self.assertEqual(descriptor.mask_vars, ("ymask", "xmask"))
+        self.assertEqual(descriptor.boundary_check, (0, 1))
+        self.assertEqual(descriptor.axes[0].prefix, "y")
+        self.assertEqual(descriptor.axes[0].tensor_dim, 0)
+        self.assertEqual(descriptor.axes[0].grid_dim, 1)
+        self.assertEqual(str(descriptor.axes[0].block_size), "YBLOCK")
+        self.assertEqual(descriptor.axes[1].prefix, "x")
+        self.assertEqual(descriptor.axes[1].tensor_dim, 1)
+        self.assertEqual(descriptor.axes[1].grid_dim, 0)
+        self.assertEqual(str(descriptor.axes[1].block_size), "XBLOCK")
+
+    def test_tile_io_descriptor_uses_existing_prepared_index(self):
+        prepared_index = sympy.Symbol("prepared_index")
+
+        def fail_if_recomputed(index):
+            raise AssertionError("prepare_indexing should not run twice")
+
+        descriptor = self._make_tile_io_descriptor(
+            prepared_index=prepared_index,
+            prepare_indexing=fail_if_recomputed,
+        )
+
+        self.assertEqual(descriptor.prepared_index, prepared_index)
+
+    def test_tile_io_descriptor_classifies_unreviewed_layouts(self):
+        self.assertEqual(
+            self._make_tile_io_descriptor(stride=(0, 1)).classification,
+            "broadcast",
+        )
+        self.assertEqual(
+            self._make_tile_io_descriptor(
+                broadcasting_dims=(True, False)
+            ).classification,
+            "broadcast",
+        )
+        self.assertEqual(
+            self._make_tile_io_descriptor(stride_sort_idx=(1, 0)).classification,
+            "transposed",
+        )
+        self.assertEqual(
+            self._make_tile_io_descriptor(offset=1).classification,
+            "nonzero_offset",
         )
 
     def test_register_constexpr_syntax(self):
