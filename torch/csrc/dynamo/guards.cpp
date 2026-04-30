@@ -6985,6 +6985,14 @@ bool run_root_guard_manager(void* root, FrameLocalsMapping* f_locals) {
   return ((RootGuardManager*)root)->check_nopybind(f_locals);
 }
 
+bool run_root_guard_manager_on_object(void* root, PyObject* value) {
+  // for invalidated guards, return false
+  if (root == nullptr) {
+    return false;
+  }
+  return ((RootGuardManager*)root)->check_nopybind(value);
+}
+
 PyObject* torch_c_dynamo_guards_init() {
   // initialize TensorGuardsType
   TensorGuardsType.tp_name = "torch._C._dynamo.guards.TensorGuards";

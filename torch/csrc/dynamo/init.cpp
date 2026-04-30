@@ -479,6 +479,14 @@ void initDynamoBindings(PyObject* torch) {
   m.def("get_c_recursion_limit", &dynamo_get_c_recursion_limit);
 
   m.def("_debug_get_cache_entry_list", &_debug_get_cache_entry_list);
+  m.def(
+      "_debug_call_cache_entry_stable_callable",
+      &_debug_call_cache_entry_stable_callable,
+      py::arg("cache_entry"),
+      py::arg("f_locals"),
+      py::arg("args"),
+      py::arg("kwargs") = py::none(),
+      py::arg("use_diff_guard") = false);
   m.def("_reset_precompile_entries", &_reset_precompile_entries);
   m.def("_load_precompile_entry", &_load_precompile_entry);
   m.def("_debug_get_precompile_entries", &_debug_get_precompile_entries);

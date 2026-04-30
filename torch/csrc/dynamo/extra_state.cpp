@@ -243,6 +243,46 @@ py::list _debug_get_cache_entry_list(const py::handle& code_obj) {
   return result;
 }
 
+py::object _debug_call_cache_entry_stable_callable(
+    CacheEntry& cache_entry,
+    py::dict f_locals,
+    py::tuple args,
+    py::object kwargs,
+    bool use_diff_guard) {
+  TORCH_CHECK(
+      !cache_entry.code.is_none(),
+      "cache entry stable callable is unavailable: cache entry is invalidated");
+  TORCH_CHECK(
+      PyCallable_Check(cache_entry.stable_callable.ptr()),
+      "cache entry stable callable is unavailable: stable_callable is not callable");
+  if (!kwargs.is_none()) {
+    TORCH_CHECK_TYPE(
+        PyDict_Check(kwargs.ptr()),
+        "expected kwargs to be a dict or None");
+    TORCH_CHECK(
+        PyDict_Size(kwargs.ptr()) == 0,
+        "cache entry stable callable only supports empty kwargs");
+  }
+
+  void* root =
+      use_diff_guard ? cache_entry.diff_guard_root_mgr : cache_entry.root_mgr;
+  TORCH_CHECK(
+      root != nullptr,
+      "cache entry stable callable is unavailable: guard root is invalidated");
+  if (!torch::dynamo::run_root_guard_manager_on_object(
+          root, f_locals.ptr())) {
+    TORCH_CHECK(
+        false, "cache entry stable callable guard check failed");
+  }
+
+  PyObject* result = PyObject_CallObject(
+      cache_entry.stable_callable.ptr(), args.ptr());
+  if (result == nullptr) {
+    throw py::error_already_set();
+  }
+  return py::reinterpret_steal<py::object>(result);
+}
+
 PrecompileEntry::PrecompileEntry(py::object gm, py::object c)
     : guard_manager(std::move(gm)), code(std::move(c)) {
   TORCH_CHECK(

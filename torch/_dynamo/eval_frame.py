@@ -389,6 +389,64 @@ def _debug_get_cache_entry_list(
     return torch._C._dynamo.eval_frame._debug_get_cache_entry_list(code)
 
 
+def _debug_make_stable_cache_entry_callable(
+    fn: Callable[..., Any],
+    *,
+    use_diff_guard: bool = False,
+) -> Callable[..., Any]:
+    """
+    Return a private diagnostic callable for a single stable Dynamo cache entry.
+
+    This deliberately supports only simple Python functions with fixed
+    positional arguments. It is for call-path attribution experiments, not a
+    product fast path.
+    """
+    if not isinstance(fn, types.FunctionType):
+        raise TypeError("expected a Python function")
+    code = fn.__code__
+    if fn.__defaults__ is not None or fn.__kwdefaults__ is not None:
+        raise TypeError("stable cache entry diagnostics do not support defaults")
+    if fn.__closure__ is not None:
+        raise TypeError("stable cache entry diagnostics do not support closures")
+    if code.co_kwonlyargcount != 0:
+        raise TypeError(
+            "stable cache entry diagnostics do not support keyword-only arguments"
+        )
+    if code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS):
+        raise TypeError("stable cache entry diagnostics do not support varargs")
+
+    entries = _debug_get_cache_entry_list(code)
+    if len(entries) != 1:
+        raise RuntimeError(
+            "stable cache entry diagnostics require exactly one cache entry"
+        )
+    cache_entry = entries[0]
+    if cache_entry.stable_callable is None:
+        raise RuntimeError("cache entry does not have a stable callable")
+
+    arg_names = code.co_varnames[: code.co_argcount]
+
+    @functools.wraps(fn)
+    def stable_cache_entry_callable(*args: Any, **kwargs: Any) -> Any:
+        if kwargs:
+            raise TypeError("stable cache entry diagnostics do not support kwargs")
+        if len(args) != len(arg_names):
+            raise TypeError(
+                "stable cache entry diagnostics expected "
+                f"{len(arg_names)} positional arguments, got {len(args)}"
+            )
+        f_locals = dict(zip(arg_names, args))
+        return torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+            cache_entry,
+            f_locals,
+            args,
+            None,
+            use_diff_guard,
+        )
+
+    return stable_cache_entry_callable
+
+
 class OptimizedModule(torch.nn.Module):
     """
     Wraps the original nn.Module object and later patches its

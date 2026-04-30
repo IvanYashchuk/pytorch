@@ -45,7 +45,10 @@ from torch import Tensor
 from torch._C import FileCheck
 from torch._dynamo import allow_in_graph
 from torch._dynamo.comptime import comptime
-from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+from torch._dynamo.eval_frame import (
+    _debug_get_cache_entry_list,
+    _debug_make_stable_cache_entry_callable,
+)
 from torch._dynamo.exc import Unsupported
 from torch._dynamo.source import ConstantSource, GetItemSource, LocalSource
 from torch._dynamo.testing import (
@@ -266,6 +269,111 @@ class MiscTests(torch._inductor.test_case.TestCase):
             entries = _debug_get_cache_entry_list(f)
             self.assertEqual(len(entries), 1)
             self.assertIsNone(entries[0].stable_callable)
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_callable_hits(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            stable_f = _debug_make_stable_cache_entry_callable(f)
+            self.assertEqual(stable_f(x, y), f(x, y))
+
+            with self.assertRaisesRegex(TypeError, "kwargs"):
+                stable_f(x=x, y=y)
+            with self.assertRaisesRegex(TypeError, "expected 2 positional arguments"):
+                stable_f(x)
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_callable_guard_miss_fails_closed(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            stable_f = _debug_make_stable_cache_entry_callable(f)
+            with self.assertRaisesRegex(RuntimeError, "guard check failed"):
+                stable_f(
+                    torch.ones(3, 3, dtype=torch.int64),
+                    torch.ones(3, 3, dtype=torch.int64),
+                )
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_callable_invalidated_fails_closed(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            stable_f = _debug_make_stable_cache_entry_callable(f)
+            entry = _debug_get_cache_entry_list(f)[0]
+            extra_state = entry.guard_manager.extra_state
+            extra_state.invalidate(entry, entry.guard_manager)
+            with self.assertRaisesRegex(RuntimeError, "invalidated"):
+                stable_f(x, y)
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_callable_rejects_ineligible_functions(self):
+        def default_arg(x, y=None):
+            return x if y is None else x + y
+
+        def varargs(x, *args):
+            return x
+
+        def f(x):
+            return x * 5
+
+        try:
+            with self.assertRaisesRegex(TypeError, "defaults"):
+                _debug_make_stable_cache_entry_callable(default_arg)
+            with self.assertRaisesRegex(TypeError, "varargs"):
+                _debug_make_stable_cache_entry_callable(varargs)
+            with self.assertRaisesRegex(RuntimeError, "exactly one cache entry"):
+                _debug_make_stable_cache_entry_callable(f)
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_callable_rejects_specialized_dispatch(self):
+        def is_dim_8(size):
+            return size == 8
+
+        def is_dim_16(size):
+            return size == 16
+
+        def f(x):
+            return x * 5
+
+        try:
+            x = torch.randn(5)
+            torch._dynamo.mark_dynamic(
+                x,
+                0,
+                specialize_on=[is_dim_8, is_dim_16],
+            )
+            opt_f = torch.compile(f, backend="eager")
+            self.assertEqual(opt_f(x), f(x))
+
+            with self.assertRaisesRegex(
+                RuntimeError, "does not have a stable callable"
+            ):
+                _debug_make_stable_cache_entry_callable(f)
         finally:
             torch._dynamo.reset()
 
