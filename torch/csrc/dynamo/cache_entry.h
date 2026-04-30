@@ -46,6 +46,9 @@ typedef struct VISIBILITY_HIDDEN CacheEntry {
   py::object guard_manager;
   // modified user bytecode (protected by guard_manager's guards)
   py::object code;
+  // Diagnostic-only callable installed into the guarded bytecode globals.
+  // Normal eval-frame lookup still executes code.
+  py::object stable_callable;
   // CompileId corresponding to this compilation
   py::object compile_id;
   // root guard manager if exists

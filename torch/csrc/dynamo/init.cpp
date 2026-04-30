@@ -445,6 +445,7 @@ void initDynamoBindings(PyObject* torch) {
   py::class_<CacheEntry>(m, "_CacheEntry")
       .def_readonly("guard_manager", &CacheEntry::guard_manager)
       .def_readonly("code", &CacheEntry::code)
+      .def_readonly("stable_callable", &CacheEntry::stable_callable)
       .def_readonly("compile_id", &CacheEntry::compile_id)
       .def_readonly("trace_annotation", &CacheEntry::trace_annotation)
       .def_readonly("backend", &CacheEntry::backend)

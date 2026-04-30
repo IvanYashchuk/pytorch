@@ -27,6 +27,7 @@ class _CacheEntry:
     def check_fn(self, *args: object, **kwargs: object) -> bool: ...
     def update_diff_guard_root_manager(self) -> None: ...
     code: types.CodeType
+    stable_callable: Callable[..., object] | None
     compile_id: CompileId
     # If we run into circular issues, just use object
     guard_manager: GuardManagerWrapper

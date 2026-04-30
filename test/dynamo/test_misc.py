@@ -220,6 +220,55 @@ class MiscTests(torch._inductor.test_case.TestCase):
         entries = _debug_get_cache_entry_list(torch._dynamo.graph_break)
         self.assertEqual(len(entries), 0)
 
+    def test_cache_entry_stable_callable_is_diagnostic_only(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            entries = _debug_get_cache_entry_list(f)
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertTrue(callable(entry.stable_callable))
+            self.assertEqual(entry.stable_callable(x, y), f(x, y))
+
+            extra_state = entry.guard_manager.extra_state
+            extra_state.invalidate(entry, entry.guard_manager)
+            self.assertIsNone(entry.stable_callable)
+            self.assertIsNone(entry.code)
+        finally:
+            torch._dynamo.reset()
+
+    def test_cache_entry_stable_callable_none_for_specialized_dispatch(self):
+        def is_dim_8(size):
+            return size == 8
+
+        def is_dim_16(size):
+            return size == 16
+
+        def f(x):
+            return x * 5
+
+        try:
+            x = torch.randn(5)
+            torch._dynamo.mark_dynamic(
+                x,
+                0,
+                specialize_on=[is_dim_8, is_dim_16],
+            )
+            opt_f = torch.compile(f, backend="eager")
+            self.assertEqual(opt_f(x), f(x))
+
+            entries = _debug_get_cache_entry_list(f)
+            self.assertEqual(len(entries), 1)
+            self.assertIsNone(entries[0].stable_callable)
+        finally:
+            torch._dynamo.reset()
+
     def test_boolarg(self):
         def boolarg(aa, bb, flag):
             if flag:

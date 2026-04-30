@@ -69,6 +69,7 @@ class GuardedCode:
     guard_manager: GuardFn
     compile_id: CompileId
     trace_annotation: str = "Unknown"
+    stable_callable: Callable[..., Any] | None = None
 
 
 @dataclasses.dataclass

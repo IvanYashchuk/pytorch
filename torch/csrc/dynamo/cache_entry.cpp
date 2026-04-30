@@ -8,6 +8,9 @@ CacheEntry::CacheEntry(const py::handle& guarded_code, PyObject* backend)
     : backend{py::cast<py::object>(get_backend(backend))} {
   this->guard_manager = guarded_code.attr("guard_manager");
   this->code = guarded_code.attr("code");
+  this->stable_callable = py::hasattr(guarded_code, "stable_callable")
+      ? guarded_code.attr("stable_callable")
+      : py::none();
   this->compile_id = guarded_code.attr("compile_id");
   py::object trace_annotation = guarded_code.attr("trace_annotation");
   const char* trace_annotation_str = PyUnicode_AsUTF8(trace_annotation.ptr());
@@ -49,6 +52,7 @@ void CacheEntry::invalidate(py::object deleted_guard_manager) {
   this->guard_manager.attr("cache_entry") = py::none();
   this->guard_manager.attr("extra_state") = py::none();
   this->code = py::none();
+  this->stable_callable = py::none();
   this->guard_manager = std::move(deleted_guard_manager);
   this->root_mgr = nullptr;
   this->trace_annotation = "Invalidated";
