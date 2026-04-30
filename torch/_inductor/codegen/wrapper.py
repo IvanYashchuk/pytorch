@@ -68,6 +68,7 @@ from .common import (
     ArgName,
     CodeGen,
     DeferredLine,
+    get_backend_kernel_launcher,
     get_backend_wrapper_imports,
     PythonPrinter,
     WorkspaceArg,
@@ -3330,6 +3331,12 @@ class PythonWrapperCodegen(CodeGen):
             return
 
         self.write_triton_header_once()
+        kernel_call_line = self.format_kernel_launch_line(
+            kernel_name,
+            call_args_str,
+            stream_name,
+            inductor_meta=inductor_meta,
+        )
 
         if (
             config.triton.autotune_at_compile_time
@@ -3458,7 +3465,12 @@ class PythonWrapperCodegen(CodeGen):
             )
             self.kernel_autotune_calls.do_indent()
             self.kernel_autotune_calls.writeline(
-                f"{kernel_name}.run({', '.join(all_args)}, stream={stream_name})"
+                self.format_kernel_launch_line(
+                    kernel_name,
+                    ", ".join(all_args),
+                    stream_name,
+                    inductor_meta=inductor_meta,
+                )
             )
             self.kernel_autotune_calls.do_unindent()
 
@@ -3474,8 +3486,33 @@ class PythonWrapperCodegen(CodeGen):
         debug_printer_manager = V.graph.wrapper_code.debug_printer
         debug_printer_manager.set_printer_args(call_args, kernel_name, arg_types, None)
         with debug_printer_manager:
-            self.writeline(f"{kernel_name}.run({call_args_str}, stream={stream_name})")
+            self.writeline(kernel_call_line)
         self.write_triton_header_once()
+
+    def format_kernel_launch_line(
+        self,
+        kernel_name: str,
+        call_args_str: str,
+        stream_name: str,
+        *,
+        inductor_meta=None,
+    ) -> str:
+        if not isinstance(inductor_meta, dict):
+            return f"{kernel_name}.run({call_args_str}, stream={stream_name})"
+        launch_backend = inductor_meta.get("kernel_launch_backend")
+        if launch_backend is None:
+            return f"{kernel_name}.run({call_args_str}, stream={stream_name})"
+        if not isinstance(launch_backend, str):
+            raise TypeError(
+                "inductor_meta['kernel_launch_backend'] must be a string "
+                f"when present, got {type(launch_backend).__name__}"
+            )
+        launcher = get_backend_kernel_launcher(launch_backend)
+        if launcher is None:
+            raise KeyError(
+                f"Unknown Inductor kernel launcher backend {launch_backend!r}"
+            )
+        return launcher(kernel_name, call_args_str, stream_name)
 
     def writeline(self, line):
         self.lines.append(line)

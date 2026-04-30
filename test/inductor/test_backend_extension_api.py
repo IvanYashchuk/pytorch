@@ -33,6 +33,7 @@ from torch._inductor.codegen.triton import (
     TritonKernel,
     TritonScheduling,
 )
+from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch._inductor.kernel import bmm as bmm_kernel
 from torch._inductor.kernel import mm as mm_kernel
 from torch._inductor.kernel.flex import flex_attention as flex_attention_kernel
@@ -107,6 +108,7 @@ class BackendExtensionAPITests(TestCase):
         common._constexpr_syntaxes.pop("dummy_constexpr_backend", None)
         common._dtype_propagation_backends.pop("dummy_dtype_backend", None)
         common._backend_wrapper_imports.pop("dummy_wrapper_backend", None)
+        common._backend_kernel_launchers.pop("dummy_launcher_backend", None)
         metrics._kernel_metadata_providers.pop("dummy_metrics_backend", None)
         wrapper_benchmark._kernel_benchmark_providers.pop(
             "dummy_benchmark_backend", None
@@ -591,6 +593,19 @@ class BackendExtensionAPITests(TestCase):
             dummy_benchmark_provider.__qualname__
         )
 
+        def dummy_launcher_formatter(kernel_name, call_args, stream_name):
+            return f"original_launch({kernel_name}, {call_args}, {stream_name})"
+
+        def reloaded_dummy_launcher_formatter(kernel_name, call_args, stream_name):
+            return f"reloaded_launch({kernel_name}, {call_args}, {stream_name})"
+
+        reloaded_dummy_launcher_formatter.__module__ = (
+            dummy_launcher_formatter.__module__
+        )
+        reloaded_dummy_launcher_formatter.__qualname__ = (
+            dummy_launcher_formatter.__qualname__
+        )
+
         def dummy_gemm_provider(context):
             return ()
 
@@ -642,6 +657,17 @@ class BackendExtensionAPITests(TestCase):
             reloaded_dummy_benchmark_provider,
         )
 
+        common.register_backend_kernel_launcher(
+            "dummy_launcher_backend", dummy_launcher_formatter
+        )
+        common.register_backend_kernel_launcher(
+            "dummy_launcher_backend", reloaded_dummy_launcher_formatter
+        )
+        self.assertIs(
+            common._backend_kernel_launchers["dummy_launcher_backend"],
+            reloaded_dummy_launcher_formatter,
+        )
+
         mm_kernel.register_gemm_template_provider(
             "dummy_gemm_backend", dummy_gemm_provider
         )
@@ -674,6 +700,70 @@ class BackendExtensionAPITests(TestCase):
             common.register_backend_wrapper_import("not-valid", "import dummy")
         with self.assertRaisesRegex(ValueError, "non-empty"):
             common.register_backend_wrapper_import("dummy_wrapper_backend", " ")
+
+    def test_register_backend_kernel_launcher(self):
+        def formatter(kernel_name, call_args, stream_name):
+            return f"launch({kernel_name}, ({call_args}), {stream_name})"
+
+        common.register_backend_kernel_launcher("dummy_launcher_backend", formatter)
+        common.register_backend_kernel_launcher("dummy_launcher_backend", formatter)
+
+        self.assertIs(
+            common.get_backend_kernel_launcher("dummy_launcher_backend"),
+            formatter,
+        )
+        self.assertIsNone(common.get_backend_kernel_launcher("missing_launcher"))
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            common.register_backend_kernel_launcher(
+                "dummy_launcher_backend", lambda *args: "other_launch()"
+            )
+
+    def test_register_backend_kernel_launcher_rejects_invalid_name(self):
+        def formatter(kernel_name, call_args, stream_name):
+            return f"launch({kernel_name}, ({call_args}), {stream_name})"
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_backend_kernel_launcher(name, formatter)
+
+    def test_backend_kernel_launcher_formats_wrapper_call(self):
+        wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
+
+        def formatter(kernel_name, call_args, stream_name):
+            return f"dummy_launch({kernel_name!r}, ({call_args}), {stream_name})"
+
+        common.register_backend_kernel_launcher("dummy_launcher_backend", formatter)
+
+        self.assertEqual(
+            wrapper.format_kernel_launch_line("kernel0", "arg0, arg1", "stream0"),
+            "kernel0.run(arg0, arg1, stream=stream0)",
+        )
+        self.assertEqual(
+            wrapper.format_kernel_launch_line(
+                "kernel0",
+                "arg0, arg1",
+                "stream0",
+                inductor_meta={"kernel_launch_backend": "dummy_launcher_backend"},
+            ),
+            "dummy_launch('kernel0', (arg0, arg1), stream0)",
+        )
+
+        with self.assertRaisesRegex(KeyError, "Unknown Inductor kernel launcher"):
+            wrapper.format_kernel_launch_line(
+                "kernel0",
+                "arg0",
+                "stream0",
+                inductor_meta={"kernel_launch_backend": "missing_launcher"},
+            )
+
+        with self.assertRaisesRegex(TypeError, "must be a string"):
+            wrapper.format_kernel_launch_line(
+                "kernel0",
+                "arg0",
+                "stream0",
+                inductor_meta={"kernel_launch_backend": 1},
+            )
 
     def test_register_gemm_template_provider(self):
         seen_context = None
