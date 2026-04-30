@@ -336,6 +336,56 @@ class MiscTests(torch._inductor.test_case.TestCase):
         finally:
             torch._dynamo.reset()
 
+    def test_debug_stable_cache_entry_callable_rejects_spoofed_arg_names(self):
+        def f(x, y):
+            return x - y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            entry = _debug_get_cache_entry_list(f)[0]
+            with self.assertRaisesRegex(
+                RuntimeError, "positional argument order"
+            ):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+                    entry,
+                    {"x": x, "y": y},
+                    ("y", "x"),
+                    (y, x),
+                    None,
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "positional argument order"
+            ):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+                    entry,
+                    {"x": x, "y": y},
+                    ("x", "x"),
+                    (x, x),
+                    None,
+                )
+            with self.assertRaisesRegex(TypeError, "arg_names to contain strings"):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+                    entry,
+                    {"x": x, "y": y},
+                    ("x", 1),
+                    (x, y),
+                    None,
+                )
+            with self.assertRaisesRegex(RuntimeError, "missing guarded local"):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+                    entry,
+                    {"x": x},
+                    ("x", "y"),
+                    (x, y),
+                    None,
+                )
+        finally:
+            torch._dynamo.reset()
+
     def test_debug_stable_cache_entry_callable_invalidated_fails_closed(self):
         def f(x, y):
             return x + y

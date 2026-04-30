@@ -267,11 +267,24 @@ py::object _debug_call_cache_entry_stable_callable(
   TORCH_CHECK(
       arg_names.size() == args.size(),
       "cache entry stable callable expected arg_names and args to have the same length");
+  PyCodeObject* stable_code = reinterpret_cast<PyCodeObject*>(cache_entry.code.ptr());
+  py::object stable_varnames =
+      py::reinterpret_steal<py::object>(PyCode_GetVarnames(stable_code));
+  TORCH_CHECK_TYPE(
+      PyTuple_Check(stable_varnames.ptr()),
+      "cache entry stable callable expected code varnames to be a tuple");
+  TORCH_CHECK(
+      static_cast<Py_ssize_t>(arg_names.size()) <= PyTuple_GET_SIZE(stable_varnames.ptr()),
+      "cache entry stable callable arg_names exceed code varnames");
   for (size_t i = 0; i < arg_names.size(); ++i) {
     py::handle name = arg_names[i];
     TORCH_CHECK_TYPE(
         PyUnicode_Check(name.ptr()),
         "cache entry stable callable expected arg_names to contain strings");
+    PyObject* expected_name = PyTuple_GET_ITEM(stable_varnames.ptr(), i);
+    TORCH_CHECK(
+        PyObject_RichCompareBool(name.ptr(), expected_name, Py_EQ) == 1,
+        "cache entry stable callable arg_names must match code positional argument order");
     PyObject* local_value = PyDict_GetItemWithError(f_locals.ptr(), name.ptr());
     if (local_value == nullptr) {
       if (PyErr_Occurred()) {
