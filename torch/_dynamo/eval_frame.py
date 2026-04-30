@@ -439,6 +439,7 @@ def _debug_make_stable_cache_entry_callable(
         return torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
             cache_entry,
             f_locals,
+            arg_names,
             args,
             None,
             use_diff_guard,

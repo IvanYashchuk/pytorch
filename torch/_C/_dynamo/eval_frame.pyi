@@ -75,6 +75,7 @@ def _debug_get_cache_entry_list(code: types.CodeType) -> list[_CacheEntry]: ...
 def _debug_call_cache_entry_stable_callable(
     cache_entry: _CacheEntry,
     f_locals: dict[str, object],
+    arg_names: tuple[str, ...],
     args: tuple[object, ...],
     kwargs: dict[str, object] | None = None,
     use_diff_guard: bool = False,

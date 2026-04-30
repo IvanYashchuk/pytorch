@@ -246,6 +246,7 @@ py::list _debug_get_cache_entry_list(const py::handle& code_obj) {
 py::object _debug_call_cache_entry_stable_callable(
     CacheEntry& cache_entry,
     py::dict f_locals,
+    py::tuple arg_names,
     py::tuple args,
     py::object kwargs,
     bool use_diff_guard) {
@@ -262,6 +263,27 @@ py::object _debug_call_cache_entry_stable_callable(
     TORCH_CHECK(
         PyDict_Size(kwargs.ptr()) == 0,
         "cache entry stable callable only supports empty kwargs");
+  }
+  TORCH_CHECK(
+      arg_names.size() == args.size(),
+      "cache entry stable callable expected arg_names and args to have the same length");
+  for (size_t i = 0; i < arg_names.size(); ++i) {
+    py::handle name = arg_names[i];
+    TORCH_CHECK_TYPE(
+        PyUnicode_Check(name.ptr()),
+        "cache entry stable callable expected arg_names to contain strings");
+    PyObject* local_value = PyDict_GetItemWithError(f_locals.ptr(), name.ptr());
+    if (local_value == nullptr) {
+      if (PyErr_Occurred()) {
+        throw py::error_already_set();
+      }
+      TORCH_CHECK(
+          false,
+          "cache entry stable callable local/arg mismatch: missing guarded local");
+    }
+    TORCH_CHECK(
+        local_value == args[i].ptr(),
+        "cache entry stable callable local/arg mismatch");
   }
 
   void* root =

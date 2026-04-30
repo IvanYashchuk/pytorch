@@ -484,6 +484,7 @@ void initDynamoBindings(PyObject* torch) {
       &_debug_call_cache_entry_stable_callable,
       py::arg("cache_entry"),
       py::arg("f_locals"),
+      py::arg("arg_names"),
       py::arg("args"),
       py::arg("kwargs") = py::none(),
       py::arg("use_diff_guard") = false);

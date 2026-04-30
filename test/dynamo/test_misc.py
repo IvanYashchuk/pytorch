@@ -311,6 +311,31 @@ class MiscTests(torch._inductor.test_case.TestCase):
         finally:
             torch._dynamo.reset()
 
+    def test_debug_stable_cache_entry_callable_rejects_mismatched_locals_and_args(
+        self,
+    ):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            z = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            entry = _debug_get_cache_entry_list(f)[0]
+            with self.assertRaisesRegex(RuntimeError, "local/arg mismatch"):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(
+                    entry,
+                    {"x": x, "y": y},
+                    ("x", "y"),
+                    (z, y),
+                    None,
+                )
+        finally:
+            torch._dynamo.reset()
+
     def test_debug_stable_cache_entry_callable_invalidated_fails_closed(self):
         def f(x, y):
             return x + y
