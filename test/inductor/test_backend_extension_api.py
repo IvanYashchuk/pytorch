@@ -701,6 +701,23 @@ class BackendExtensionAPITests(TestCase):
         with self.assertRaisesRegex(ValueError, "non-empty"):
             common.register_backend_wrapper_import("dummy_wrapper_backend", " ")
 
+    def test_backend_wrapper_imports_are_available_to_compile_time_autotune(self):
+        common.register_backend_wrapper_import(
+            "dummy_wrapper_backend",
+            "import math as dummy_math\nfrom math import sqrt as dummy_sqrt",
+        )
+        wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
+        wrapper.imports = common.IndentedBuffer()
+        wrapper.kernel_autotune_defs = common.IndentedBuffer()
+
+        with config.patch("triton.autotune_at_compile_time", True):
+            wrapper.write_backend_header_once("dummy_wrapper_backend")
+
+        for buffer in (wrapper.imports, wrapper.kernel_autotune_defs):
+            source = buffer.getvalue()
+            self.assertIn("import math as dummy_math", source)
+            self.assertIn("from math import sqrt as dummy_sqrt", source)
+
     def test_register_backend_kernel_launcher(self):
         def formatter(kernel_name, call_args, stream_name):
             return f"launch({kernel_name}, ({call_args}), {stream_name})"

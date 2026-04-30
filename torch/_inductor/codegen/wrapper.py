@@ -1501,6 +1501,8 @@ class PythonWrapperCodegen(CodeGen):
             return
         for import_code in get_backend_wrapper_imports(backend_name):
             self.imports.splice(import_code, strip=True)
+            if config.triton.autotune_at_compile_time:
+                self.kernel_autotune_defs.splice(import_code, strip=True)
         backend_headers_written.add(backend_name)
         self._backend_headers_written = backend_headers_written
 
