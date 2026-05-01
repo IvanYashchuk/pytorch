@@ -1595,6 +1595,7 @@ def _optimize(
     dynamic: bool | None = None,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
+    isolate_recompiles: bool = False,
 ) -> OptimizeContext | _NullDecorator:
     """
     The main entrypoint of TorchDynamo.  Do graph capture and call
@@ -1626,6 +1627,11 @@ def _optimize(
         @torch._dynamo.optimize()
         def toy_example(a, b): ...
     """
+    # Compatibility for source overlays on PyTorch builds whose public
+    # torch.compile already forwards isolate_recompiles. This branch does not
+    # implement isolated recompile behavior, so accept the kwarg and keep the
+    # existing default path.
+    del isolate_recompiles
     check_if_dynamo_supported()
     check_for_incompatible_configs()
     # Note: The hooks object could be global instead of passed around, *however* that would make
@@ -2531,6 +2537,7 @@ def _optimize_assert(
     dynamic: bool | None = None,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
+    isolate_recompiles: bool = False,
 ) -> OptimizeContext:
     """
     Guarantees single-graph capture.
@@ -2540,6 +2547,7 @@ def _optimize_assert(
     Used for fullgraph=True and export, since we must always error on graph breaks and ignore
     symbolic_convert.error_on_graph_break. Can also be used for testing.
     """
+    del isolate_recompiles
     backend = get_compiler_fn(backend)
 
     # Find if backend has any extra context manager
