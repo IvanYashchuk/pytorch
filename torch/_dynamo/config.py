@@ -446,6 +446,10 @@ skip_fsdp_guards = True
 # Defaults to True. If Traceable FSDP2 is used, set this to False.
 skip_fsdp_hooks = True
 
+# Compatibility for source overlays on PyTorch builds whose Dynamo output graph
+# checks this newer config flag.
+inline_single_use_invoke_subgraph = False
+
 # Make dynamo skip guarding on hooks on nn modules
 # Note: unsafe: if your model actually has hooks and you remove them, or doesn't and  you add them,
 # dynamo will not notice and will execute whichever version you first compiled.
