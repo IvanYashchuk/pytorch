@@ -5655,6 +5655,30 @@ class MultiTemplateBuffer(TritonTemplateBuffer):
             make_kernel_render=None,
             allowed_prologue_inps=allowed_prologue_inps,
         )
+        choice_epilogue_fusion = [
+            getattr(choice, "allow_epilogue_fusion", None)
+            for choice in unfiltered_choices
+        ]
+        if any(flag is False for flag in choice_epilogue_fusion):
+            self.allow_epilogue_fusion = False
+            self.epilogue_fusable_outputs.clear()
+        elif choice_epilogue_fusion and all(
+            flag is True for flag in choice_epilogue_fusion
+        ):
+            self.allow_epilogue_fusion = True
+
+        choice_prologue_fusion = [
+            getattr(choice, "allow_prologue_fusion", None)
+            for choice in unfiltered_choices
+        ]
+        if any(flag is False for flag in choice_prologue_fusion):
+            self.allow_prologue_fusion = False
+            self.allowed_prologue_inps.clear()
+        elif choice_prologue_fusion and all(
+            flag is True for flag in choice_prologue_fusion
+        ):
+            self.allow_prologue_fusion = True
+
         self._choice_timings_fn = choice_timings_fn
         self._choice_timings: dict[int | None, dict[ChoiceCaller, float]] = {}
         self._choices: list[ChoiceCaller] = unfiltered_choices

@@ -1016,6 +1016,8 @@ class BackendExtensionAPITests(TestCase):
             log_info={"tile_shape": "(16, 32, 8)"},
             allowed_prologue_inps=OrderedSet(["arg0"]),
         )
+        provider_choice.allow_epilogue_fusion = False
+        provider_choice.allow_prologue_fusion = False
 
         def dummy_gemm_provider(context):
             return [provider_choice]
@@ -1070,6 +1072,10 @@ class BackendExtensionAPITests(TestCase):
             )
 
             self.assertTrue(multi_template_buffer.output_plannable)
+            self.assertFalse(multi_template_buffer.allow_epilogue_fusion)
+            self.assertFalse(multi_template_buffer.allow_prologue_fusion)
+            self.assertEqual(multi_template_buffer.epilogue_fusable_outputs, {})
+            self.assertEqual(multi_template_buffer.allowed_prologue_inps, OrderedSet())
             multi_template_buffer.finalize_as_template_caller(provider_choice)
             self.assertIs(
                 multi_template_buffer.make_kernel_render, make_kernel_render
