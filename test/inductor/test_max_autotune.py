@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
@@ -221,7 +222,7 @@ class TestMaxAutotune(TestCase):
         def high_warp_pairs(size_hints, extra_meta=None):
             configs = pointwise(
                 size_hints,
-                triton_meta={"device": object()},
+                triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
                 inductor_meta={
                     **{
                         "autotune_pointwise": False,
@@ -250,10 +251,12 @@ class TestMaxAutotune(TestCase):
     @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
     @skipIfRocm
     def test_max_autotune_pointwise_high_warp_configs_are_guarded(self):
-        def high_warp_pairs(size_hints, extra_meta=None):
+        def high_warp_pairs(size_hints, extra_meta=None, device_type="cuda"):
             configs = pointwise(
                 size_hints,
-                triton_meta={"device": object()},
+                triton_meta={
+                    "device": SimpleNamespace(type=device_type, warp_size=32)
+                },
                 inductor_meta={
                     **{
                         "autotune_pointwise": False,
@@ -271,27 +274,34 @@ class TestMaxAutotune(TestCase):
                 if cfg.num_warps in (16, 32)
             }
 
-        for size_hints, meta in (
-            ({"x": 256}, None),
-            ({"x": 2048, "y": 2}, None),
-            ({"x": 2048}, {"atomic_add_found": True}),
-            ({"x": 2048}, {"num_reduction": 1}),
-            ({"x": 2048}, {"num_load": 0}),
-            ({"x": 2048}, {"num_store": 0}),
+        for size_hints, meta, device_type in (
+            ({"x": 256}, None, "cuda"),
+            ({"x": 2048, "y": 2}, None, "cuda"),
+            ({"x": 2048}, {"atomic_add_found": True}, "cuda"),
+            ({"x": 2048}, {"num_reduction": 1}, "cuda"),
+            ({"x": 2048}, {"num_load": 0}, "cuda"),
+            ({"x": 2048}, {"num_store": 0}, "cuda"),
+            ({"x": 2048}, None, "xpu"),
+            ({"x": 2048}, None, "hip"),
             (
                 {"x": 2048},
                 {
                     "max_autotune_pointwise": False,
                     "max_autotune": False,
                 },
+                "cuda",
             ),
         ):
-            with self.subTest(size_hints=size_hints, meta=meta):
-                self.assertEqual(high_warp_pairs(size_hints, meta), set())
+            with self.subTest(
+                size_hints=size_hints, meta=meta, device_type=device_type
+            ):
+                self.assertEqual(
+                    high_warp_pairs(size_hints, meta, device_type), set()
+                )
 
         configs = pointwise(
             {"x": 2048},
-            triton_meta={"device": object()},
+            triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
             inductor_meta={
                 "autotune_pointwise": False,
                 "max_autotune_pointwise": False,

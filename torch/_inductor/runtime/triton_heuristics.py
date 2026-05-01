@@ -3210,10 +3210,11 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
-def _should_add_high_warp_pointwise_configs(size_hints, inductor_meta):
+def _should_add_high_warp_pointwise_configs(size_hints, triton_meta, inductor_meta):
+    device_props = triton_meta.get("device")
     return (
         torch.version.hip is None
-        and not torch.xpu.is_available()
+        and getattr(device_props, "type", None) == "cuda"
         and len(size_hints) == 1
         and isinstance(size_hints.get("x"), int)
         and (
@@ -3323,7 +3324,9 @@ def prepare_pointwise_configs(
                         triton_config_with_settings(size_hints, 32),
                     ]
                 )
-            if _should_add_high_warp_pointwise_configs(size_hints, inductor_meta):
+            if _should_add_high_warp_pointwise_configs(
+                size_hints, triton_meta, inductor_meta
+            ):
                 configs.extend(
                     triton_config_with_settings(size_hints, xblock, num_warps=warps)
                     for xblock, warps in [
