@@ -19400,6 +19400,55 @@ if RUN_GPU:
     tmp1 = tl.load(in_ptr1 + (x0), xmask, cache_modifier='.cg')""",
             )
 
+        @config.patch("max_autotune", True)
+        def test_max_autotune_pointwise_streaming_memory_policy(self):
+            @torch.compile
+            def f(a, b):
+                return a + b
+
+            N = 512
+            inps = (torch.randn(N, device=GPU_TYPE), torch.randn(N, device=GPU_TYPE))
+            code = run_and_get_triton_code(f, *inps)
+            FileCheck().check("cache_modifier='.cg'").check(
+                "tl.store"
+            ).check("cache_modifier='.cs'").run(code)
+
+        def test_default_pointwise_streaming_memory_policy_disabled(self):
+            @torch.compile
+            def f(a, b):
+                return a + b
+
+            N = 512
+            inps = (torch.randn(N, device=GPU_TYPE), torch.randn(N, device=GPU_TYPE))
+            code = run_and_get_triton_code(f, *inps)
+            FileCheck().check_not("cache_modifier='.cg'").check_not(
+                "cache_modifier='.cs'"
+            ).run(code)
+
+        @config.patch("max_autotune", True)
+        def test_max_autotune_pointwise_streaming_memory_policy_skips_broadcast_load(
+            self,
+        ):
+            @torch.compile
+            def f(a, b):
+                return a + b
+
+            N = 512
+            inps = (
+                torch.randn(N, N, device=GPU_TYPE),
+                torch.randn(N, device=GPU_TYPE),
+            )
+            code = run_and_get_triton_code(f, *inps)
+            broadcast_loads = [
+                line
+                for line in code.splitlines()
+                if "tl.load" in line and "in_ptr1" in line
+            ]
+            self.assertTrue(broadcast_loads)
+            self.assertTrue(
+                all("cache_modifier='.cg'" not in line for line in broadcast_loads)
+            )
+
         @config.patch("triton.skip_l1_cache", True)
         def test_skip_l1_cache_buf_read_counts_guard(self):
             from torch._inductor.codegen import simd_kernel_features

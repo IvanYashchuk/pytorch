@@ -3938,6 +3938,24 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _should_add_high_warp_pointwise_configs(size_hints, triton_meta, inductor_meta):
+    device_props = triton_meta.get("device")
+    return (
+        torch.version.hip is None
+        and getattr(device_props, "type", None) == "cuda"
+        and len(size_hints) == 1
+        and isinstance(size_hints.get("x"), int)
+        and (
+            inductor_meta.get("max_autotune")
+            or inductor_meta.get("max_autotune_pointwise")
+        )
+        and not inductor_meta.get("atomic_add_found")
+        and inductor_meta.get("num_reduction", 0) == 0
+        and inductor_meta.get("num_load", 0) > 0
+        and inductor_meta.get("num_store", 0) > 0
+    )
+
+
 def pointwise(
     size_hints,
     triton_meta,
@@ -4039,6 +4057,18 @@ def pointwise(
                     [  # intel-xpu-backend-for-triton #5133
                         triton_config_with_settings(size_hints, 32),
                     ]
+                )
+            if _should_add_high_warp_pointwise_configs(
+                size_hints, triton_meta, inductor_meta
+            ):
+                configs.extend(
+                    triton_config_with_settings(size_hints, xblock, num_warps=warps)
+                    for xblock, warps in [
+                        (512, 16),
+                        (512, 32),
+                        (1024, 32),
+                    ]
+                    if xblock <= size_hints["x"]
                 )
     if len(size_hints) == 2:
         # Only avoiding tuning on TileHint.SQUARE if not on ROCm builds

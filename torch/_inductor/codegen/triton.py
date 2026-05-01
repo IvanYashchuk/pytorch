@@ -4283,7 +4283,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         NOTE: enabled with env variable TORCHINDUCTOR_SKIP_L1
         """
         has_read_deps = True
-        if config.triton.skip_l1_cache:
+        if config.triton.skip_l1_cache or self._use_pointwise_streaming_memory_policy():
             buffer_read_counts = self.features.buffer_read_counts()
             # Graph inputs, primals_*, arg*_* would not be tracked by `buffer_read_counts`
             # and it'd be fair to expect them to be reused.
@@ -4476,7 +4476,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 ):
                     value_shape = ", ".join(map(str, value.shape))
                     indexing_str += f".broadcast_to({value_shape})"
-            line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str})"
+            cachemod = ""
+            store_is_coalesced = any(
+                i == 1 for i in self.get_strides_of_load(original_index).values()
+            )
+            if (
+                self._use_pointwise_streaming_memory_policy()
+                and not is_inplace
+                and not is_broadcasted
+                and store_is_coalesced
+            ):
+                cachemod = ", cache_modifier='.cs'"
+            line = f"tl.store({var} + ({indexing_str}), {value}, {indexing.mask_str}{cachemod})"
         elif mode == "atomic_add":
             self.atomic_add_found = True
             indexing_str = indexing.index_str
@@ -4502,6 +4513,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.outside_loop_vars.add(value)
 
         exit_stack.close()
+
+    def _use_pointwise_streaming_memory_policy(self) -> bool:
+        return (
+            torch.version.hip is None
+            and V.graph.get_current_device_or_throw().type == "cuda"
+            and not self.inside_reduction
+            and (config.max_autotune or config.max_autotune_pointwise)
+            and self.num_reduction == 0
+        )
 
     def device_assert_async(self, cond, msg) -> None:
         self.compute.writeline(f"tl.device_assert({cond}, {repr(msg)})")

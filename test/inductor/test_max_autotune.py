@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
@@ -231,6 +232,110 @@ class TestMaxAutotune(TestCase):
                     len(max_autotune_pointwise_configs),
                     "max_autotune should include all pointwise configs from max_autotune_pointwise",
                 )
+
+    @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
+    @skipIfRocm
+    def test_max_autotune_pointwise_adds_high_warp_1d_configs(self):
+        def high_warp_pairs(size_hints, extra_meta=None):
+            configs = pointwise(
+                size_hints,
+                triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
+                inductor_meta={
+                    **{
+                        "autotune_pointwise": False,
+                        "max_autotune_pointwise": True,
+                        "num_load": 2,
+                        "num_store": 1,
+                    },
+                    **(extra_meta or {}),
+                },
+                return_configs=True,
+            )
+            return {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+
+        self.assertTrue(
+            {(512, 16), (512, 32), (1024, 32)} <= high_warp_pairs({"x": 2048})
+        )
+        self.assertEqual(
+            high_warp_pairs({"x": 768}),
+            {(512, 16), (512, 32)},
+        )
+
+    @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
+    @skipIfRocm
+    def test_max_autotune_pointwise_high_warp_configs_are_guarded(self):
+        def high_warp_pairs(size_hints, extra_meta=None, device_type="cuda"):
+            configs = pointwise(
+                size_hints,
+                triton_meta={
+                    "device": SimpleNamespace(type=device_type, warp_size=32)
+                },
+                inductor_meta={
+                    **{
+                        "autotune_pointwise": False,
+                        "max_autotune_pointwise": True,
+                        "num_load": 2,
+                        "num_store": 1,
+                    },
+                    **(extra_meta or {}),
+                },
+                return_configs=True,
+            )
+            return {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+
+        for size_hints, meta, device_type in (
+            ({"x": 256}, None, "cuda"),
+            ({"x": 2048, "y": 2}, None, "cuda"),
+            ({"x": 2048}, {"atomic_add_found": True}, "cuda"),
+            ({"x": 2048}, {"num_reduction": 1}, "cuda"),
+            ({"x": 2048}, {"num_load": 0}, "cuda"),
+            ({"x": 2048}, {"num_store": 0}, "cuda"),
+            ({"x": 2048}, None, "xpu"),
+            ({"x": 2048}, None, "hip"),
+            (
+                {"x": 2048},
+                {
+                    "max_autotune_pointwise": False,
+                    "max_autotune": False,
+                },
+                "cuda",
+            ),
+        ):
+            with self.subTest(
+                size_hints=size_hints, meta=meta, device_type=device_type
+            ):
+                self.assertEqual(
+                    high_warp_pairs(size_hints, meta, device_type), set()
+                )
+
+        configs = pointwise(
+            {"x": 2048},
+            triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
+            inductor_meta={
+                "autotune_pointwise": False,
+                "max_autotune_pointwise": False,
+                "max_autotune": True,
+                "num_load": 2,
+                "num_store": 1,
+            },
+            return_configs=True,
+        )
+        self.assertTrue(
+            {(512, 16), (512, 32), (1024, 32)}
+            <= {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+        )
 
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
