@@ -218,20 +218,97 @@ class TestMaxAutotune(TestCase):
     @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
     @skipIfRocm
     def test_max_autotune_pointwise_adds_high_warp_1d_configs(self):
+        def high_warp_pairs(size_hints, extra_meta=None):
+            configs = pointwise(
+                size_hints,
+                triton_meta={"device": object()},
+                inductor_meta={
+                    **{
+                        "autotune_pointwise": False,
+                        "max_autotune_pointwise": True,
+                        "num_load": 2,
+                        "num_store": 1,
+                    },
+                    **(extra_meta or {}),
+                },
+                return_configs=True,
+            )
+            return {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+
+        self.assertTrue(
+            {(512, 16), (512, 32), (1024, 32)} <= high_warp_pairs({"x": 2048})
+        )
+        self.assertEqual(
+            high_warp_pairs({"x": 768}),
+            {(512, 16), (512, 32)},
+        )
+
+    @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
+    @skipIfRocm
+    def test_max_autotune_pointwise_high_warp_configs_are_guarded(self):
+        def high_warp_pairs(size_hints, extra_meta=None):
+            configs = pointwise(
+                size_hints,
+                triton_meta={"device": object()},
+                inductor_meta={
+                    **{
+                        "autotune_pointwise": False,
+                        "max_autotune_pointwise": True,
+                        "num_load": 2,
+                        "num_store": 1,
+                    },
+                    **(extra_meta or {}),
+                },
+                return_configs=True,
+            )
+            return {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+
+        for size_hints, meta in (
+            ({"x": 256}, None),
+            ({"x": 2048, "y": 2}, None),
+            ({"x": 2048}, {"atomic_add_found": True}),
+            ({"x": 2048}, {"num_reduction": 1}),
+            ({"x": 2048}, {"num_load": 0}),
+            ({"x": 2048}, {"num_store": 0}),
+            (
+                {"x": 2048},
+                {
+                    "max_autotune_pointwise": False,
+                    "max_autotune": False,
+                },
+            ),
+        ):
+            with self.subTest(size_hints=size_hints, meta=meta):
+                self.assertEqual(high_warp_pairs(size_hints, meta), set())
+
         configs = pointwise(
             {"x": 2048},
             triton_meta={"device": object()},
             inductor_meta={
                 "autotune_pointwise": False,
-                "max_autotune_pointwise": True,
+                "max_autotune_pointwise": False,
+                "max_autotune": True,
                 "num_load": 2,
                 "num_store": 1,
             },
             return_configs=True,
         )
-
-        config_pairs = {(cfg.kwargs["XBLOCK"], cfg.num_warps) for cfg in configs}
-        self.assertTrue({(512, 16), (512, 32), (1024, 32)} <= config_pairs)
+        self.assertTrue(
+            {(512, 16), (512, 32), (1024, 32)}
+            <= {
+                (cfg.kwargs["XBLOCK"], cfg.num_warps)
+                for cfg in configs
+                if cfg.num_warps in (16, 32)
+            }
+        )
 
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
