@@ -3210,6 +3210,20 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _should_add_high_warp_pointwise_configs(inductor_meta):
+    return (
+        torch.version.hip is None
+        and not torch.xpu.is_available()
+        and (
+            inductor_meta.get("max_autotune")
+            or inductor_meta.get("max_autotune_pointwise")
+        )
+        and not inductor_meta.get("atomic_add_found")
+        and inductor_meta.get("num_load", 0) > 0
+        and inductor_meta.get("num_store", 0) > 0
+    )
+
+
 def prepare_pointwise_configs(
     size_hints,
     triton_meta,
@@ -3304,6 +3318,14 @@ def prepare_pointwise_configs(
                 configs.extend(
                     [  # intel-xpu-backend-for-triton #5133
                         triton_config_with_settings(size_hints, 32),
+                    ]
+                )
+            if _should_add_high_warp_pointwise_configs(inductor_meta):
+                configs.extend(
+                    [
+                        triton_config_with_settings(size_hints, 512, num_warps=16),
+                        triton_config_with_settings(size_hints, 512, num_warps=32),
+                        triton_config_with_settings(size_hints, 1024, num_warps=32),
                     ]
                 )
     if len(size_hints) == 2:

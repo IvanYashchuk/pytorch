@@ -2946,7 +2946,13 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
         raise NotImplementedError
 
     def codegen_store(
-        self, name: str, var: str, index: str, value: str, mask: str | None = None
+        self,
+        name: str,
+        var: str,
+        index: str,
+        value: str,
+        mask: str | None = None,
+        cachemod: str | None = "",
     ) -> str:
         raise NotImplementedError
 
@@ -4081,7 +4087,7 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
         NOTE: enabled with env variable TORCHINDUCTOR_SKIP_L1
         """
         has_read_deps = True
-        if config.triton.skip_l1_cache:
+        if config.triton.skip_l1_cache or self._use_pointwise_streaming_memory_policy():
             buffer_read_counts = self.features.buffer_read_counts()
             # Graph inputs, primals_*, arg*_* would not be tracked by `buffer_read_counts`
             # and it'd be fair to expect them to be reused.
@@ -4313,8 +4319,19 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
                 ):
                     value_shape = ", ".join(map(str, value.shape))
                     indexing_str += f".broadcast_to({value_shape})"
+            cachemod = ""
+            store_is_coalesced = any(
+                i == 1 for i in self.get_strides_of_load(original_index).values()
+            )
+            if (
+                self._use_pointwise_streaming_memory_policy()
+                and not is_inplace
+                and not is_broadcasted
+                and store_is_coalesced
+            ):
+                cachemod = ", cache_modifier='.cs'"
             line = self.codegen_store(
-                name, var, indexing_str, str(value), indexing.mask_str
+                name, var, indexing_str, str(value), indexing.mask_str, cachemod
             )
         elif mode == "atomic_add":
             self.atomic_add_found = True
@@ -4353,6 +4370,15 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
         idx = self.cooperative_reduction_workspace_cache.increment_store_count()
         buffer.writeline(DeferredLine(name, f"if rsplit_id == ({idx} % RSPLIT):"))
         return buffer.indent()
+
+    def _use_pointwise_streaming_memory_policy(self) -> bool:
+        return (
+            torch.version.hip is None
+            and not torch.xpu.is_available()
+            and not self.inside_reduction
+            and (config.max_autotune or config.max_autotune_pointwise)
+            and self.num_reduction == 0
+        )
 
     def _combine_masks(self, *variables: CSEVariable | None):
         masks = None
@@ -6699,11 +6725,17 @@ class TritonKernel(TileKernel):
         return f"{line}.to(tl.int1)"
 
     def codegen_store(
-        self, name: str, var: str, index: str, value: str, mask: str | None = None
+        self,
+        name: str,
+        var: str,
+        index: str,
+        value: str,
+        mask: str | None = None,
+        cachemod: str | None = "",
     ) -> str:
         if mask is not None:
-            return f"tl.store({var} + ({index}), {value}, {mask})"
-        return f"tl.store({var} + ({index}), {value})"
+            return f"tl.store({var} + ({index}), {value}, {mask}{cachemod})"
+        return f"tl.store({var} + ({index}), {value}{cachemod})"
 
     def codegen_arange(self, end: str) -> str:
         return f"tl.arange(0, {end})"

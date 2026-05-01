@@ -215,6 +215,24 @@ class TestMaxAutotune(TestCase):
                     "max_autotune should include all pointwise configs from max_autotune_pointwise",
                 )
 
+    @skipIfXpu(msg="CUDA-only high-warp pointwise configs")
+    @skipIfRocm
+    def test_max_autotune_pointwise_adds_high_warp_1d_configs(self):
+        configs = pointwise(
+            {"x": 2048},
+            triton_meta={"device": object()},
+            inductor_meta={
+                "autotune_pointwise": False,
+                "max_autotune_pointwise": True,
+                "num_load": 2,
+                "num_store": 1,
+            },
+            return_configs=True,
+        )
+
+        config_pairs = {(cfg.kwargs["XBLOCK"], cfg.num_warps) for cfg in configs}
+        self.assertTrue({(512, 16), (512, 32), (1024, 32)} <= config_pairs)
+
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
