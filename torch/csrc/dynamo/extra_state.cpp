@@ -343,6 +343,95 @@ py::object _debug_call_cache_entry_stable_callable_from_args(
       use_diff_guard);
 }
 
+py::tuple _debug_try_call_cache_entry_stable_callable_from_args(
+    CacheEntry& cache_entry,
+    py::tuple arg_names,
+    py::tuple args,
+    py::object kwargs,
+    bool use_diff_guard) {
+  if (cache_entry.code.is_none()) {
+    return py::make_tuple(
+        false, "cache entry stable callable miss: cache entry is invalidated");
+  }
+  if (!PyCallable_Check(cache_entry.stable_callable.ptr())) {
+    return py::make_tuple(
+        false,
+        "cache entry stable callable miss: stable_callable is not callable");
+  }
+  if (!kwargs.is_none()) {
+    if (!PyDict_Check(kwargs.ptr())) {
+      return py::make_tuple(
+          false,
+          "cache entry stable callable miss: kwargs must be a dict or None");
+    }
+    if (PyDict_Size(kwargs.ptr()) != 0) {
+      return py::make_tuple(
+          false,
+          "cache entry stable callable miss: non-empty kwargs are unsupported");
+    }
+  }
+  if (arg_names.size() != args.size()) {
+    return py::make_tuple(
+        false,
+        "cache entry stable callable miss: arg_names and args length mismatch");
+  }
+
+  PyCodeObject* stable_code =
+      reinterpret_cast<PyCodeObject*>(cache_entry.code.ptr());
+  py::object stable_varnames =
+      py::reinterpret_steal<py::object>(PyCode_GetVarnames(stable_code));
+  if (!PyTuple_Check(stable_varnames.ptr())) {
+    return py::make_tuple(
+        false,
+        "cache entry stable callable miss: code varnames are unavailable");
+  }
+  if (static_cast<Py_ssize_t>(arg_names.size()) >
+      PyTuple_GET_SIZE(stable_varnames.ptr())) {
+    return py::make_tuple(
+        false,
+        "cache entry stable callable miss: arg_names exceed code varnames");
+  }
+
+  py::dict f_locals;
+  for (size_t i = 0; i < arg_names.size(); ++i) {
+    py::handle name = arg_names[i];
+    if (!PyUnicode_Check(name.ptr())) {
+      return py::make_tuple(
+          false,
+          "cache entry stable callable miss: arg_names must contain strings");
+    }
+    PyObject* expected_name = PyTuple_GET_ITEM(stable_varnames.ptr(), i);
+    int cmp = PyObject_RichCompareBool(name.ptr(), expected_name, Py_EQ);
+    if (cmp < 0) {
+      throw py::error_already_set();
+    }
+    if (cmp != 1) {
+      return py::make_tuple(
+          false,
+          "cache entry stable callable miss: arg_names do not match code positional argument order");
+    }
+    f_locals[name] = args[i];
+  }
+
+  void* root =
+      use_diff_guard ? cache_entry.diff_guard_root_mgr : cache_entry.root_mgr;
+  if (root == nullptr) {
+    return py::make_tuple(
+        false, "cache entry stable callable miss: guard root is invalidated");
+  }
+  if (!torch::dynamo::run_root_guard_manager_on_object(root, f_locals.ptr())) {
+    return py::make_tuple(
+        false, "cache entry stable callable miss: guard check failed");
+  }
+
+  PyObject* result =
+      PyObject_CallObject(cache_entry.stable_callable.ptr(), args.ptr());
+  if (result == nullptr) {
+    throw py::error_already_set();
+  }
+  return py::make_tuple(true, py::reinterpret_steal<py::object>(result));
+}
+
 PrecompileEntry::PrecompileEntry(py::object gm, py::object c)
     : guard_manager(std::move(gm)), code(std::move(c)) {
   TORCH_CHECK(

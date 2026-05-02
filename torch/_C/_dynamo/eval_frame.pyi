@@ -87,6 +87,13 @@ def _debug_call_cache_entry_stable_callable_from_args(
     kwargs: dict[str, object] | None = None,
     use_diff_guard: bool = False,
 ) -> object: ...
+def _debug_try_call_cache_entry_stable_callable_from_args(
+    cache_entry: _CacheEntry,
+    arg_names: tuple[str, ...],
+    args: tuple[object, ...],
+    kwargs: dict[str, object] | None = None,
+    use_diff_guard: bool = False,
+) -> tuple[bool, object]: ...
 def _get_frame_value_stack_with_depth(
     frame: types.FrameType, depth: int
 ) -> list[object]: ...

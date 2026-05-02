@@ -461,6 +461,75 @@ def _debug_make_stable_cache_entry_callable(
     return stable_cache_entry_callable
 
 
+def _debug_make_stable_cache_entry_fallback_callable(
+    compiled_fn: Callable[..., Any],
+    *,
+    use_diff_guard: bool = False,
+) -> Callable[..., Any]:
+    """
+    Return a private diagnostic wrapper that tries one stable cache entry first.
+
+    This is still diagnostic-only. A cache hit calls the stored stable callable;
+    a miss or ineligible signature falls back to the original compiled wrapper
+    so normal Dynamo recompilation/error semantics remain in charge.
+    """
+    if not callable(compiled_fn):
+        raise TypeError("expected a callable")
+    fn = getattr(compiled_fn, "_torchdynamo_orig_callable", None)
+    native_try_from_args = getattr(
+        torch._C._dynamo.eval_frame,
+        "_debug_try_call_cache_entry_stable_callable_from_args",
+        None,
+    )
+    if not isinstance(fn, types.FunctionType) or native_try_from_args is None:
+
+        @functools.wraps(compiled_fn)
+        def fallback_only(*args: Any, **kwargs: Any) -> Any:
+            return compiled_fn(*args, **kwargs)
+
+        return fallback_only
+
+    code = fn.__code__
+    eligible = (
+        fn.__defaults__ is None
+        and fn.__kwdefaults__ is None
+        and fn.__closure__ is None
+        and code.co_kwonlyargcount == 0
+        and not (code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS))
+    )
+    arg_names = code.co_varnames[: code.co_argcount]
+    cache_entry: CacheEntry | None = None
+
+    def refresh_cache_entry() -> CacheEntry | None:
+        entries = _debug_get_cache_entry_list(code)
+        if len(entries) != 1 or entries[0].stable_callable is None:
+            return None
+        return entries[0]
+
+    @functools.wraps(compiled_fn)
+    def stable_cache_entry_fallback_callable(*args: Any, **kwargs: Any) -> Any:
+        nonlocal cache_entry
+        if not eligible or kwargs or len(args) != len(arg_names):
+            return compiled_fn(*args, **kwargs)
+        if cache_entry is None or cache_entry.code is None:
+            cache_entry = refresh_cache_entry()
+            if cache_entry is None:
+                return compiled_fn(*args, **kwargs)
+        hit, result = native_try_from_args(
+            cache_entry,
+            arg_names,
+            args,
+            None,
+            use_diff_guard,
+        )
+        if hit:
+            return result
+        cache_entry = None
+        return compiled_fn(*args, **kwargs)
+
+    return stable_cache_entry_fallback_callable
+
+
 class OptimizedModule(torch.nn.Module):
     """
     Wraps the original nn.Module object and later patches its

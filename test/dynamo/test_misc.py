@@ -48,6 +48,7 @@ from torch._dynamo.comptime import comptime
 from torch._dynamo.eval_frame import (
     _debug_get_cache_entry_list,
     _debug_make_stable_cache_entry_callable,
+    _debug_make_stable_cache_entry_fallback_callable,
 )
 from torch._dynamo.exc import Unsupported
 from torch._dynamo.source import ConstantSource, GetItemSource, LocalSource
@@ -320,6 +321,102 @@ class MiscTests(torch._inductor.test_case.TestCase):
                     (x,),
                     None,
                 )
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_try_stable_cache_entry_callable_from_args_misses(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            entry = _debug_get_cache_entry_list(f)[0]
+            hit, result = (
+                torch._C._dynamo.eval_frame._debug_try_call_cache_entry_stable_callable_from_args(
+                    entry,
+                    ("x", "y"),
+                    (x, y),
+                    None,
+                )
+            )
+            self.assertTrue(hit)
+            self.assertEqual(result, f(x, y))
+
+            hit, reason = (
+                torch._C._dynamo.eval_frame._debug_try_call_cache_entry_stable_callable_from_args(
+                    entry,
+                    ("x", "y"),
+                    (
+                        torch.ones(3, 3, dtype=torch.int64),
+                        torch.ones(3, 3, dtype=torch.int64),
+                    ),
+                    None,
+                )
+            )
+            self.assertFalse(hit)
+            self.assertIn("guard check failed", reason)
+
+            hit, reason = (
+                torch._C._dynamo.eval_frame._debug_try_call_cache_entry_stable_callable_from_args(
+                    entry,
+                    ("x", "y"),
+                    (x,),
+                    None,
+                )
+            )
+            self.assertFalse(hit)
+            self.assertIn("length mismatch", reason)
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_fallback_callable_hits(self):
+        def f(x):
+            return x + 1
+
+        counter = CompileCounterWithBackend("eager")
+        try:
+            opt_f = torch.compile(f, backend=counter, dynamic=False)
+            x = torch.randn(3, 3)
+            self.assertEqual(opt_f(x), f(x))
+            self.assertEqual(counter.frame_count, 1)
+
+            stable_f = _debug_make_stable_cache_entry_fallback_callable(opt_f)
+            self.assertEqual(stable_f(x), f(x))
+            self.assertEqual(counter.frame_count, 1)
+
+            with torch.compiler.set_stance("fail_on_recompile"):
+                with self.assertRaisesRegex(RuntimeError, "fail_on_recompile"):
+                    stable_f(torch.randn(4, 4))
+        finally:
+            torch._dynamo.reset()
+
+    def test_debug_stable_cache_entry_fallback_propagates_stable_error(self):
+        should_raise = False
+
+        def f(x):
+            return x + 1
+
+        def backend(gm, example_inputs):
+            def compiled(*args):
+                if should_raise:
+                    raise RuntimeError("stable callable failure")
+                return gm.forward(*args)
+
+            return compiled
+
+        try:
+            opt_f = torch.compile(f, backend=backend)
+            x = torch.randn(3, 3)
+            self.assertEqual(opt_f(x), f(x))
+
+            stable_f = _debug_make_stable_cache_entry_fallback_callable(opt_f)
+            should_raise = True
+            with self.assertRaisesRegex(RuntimeError, "stable callable failure"):
+                stable_f(x)
         finally:
             torch._dynamo.reset()
 
