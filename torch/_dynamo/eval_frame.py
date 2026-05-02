@@ -425,6 +425,11 @@ def _debug_make_stable_cache_entry_callable(
         raise RuntimeError("cache entry does not have a stable callable")
 
     arg_names = code.co_varnames[: code.co_argcount]
+    native_from_args = getattr(
+        torch._C._dynamo.eval_frame,
+        "_debug_call_cache_entry_stable_callable_from_args",
+        None,
+    )
 
     @functools.wraps(fn)
     def stable_cache_entry_callable(*args: Any, **kwargs: Any) -> Any:
@@ -434,6 +439,14 @@ def _debug_make_stable_cache_entry_callable(
             raise TypeError(
                 "stable cache entry diagnostics expected "
                 f"{len(arg_names)} positional arguments, got {len(args)}"
+            )
+        if native_from_args is not None:
+            return native_from_args(
+                cache_entry,
+                arg_names,
+                args,
+                None,
+                use_diff_guard,
             )
         f_locals = dict(zip(arg_names, args))
         return torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable(

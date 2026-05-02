@@ -292,6 +292,37 @@ class MiscTests(torch._inductor.test_case.TestCase):
         finally:
             torch._dynamo.reset()
 
+    def test_debug_stable_cache_entry_callable_from_args_hits(self):
+        def f(x, y):
+            return x + y
+
+        try:
+            opt_f = torch.compile(f, backend="eager")
+            x = torch.randn(3, 3)
+            y = torch.randn(3, 3)
+            self.assertEqual(opt_f(x, y), f(x, y))
+
+            entry = _debug_get_cache_entry_list(f)[0]
+            result = (
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable_from_args(
+                    entry,
+                    ("x", "y"),
+                    (x, y),
+                    None,
+                )
+            )
+            self.assertEqual(result, f(x, y))
+
+            with self.assertRaisesRegex(RuntimeError, "same length"):
+                torch._C._dynamo.eval_frame._debug_call_cache_entry_stable_callable_from_args(
+                    entry,
+                    ("x", "y"),
+                    (x,),
+                    None,
+                )
+        finally:
+            torch._dynamo.reset()
+
     def test_debug_stable_cache_entry_callable_guard_miss_fails_closed(self):
         def f(x, y):
             return x + y

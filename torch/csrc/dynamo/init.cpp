@@ -488,6 +488,14 @@ void initDynamoBindings(PyObject* torch) {
       py::arg("args"),
       py::arg("kwargs") = py::none(),
       py::arg("use_diff_guard") = false);
+  m.def(
+      "_debug_call_cache_entry_stable_callable_from_args",
+      &_debug_call_cache_entry_stable_callable_from_args,
+      py::arg("cache_entry"),
+      py::arg("arg_names"),
+      py::arg("args"),
+      py::arg("kwargs") = py::none(),
+      py::arg("use_diff_guard") = false);
   m.def("_reset_precompile_entries", &_reset_precompile_entries);
   m.def("_load_precompile_entry", &_load_precompile_entry);
   m.def("_debug_get_precompile_entries", &_debug_get_precompile_entries);

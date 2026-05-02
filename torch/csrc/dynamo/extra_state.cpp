@@ -258,8 +258,7 @@ py::object _debug_call_cache_entry_stable_callable(
       "cache entry stable callable is unavailable: stable_callable is not callable");
   if (!kwargs.is_none()) {
     TORCH_CHECK_TYPE(
-        PyDict_Check(kwargs.ptr()),
-        "expected kwargs to be a dict or None");
+        PyDict_Check(kwargs.ptr()), "expected kwargs to be a dict or None");
     TORCH_CHECK(
         PyDict_Size(kwargs.ptr()) == 0,
         "cache entry stable callable only supports empty kwargs");
@@ -267,14 +266,16 @@ py::object _debug_call_cache_entry_stable_callable(
   TORCH_CHECK(
       arg_names.size() == args.size(),
       "cache entry stable callable expected arg_names and args to have the same length");
-  PyCodeObject* stable_code = reinterpret_cast<PyCodeObject*>(cache_entry.code.ptr());
+  PyCodeObject* stable_code =
+      reinterpret_cast<PyCodeObject*>(cache_entry.code.ptr());
   py::object stable_varnames =
       py::reinterpret_steal<py::object>(PyCode_GetVarnames(stable_code));
   TORCH_CHECK_TYPE(
       PyTuple_Check(stable_varnames.ptr()),
       "cache entry stable callable expected code varnames to be a tuple");
   TORCH_CHECK(
-      static_cast<Py_ssize_t>(arg_names.size()) <= PyTuple_GET_SIZE(stable_varnames.ptr()),
+      static_cast<Py_ssize_t>(arg_names.size()) <=
+          PyTuple_GET_SIZE(stable_varnames.ptr()),
       "cache entry stable callable arg_names exceed code varnames");
   for (size_t i = 0; i < arg_names.size(); ++i) {
     py::handle name = arg_names[i];
@@ -304,18 +305,42 @@ py::object _debug_call_cache_entry_stable_callable(
   TORCH_CHECK(
       root != nullptr,
       "cache entry stable callable is unavailable: guard root is invalidated");
-  if (!torch::dynamo::run_root_guard_manager_on_object(
-          root, f_locals.ptr())) {
-    TORCH_CHECK(
-        false, "cache entry stable callable guard check failed");
+  if (!torch::dynamo::run_root_guard_manager_on_object(root, f_locals.ptr())) {
+    TORCH_CHECK(false, "cache entry stable callable guard check failed");
   }
 
-  PyObject* result = PyObject_CallObject(
-      cache_entry.stable_callable.ptr(), args.ptr());
+  PyObject* result =
+      PyObject_CallObject(cache_entry.stable_callable.ptr(), args.ptr());
   if (result == nullptr) {
     throw py::error_already_set();
   }
   return py::reinterpret_steal<py::object>(result);
+}
+
+py::object _debug_call_cache_entry_stable_callable_from_args(
+    CacheEntry& cache_entry,
+    py::tuple arg_names,
+    py::tuple args,
+    py::object kwargs,
+    bool use_diff_guard) {
+  TORCH_CHECK(
+      arg_names.size() == args.size(),
+      "cache entry stable callable expected arg_names and args to have the same length");
+  py::dict f_locals;
+  for (size_t i = 0; i < arg_names.size(); ++i) {
+    py::handle name = arg_names[i];
+    TORCH_CHECK_TYPE(
+        PyUnicode_Check(name.ptr()),
+        "cache entry stable callable expected arg_names to contain strings");
+    f_locals[name] = args[i];
+  }
+  return _debug_call_cache_entry_stable_callable(
+      cache_entry,
+      f_locals,
+      arg_names,
+      args,
+      std::move(kwargs),
+      use_diff_guard);
 }
 
 PrecompileEntry::PrecompileEntry(py::object gm, py::object c)

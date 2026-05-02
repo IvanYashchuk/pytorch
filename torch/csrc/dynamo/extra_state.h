@@ -204,6 +204,12 @@ py::object _debug_call_cache_entry_stable_callable(
     py::tuple args,
     py::object kwargs,
     bool use_diff_guard);
+py::object _debug_call_cache_entry_stable_callable_from_args(
+    CacheEntry& cache_entry,
+    py::tuple arg_names,
+    py::tuple args,
+    py::object kwargs,
+    bool use_diff_guard);
 void _reset_precompile_entries(const py::handle& code_obj);
 void _load_precompile_entry(
     const py::handle& code_obj,
