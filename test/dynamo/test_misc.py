@@ -385,12 +385,28 @@ class MiscTests(torch._inductor.test_case.TestCase):
             self.assertEqual(counter.frame_count, 1)
 
             stable_f = _debug_make_stable_cache_entry_fallback_callable(opt_f)
+            self.assertEqual(
+                stable_f._torchdynamo_stable_cache_entry_last_status,
+                "not_called",
+            )
             self.assertEqual(stable_f(x), f(x))
+            self.assertEqual(
+                stable_f._torchdynamo_stable_cache_entry_last_status,
+                "hit",
+            )
+            self.assertEqual(stable_f._torchdynamo_stable_cache_entry_hit_count, 1)
+            self.assertEqual(stable_f._torchdynamo_stable_cache_entry_miss_count, 0)
             self.assertEqual(counter.frame_count, 1)
 
             with torch.compiler.set_stance("fail_on_recompile"):
                 with self.assertRaisesRegex(RuntimeError, "fail_on_recompile"):
                     stable_f(torch.randn(4, 4))
+            self.assertEqual(
+                stable_f._torchdynamo_stable_cache_entry_last_status,
+                "fallback_miss",
+            )
+            self.assertEqual(stable_f._torchdynamo_stable_cache_entry_hit_count, 1)
+            self.assertEqual(stable_f._torchdynamo_stable_cache_entry_miss_count, 1)
         finally:
             torch._dynamo.reset()
 
@@ -417,6 +433,10 @@ class MiscTests(torch._inductor.test_case.TestCase):
             should_raise = True
             with self.assertRaisesRegex(RuntimeError, "stable callable failure"):
                 stable_f(x)
+            self.assertEqual(
+                stable_f._torchdynamo_stable_cache_entry_last_status,
+                "error",
+            )
         finally:
             torch._dynamo.reset()
 

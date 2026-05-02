@@ -481,12 +481,35 @@ def _debug_make_stable_cache_entry_fallback_callable(
         "_debug_try_call_cache_entry_stable_callable_from_args",
         None,
     )
+
+    def init_probe_metadata(callable_obj: Callable[..., Any]) -> None:
+        callable_obj._torchdynamo_stable_cache_entry_last_status = "not_called"  # type: ignore[attr-defined]
+        callable_obj._torchdynamo_stable_cache_entry_last_reason = ""  # type: ignore[attr-defined]
+        callable_obj._torchdynamo_stable_cache_entry_hit_count = 0  # type: ignore[attr-defined]
+        callable_obj._torchdynamo_stable_cache_entry_miss_count = 0  # type: ignore[attr-defined]
+
+    def record_probe_metadata(
+        callable_obj: Callable[..., Any], status: str, reason: str
+    ) -> None:
+        callable_obj._torchdynamo_stable_cache_entry_last_status = status  # type: ignore[attr-defined]
+        callable_obj._torchdynamo_stable_cache_entry_last_reason = reason  # type: ignore[attr-defined]
+        if status == "hit":
+            callable_obj._torchdynamo_stable_cache_entry_hit_count += 1  # type: ignore[attr-defined]
+        elif status.startswith("fallback"):
+            callable_obj._torchdynamo_stable_cache_entry_miss_count += 1  # type: ignore[attr-defined]
+
     if not isinstance(fn, types.FunctionType) or native_try_from_args is None:
 
         @functools.wraps(compiled_fn)
         def fallback_only(*args: Any, **kwargs: Any) -> Any:
+            record_probe_metadata(
+                fallback_only,
+                "fallback_unavailable",
+                "original callable or native try helper is unavailable",
+            )
             return compiled_fn(*args, **kwargs)
 
+        init_probe_metadata(fallback_only)
         return fallback_only
 
     code = fn.__code__
@@ -510,23 +533,52 @@ def _debug_make_stable_cache_entry_fallback_callable(
     def stable_cache_entry_fallback_callable(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entry
         if not eligible or kwargs or len(args) != len(arg_names):
+            record_probe_metadata(
+                stable_cache_entry_fallback_callable,
+                "fallback_ineligible",
+                "signature or runtime call arguments are ineligible",
+            )
             return compiled_fn(*args, **kwargs)
         if cache_entry is None or cache_entry.code is None:
             cache_entry = refresh_cache_entry()
             if cache_entry is None:
+                record_probe_metadata(
+                    stable_cache_entry_fallback_callable,
+                    "fallback_no_cache_entry",
+                    "exactly one cache entry with a stable callable is unavailable",
+                )
                 return compiled_fn(*args, **kwargs)
-        hit, result = native_try_from_args(
-            cache_entry,
-            arg_names,
-            args,
-            None,
-            use_diff_guard,
-        )
+        try:
+            hit, result = native_try_from_args(
+                cache_entry,
+                arg_names,
+                args,
+                None,
+                use_diff_guard,
+            )
+        except Exception:
+            record_probe_metadata(
+                stable_cache_entry_fallback_callable,
+                "error",
+                "stable cache-entry try helper raised",
+            )
+            raise
         if hit:
+            record_probe_metadata(
+                stable_cache_entry_fallback_callable,
+                "hit",
+                "stable cache-entry callable executed",
+            )
             return result
         cache_entry = None
+        record_probe_metadata(
+            stable_cache_entry_fallback_callable,
+            "fallback_miss",
+            str(result),
+        )
         return compiled_fn(*args, **kwargs)
 
+    init_probe_metadata(stable_cache_entry_fallback_callable)
     return stable_cache_entry_fallback_callable
 
 
