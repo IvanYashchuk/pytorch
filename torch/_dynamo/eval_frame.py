@@ -483,22 +483,53 @@ def _debug_make_stable_cache_entry_fallback_callable(
     )
 
     def init_probe_metadata(callable_obj: Callable[..., Any]) -> None:
-        callable_obj._torchdynamo_stable_cache_entry_last_status = "not_called"  # type: ignore[attr-defined]
-        callable_obj._torchdynamo_stable_cache_entry_last_reason = ""  # type: ignore[attr-defined]
-        callable_obj._torchdynamo_stable_cache_entry_hit_count = 0  # type: ignore[attr-defined]
-        callable_obj._torchdynamo_stable_cache_entry_miss_count = 0  # type: ignore[attr-defined]
+        state: dict[str, Any] = {
+            "calls": 0,
+            "stable_hits": 0,
+            "stable_errors": 0,
+            "fallback_misses": 0,
+            "last_hit": False,
+            "last_status": "not_called",
+            "last_miss_reason": "",
+            "eligible": eligible,
+        }
+
+        def stats(*, reset: bool = False) -> dict[str, Any]:
+            result = dict(state)
+            if reset:
+                state.update(
+                    {
+                        "calls": 0,
+                        "stable_hits": 0,
+                        "stable_errors": 0,
+                        "fallback_misses": 0,
+                        "last_hit": False,
+                        "last_status": "not_called",
+                        "last_miss_reason": "",
+                    }
+                )
+            return result
+
+        callable_obj._torchdynamo_debug_stable_cache_entry_state = state  # type: ignore[attr-defined]
+        callable_obj._torchdynamo_debug_stable_cache_entry_stats = stats  # type: ignore[attr-defined]
 
     def record_probe_metadata(
         callable_obj: Callable[..., Any], status: str, reason: str
     ) -> None:
-        callable_obj._torchdynamo_stable_cache_entry_last_status = status  # type: ignore[attr-defined]
-        callable_obj._torchdynamo_stable_cache_entry_last_reason = reason  # type: ignore[attr-defined]
+        state = callable_obj._torchdynamo_debug_stable_cache_entry_state  # type: ignore[attr-defined]
+        state["calls"] += 1
+        state["last_status"] = status
+        state["last_miss_reason"] = "" if status == "hit" else reason
+        state["last_hit"] = status == "hit"
         if status == "hit":
-            callable_obj._torchdynamo_stable_cache_entry_hit_count += 1  # type: ignore[attr-defined]
+            state["stable_hits"] += 1
+        elif status == "error":
+            state["stable_errors"] += 1
         elif status.startswith("fallback"):
-            callable_obj._torchdynamo_stable_cache_entry_miss_count += 1  # type: ignore[attr-defined]
+            state["fallback_misses"] += 1
 
-    if not isinstance(fn, types.FunctionType) or native_try_from_args is None:
+    eligible = isinstance(fn, types.FunctionType) and native_try_from_args is not None
+    if not eligible:
 
         @functools.wraps(compiled_fn)
         def fallback_only(*args: Any, **kwargs: Any) -> Any:
@@ -512,6 +543,7 @@ def _debug_make_stable_cache_entry_fallback_callable(
         init_probe_metadata(fallback_only)
         return fallback_only
 
+    assert isinstance(fn, types.FunctionType)
     code = fn.__code__
     eligible = (
         fn.__defaults__ is None
