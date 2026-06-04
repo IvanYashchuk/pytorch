@@ -46,7 +46,10 @@ from weakref import ReferenceType
 import torch
 import torch.overrides
 import torch.utils._device
-from torch._C._dynamo.eval_frame import code_framelocals_names
+from torch._C._dynamo.eval_frame import (
+    _debug_get_cache_entry_list,
+    code_framelocals_names,
+)
 from torch._C._dynamo.guards import (
     check_obj_id,
     check_type_id,
@@ -3490,11 +3493,24 @@ class GuardBuilder(GuardBuilderBase):
                     dynamic_indices = value._dynamo_dynamic_indices
                     code_part = f"(({tensor_name}._dynamo_dynamic_indices.issubset({dynamic_indices})) if hasattr({tensor_name}, '_dynamo_dynamic_indices') else True)"
                     code.append(code_part)
-                    self.get_guard_manager(guard).add_dynamic_indices_guard(
-                        dynamic_indices,
-                        get_verbose_code_parts(code_part, guard),
-                        guard.user_stack,
-                    )
+                    guard_manager = self.get_guard_manager(guard)
+                    verbose_code_parts = get_verbose_code_parts(code_part, guard)
+                    if hasattr(guard_manager, "add_dynamic_indices_guard"):
+                        guard_manager.add_dynamic_indices_guard(
+                            dynamic_indices,
+                            verbose_code_parts,
+                            guard.user_stack,
+                        )
+                    else:
+                        guard_manager.add_lambda_guard(
+                            lambda x, expected=dynamic_indices: (
+                                x._dynamo_dynamic_indices.issubset(expected)
+                                if hasattr(x, "_dynamo_dynamic_indices")
+                                else True
+                            ),
+                            verbose_code_parts,
+                            guard.user_stack,
+                        )
                 # In the case of us not having any dynamic dimension indices, we compiled the frame with no chance of
                 # raising for this specific tensor - and any inputs with more dynamic user directives specified must be recompiled.
                 else:
@@ -5132,6 +5148,24 @@ def get_guard_fail_reason(
     return reason_str
 
 
+def _iter_cache_entries(
+    cache_entry: CacheEntry | None,
+    frame: DynamoFrameType | None = None,
+) -> list[CacheEntry]:
+    if cache_entry is None:
+        return []
+    if not hasattr(cache_entry, "next"):
+        if frame is not None:
+            return _debug_get_cache_entry_list(frame.f_code)
+        return [cache_entry]
+
+    cache_entries = []
+    while cache_entry is not None:
+        cache_entries.append(cache_entry)
+        cache_entry = cache_entry.next  # type: ignore[assignment]
+    return cache_entries
+
+
 def get_and_maybe_log_recompilation_reasons(
     cache_entry: CacheEntry | None,
     frame: DynamoFrameType,
@@ -5146,7 +5180,7 @@ def get_and_maybe_log_recompilation_reasons(
     """
     # pyrefly: ignore [implicit-any]
     reasons = []
-    while cache_entry is not None:
+    for cache_entry in _iter_cache_entries(cache_entry, frame):
         reason = get_guard_fail_reason(
             cache_entry.guard_manager,
             cache_entry.code,
@@ -5157,7 +5191,6 @@ def get_and_maybe_log_recompilation_reasons(
         )
         if reason:
             reasons.append(reason)
-        cache_entry = cache_entry.next
 
     code = frame.f_code
 
@@ -5204,25 +5237,22 @@ def get_and_maybe_log_recompilation_reasons(
 def update_diff_guard_managers_for_existing_cache_entries(
     cache_entry: CacheEntry | None,
 ) -> OrderedSet[str]:
-    first_cache_entry = cache_entry
+    cache_entries = _iter_cache_entries(cache_entry)
 
     # On the first pass, go through the cache entries and accumulate the diff
     # guard sources. Different guard managers can fail with different sources.
     # So, we collect all of them first.
     acc_diff_guard_sources: OrderedSet[str] = OrderedSet()
-    while cache_entry is not None:
+    for cache_entry in cache_entries:
         acc_diff_guard_sources.update(
             cache_entry.guard_manager.collect_diff_guard_sources()
         )
-        cache_entry = cache_entry.next  # type: ignore[assignment]
 
     # On the second pass, set the diff_guard_sources for each cache line to the
     # accumulated value. And the re-populate the diff guard manager.
-    cache_entry = first_cache_entry
-    while cache_entry is not None:
+    for cache_entry in cache_entries:
         cache_entry.guard_manager.diff_guard_sources = acc_diff_guard_sources
         cache_entry.guard_manager.populate_diff_guard_manager()
-        cache_entry = cache_entry.next  # type: ignore[assignment]
 
     # return the accumulated sources to set up the new cache line.
     return acc_diff_guard_sources

@@ -3,6 +3,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Any
 
+from torch._C._dynamo import eval_frame as _c_eval_frame
 from torch._guards import CompileId
 
 from . import config
@@ -139,14 +140,21 @@ def compute_cache_size(
     num_cache_entries = 0
     num_cache_entries_with_same_id_matched_objs = 0
 
-    while cache_entry:
+    if cache_entry and not hasattr(cache_entry, "next"):
+        cache_entries = _c_eval_frame._debug_get_cache_entry_list(frame.f_code)
+    else:
+        cache_entries = []
+        while cache_entry:
+            cache_entries.append(cache_entry)
+            cache_entry = cache_entry.next
+
+    for cache_entry in cache_entries:
         num_cache_entries += 1
         # Track the number of cache entries having same ID_MATCH'd objects as
         # that of frame.f_locals. This will be used later to compare against the
         # recompile_limit.
         if _has_same_id_matched_objs(frame, cache_entry):
             num_cache_entries_with_same_id_matched_objs += 1
-        cache_entry = cache_entry.next
 
     return CacheSizeRelevantForFrame(
         num_cache_entries, num_cache_entries_with_same_id_matched_objs
