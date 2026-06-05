@@ -109,6 +109,7 @@ class BackendExtensionAPITests(TestCase):
         common._dtype_propagation_backends.pop("dummy_dtype_backend", None)
         common._backend_wrapper_imports.pop("dummy_wrapper_backend", None)
         common._backend_kernel_launchers.pop("dummy_launcher_backend", None)
+        common._backend_inductor_meta_providers.pop("dummy_meta_backend", None)
         metrics._kernel_metadata_providers.pop("dummy_metrics_backend", None)
         wrapper_benchmark._kernel_benchmark_providers.pop(
             "dummy_benchmark_backend", None
@@ -606,6 +607,19 @@ class BackendExtensionAPITests(TestCase):
             dummy_launcher_formatter.__qualname__
         )
 
+        def dummy_inductor_meta_provider(kernel, inductor_meta):
+            return {"source": "original"}
+
+        def reloaded_dummy_inductor_meta_provider(kernel, inductor_meta):
+            return {"source": "reloaded"}
+
+        reloaded_dummy_inductor_meta_provider.__module__ = (
+            dummy_inductor_meta_provider.__module__
+        )
+        reloaded_dummy_inductor_meta_provider.__qualname__ = (
+            dummy_inductor_meta_provider.__qualname__
+        )
+
         def dummy_gemm_provider(context):
             return ()
 
@@ -666,6 +680,17 @@ class BackendExtensionAPITests(TestCase):
         self.assertIs(
             common._backend_kernel_launchers["dummy_launcher_backend"],
             reloaded_dummy_launcher_formatter,
+        )
+
+        common.register_backend_inductor_meta_provider(
+            "dummy_meta_backend", dummy_inductor_meta_provider
+        )
+        common.register_backend_inductor_meta_provider(
+            "dummy_meta_backend", reloaded_dummy_inductor_meta_provider
+        )
+        self.assertIs(
+            common._backend_inductor_meta_providers["dummy_meta_backend"],
+            reloaded_dummy_inductor_meta_provider,
         )
 
         mm_kernel.register_gemm_template_provider(
@@ -780,6 +805,71 @@ class BackendExtensionAPITests(TestCase):
                 "arg0",
                 "stream0",
                 inductor_meta={"kernel_launch_backend": 1},
+            )
+
+    def test_register_backend_inductor_meta_provider(self):
+        def provider(kernel, inductor_meta):
+            inductor_meta["mutated"] = True
+            return {"returned": kernel.name}
+
+        common.register_backend_inductor_meta_provider("dummy_meta_backend", provider)
+        common.register_backend_inductor_meta_provider("dummy_meta_backend", provider)
+
+        self.assertIs(
+            common.get_backend_inductor_meta_provider("dummy_meta_backend"),
+            provider,
+        )
+        self.assertIsNone(common.get_backend_inductor_meta_provider("missing_backend"))
+
+        kernel = SimpleNamespace(name="kernel0")
+        inductor_meta = {}
+        common.apply_backend_inductor_meta_provider(
+            kernel, inductor_meta, backend="dummy_meta_backend"
+        )
+        self.assertEqual(inductor_meta, {"mutated": True, "returned": "kernel0"})
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            common.register_backend_inductor_meta_provider(
+                "dummy_meta_backend", lambda *args: None
+            )
+
+    def test_register_backend_inductor_meta_provider_rejects_invalid_name(self):
+        def provider(kernel, inductor_meta):
+            return None
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_backend_inductor_meta_provider(name, provider)
+
+    def test_backend_inductor_meta_provider_uses_kernel_backend(self):
+        def provider(kernel, inductor_meta):
+            return {"backend": kernel.backend(), "kernel_seen": kernel.name}
+
+        class DummyKernel:
+            name = "kernel0"
+
+            @staticmethod
+            def backend():
+                return "dummy_meta_backend"
+
+        common.register_backend_inductor_meta_provider("dummy_meta_backend", provider)
+
+        inductor_meta = {}
+        common.apply_backend_inductor_meta_provider(DummyKernel(), inductor_meta)
+        self.assertEqual(
+            inductor_meta,
+            {"backend": "dummy_meta_backend", "kernel_seen": "kernel0"},
+        )
+
+    def test_backend_inductor_meta_provider_rejects_invalid_return(self):
+        def provider(kernel, inductor_meta):
+            return "not a dict"
+
+        common.register_backend_inductor_meta_provider("dummy_meta_backend", provider)
+
+        with self.assertRaisesRegex(TypeError, "must return a dict or None"):
+            common.apply_backend_inductor_meta_provider(
+                SimpleNamespace(), {}, backend="dummy_meta_backend"
             )
 
     def test_register_gemm_template_provider(self):

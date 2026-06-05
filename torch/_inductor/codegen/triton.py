@@ -87,6 +87,7 @@ from ..wrapper_benchmark import get_kernel_category_by_source_code
 from .block_analysis import BlockPatternMatcher
 from .common import (
     ArgName,
+    apply_backend_inductor_meta_provider,
     BackendFeature,
     ConstexprArg,
     CSE,
@@ -6189,6 +6190,8 @@ class TileKernel(SIMDKernel[TritonCSEVariable]):
             triton_meta["configs"] = [config_of(signature, pointer_range_override=())]
         else:
             triton_meta["configs"] = [config_of(signature)]
+
+        apply_backend_inductor_meta_provider(self, inductor_meta)
 
         for helper in self.helper_functions:
             code.writeline("")
