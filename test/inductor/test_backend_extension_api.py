@@ -1000,6 +1000,54 @@ class BackendExtensionAPITests(TestCase):
             [],
         )
 
+    def test_flex_block_mask_tuple_v17_normalization(self):
+        block_mask = (
+            1,
+            1,
+            "kv_num_blocks",
+            "kv_indices",
+            None,
+            None,
+            "q_num_blocks",
+            "q_indices",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1 << 30,
+            1 << 30,
+            "mask_graph",
+        )
+
+        normalized = flex_attention_kernel._normalize_block_mask_tuple(block_mask)
+
+        self.assertEqual(len(normalized), 13)
+        self.assertEqual(
+            normalized,
+            (
+                1,
+                1,
+                "kv_num_blocks",
+                "kv_indices",
+                None,
+                None,
+                "q_num_blocks",
+                "q_indices",
+                None,
+                None,
+                1 << 30,
+                1 << 30,
+                "mask_graph",
+            ),
+        )
+        non_default = (*block_mask[:10], object(), None, None, None, *block_mask[14:])
+        self.assertIs(
+            flex_attention_kernel._normalize_block_mask_tuple(non_default),
+            non_default,
+        )
+
     def test_register_flex_attention_template_provider_rejects_duplicate(self):
         def dummy_flex_provider(context):
             return ()

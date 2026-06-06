@@ -110,6 +110,47 @@ def _sanitize_kernel_options_for_triton(
     return sanitized, backend
 
 
+def _normalize_block_mask_tuple(block_mask: Any) -> Any:
+    if not isinstance(block_mask, (tuple, list)) or len(block_mask) != 17:
+        return block_mask
+    (
+        q_length,
+        kv_length,
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_q_num_blocks,
+        full_q_indices,
+        extra_0,
+        extra_1,
+        extra_2,
+        extra_3,
+        sparse_q_block_size,
+        sparse_kv_block_size,
+        mask_graph,
+    ) = block_mask
+    if any(extra is not None for extra in (extra_0, extra_1, extra_2, extra_3)):
+        return block_mask
+    return (
+        q_length,
+        kv_length,
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_q_num_blocks,
+        full_q_indices,
+        sparse_q_block_size,
+        sparse_kv_block_size,
+        mask_graph,
+    )
+
+
 @SymbolicGridFn
 def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv):
     """How is this kernel parallelized?
@@ -185,6 +226,7 @@ def flex_attention(
             f"at least 16 but got E={query.get_size()[-1]} and Ev={value.get_size()[-1]}"
         )
 
+    block_mask = _normalize_block_mask_tuple(block_mask)
     (
         _,  # q_length
         _,  # kv_length
@@ -720,6 +762,7 @@ def flex_attention_backward(*args, **kwargs):
         score_mod_other_buffers,
         mask_mod_other_buffers,
     ) = args
+    block_mask = _normalize_block_mask_tuple(block_mask)
     (
         _,  # q_length
         _,  # kv_length
