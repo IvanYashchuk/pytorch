@@ -110,6 +110,7 @@ class BackendExtensionAPITests(TestCase):
         common._backend_wrapper_imports.pop("dummy_wrapper_backend", None)
         common._backend_kernel_launchers.pop("dummy_launcher_backend", None)
         common._backend_inductor_meta_providers.pop("dummy_meta_backend", None)
+        common._backend_post_compile_hooks.pop("dummy_post_compile_backend", None)
         metrics._kernel_metadata_providers.pop("dummy_metrics_backend", None)
         wrapper_benchmark._kernel_benchmark_providers.pop(
             "dummy_benchmark_backend", None
@@ -871,6 +872,104 @@ class BackendExtensionAPITests(TestCase):
             common.apply_backend_inductor_meta_provider(
                 SimpleNamespace(), {}, backend="dummy_meta_backend"
             )
+
+    def test_register_backend_post_compile_hook(self):
+        seen = []
+
+        def hook(kernel_name, inductor_meta):
+            seen.append((kernel_name, dict(inductor_meta)))
+            return (f"{kernel_name}.mark_ready()", f"{kernel_name}.check_ready()")
+
+        common.register_backend_post_compile_hook("dummy_post_compile_backend", hook)
+        common.register_backend_post_compile_hook("dummy_post_compile_backend", hook)
+
+        self.assertIs(
+            common.get_backend_post_compile_hook("dummy_post_compile_backend"),
+            hook,
+        )
+        self.assertIsNone(
+            common.get_backend_post_compile_hook("missing_post_compile_backend")
+        )
+
+        lines = common.get_backend_post_compile_hook_lines(
+            "kernel0",
+            {"value": 1},
+            backend="dummy_post_compile_backend",
+        )
+        self.assertEqual(lines, ("kernel0.mark_ready()", "kernel0.check_ready()"))
+        self.assertEqual(seen, [("kernel0", {"value": 1})])
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            common.register_backend_post_compile_hook(
+                "dummy_post_compile_backend", lambda *args: None
+            )
+
+    def test_register_backend_post_compile_hook_rejects_invalid_name(self):
+        def hook(kernel_name, inductor_meta):
+            return None
+
+        for name in ("", "not-valid", "class"):
+            with self.assertRaisesRegex(ValueError, "valid Python identifier|non-empty"):
+                common.register_backend_post_compile_hook(name, hook)
+
+    def test_backend_post_compile_hook_uses_kernel_launch_backend(self):
+        def hook(kernel_name, inductor_meta):
+            return f"{kernel_name}.apply({inductor_meta['value']})"
+
+        common.register_backend_post_compile_hook("dummy_post_compile_backend", hook)
+
+        self.assertEqual(
+            common.get_backend_post_compile_hook_lines(
+                "kernel0",
+                {
+                    "kernel_launch_backend": "dummy_post_compile_backend",
+                    "value": 7,
+                },
+            ),
+            ("kernel0.apply(7)",),
+        )
+
+    def test_backend_post_compile_hook_rejects_invalid_return(self):
+        def returns_non_sequence(kernel_name, inductor_meta):
+            return object()
+
+        common.register_backend_post_compile_hook(
+            "dummy_post_compile_backend", returns_non_sequence
+        )
+        with self.assertRaisesRegex(
+            TypeError, "must return a string, a sequence of strings, or None"
+        ):
+            common.get_backend_post_compile_hook_lines(
+                "kernel0", {}, backend="dummy_post_compile_backend"
+            )
+
+        common._backend_post_compile_hooks.pop("dummy_post_compile_backend", None)
+
+        def returns_non_string_line(kernel_name, inductor_meta):
+            return ("kernel0.apply()", 1)
+
+        common.register_backend_post_compile_hook(
+            "dummy_post_compile_backend", returns_non_string_line
+        )
+        with self.assertRaisesRegex(TypeError, "must return only strings"):
+            common.get_backend_post_compile_hook_lines(
+                "kernel0", {}, backend="dummy_post_compile_backend"
+            )
+
+    def test_backend_post_compile_hook_lines_emit_after_async_wait(self):
+        wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
+        wrapper.prefix = common.IndentedBuffer()
+        wrapper.kernel_post_compile_hook_lines = []
+
+        wrapper.write_async_compile_wait()
+        wrapper.kernel_post_compile_hook_lines.append("kernel0.apply_ready()")
+        source = wrapper.prefix.getvalue()
+
+        wait_idx = source.index("async_compile.wait(globals())")
+        hook_idx = source.index("kernel0.apply_ready()")
+        del_idx = source.index("del async_compile")
+        self.assertLess(wait_idx, hook_idx)
+        self.assertLess(hook_idx, del_idx)
 
     def test_register_gemm_template_provider(self):
         seen_context = None

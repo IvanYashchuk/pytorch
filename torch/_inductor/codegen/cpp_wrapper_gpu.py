@@ -5,7 +5,7 @@ import dataclasses
 import re
 import sys
 from itertools import count, zip_longest
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from typing_extensions import Self
 
 import sympy
@@ -49,6 +49,9 @@ _cpp_string_literal_escapes = {
     "\r": "\\r",
 }
 _cpp_string_literal_pattern = re.compile(r'["\\\n\t\r]')
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def cpp_string_literal(s: str) -> str:
@@ -900,17 +903,30 @@ class CppWrapperGpu(CppWrapperCpu):
         metadata: str | None = None,
         gpu: bool = True,
         cpp_definition: str | None = None,
+        post_compile_hook_lines: Sequence[str] | None = None,
     ):
         if gpu:
             self._kernel_name_to_body[kernel_name] = kernel_body
             if config.triton.autotune_at_compile_time:
                 # Call PythonWrapperCodegen to create the autotune code block
                 PythonWrapperCodegen._define_kernel_helper(
-                    self, kernel_name, kernel_body, metadata, gpu, cpp_definition
+                    self,
+                    kernel_name,
+                    kernel_body,
+                    metadata,
+                    gpu,
+                    cpp_definition,
+                    post_compile_hook_lines,
                 )
         else:
             return CppWrapperCpu._define_kernel_helper(
-                self, kernel_name, kernel_body, metadata, gpu, cpp_definition
+                self,
+                kernel_name,
+                kernel_body,
+                metadata,
+                gpu,
+                cpp_definition,
+                post_compile_hook_lines,
             )
 
     def generate(self, is_inference):

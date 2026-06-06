@@ -93,6 +93,7 @@ from .common import (
     CSE,
     CSEVariable,
     DeferredLine,
+    get_backend_post_compile_hook_lines,
     IndentedBuffer,
     InplacedBuffer,
     is_buffer_removed,
@@ -7015,7 +7016,17 @@ class TileKernelScheduling(SIMDScheduling):
         metadata_comment = f"# kernel path: {kernel_path}"
         origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
         metadata_comment += "\n" + origins + "\n" + detailed_origins
-        wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), metadata_comment)
+        post_compile_hook_lines = get_backend_post_compile_hook_lines(
+            kernel_name,
+            getattr(kernel, "inductor_meta", None),
+            backend=backend_name,
+        )
+        wrapper.define_kernel(
+            kernel_name,
+            compile_wrapper.getvalue(),
+            metadata_comment,
+            post_compile_hook_lines=post_compile_hook_lines,
+        )
 
     def define_kernel(self, src_code, node_schedule, kernel):
         wrapper = V.graph.wrapper_code

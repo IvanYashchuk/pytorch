@@ -730,6 +730,7 @@ class KernelDefinitionLine(WrapperLine):
     metadata: str | None = None
     gpu: bool = True
     cpp_definition: str | None = None
+    post_compile_hook_lines: Sequence[str] | None = None
 
     def codegen(self, code: IndentedBuffer) -> None:
         self.wrapper._define_kernel_helper(
@@ -738,6 +739,7 @@ class KernelDefinitionLine(WrapperLine):
             metadata=self.metadata,
             gpu=self.gpu,
             cpp_definition=self.cpp_definition,
+            post_compile_hook_lines=self.post_compile_hook_lines,
         )
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
@@ -1246,6 +1248,7 @@ class PythonWrapperCodegen(CodeGen):
         self.kernel_autotune_defs = IndentedBuffer()
         self.kernel_autotune_calls = IndentedBuffer()
         self.subgraph_definitions = IndentedBuffer()
+        self.kernel_post_compile_hook_lines: list[str] = []
         self.kernel_autotune_names: OrderedSet[str] = OrderedSet()
         # Map key is the kernel argument name; value is a tuple of the resulting example
         # tensor name with the kernel where that tensor was most recently used.
@@ -1609,9 +1612,18 @@ class PythonWrapperCodegen(CodeGen):
             """
 
             async_compile.wait(globals())
+            <backend_post_compile_hook_lines>
             del async_compile
             """
         )
+        self.prefix.get_lines_ref()[-2] = DelayReplaceLine(
+            "<backend_post_compile_hook_lines>",
+            self.get_backend_post_compile_hook_lines,
+            self.prefix.get_lines_ref()[-2],
+        )
+
+    def get_backend_post_compile_hook_lines(self) -> str:
+        return "\n".join(self.kernel_post_compile_hook_lines)
 
     def write_args(self, input_names: list[str]):
         lhs = ", ".join(input_names)
@@ -2168,12 +2180,10 @@ class PythonWrapperCodegen(CodeGen):
         Compose self.kernel_autotune_defs and self.kernel_autotune_calls into a single block of
         code and execute it to trigger Triton kernel compilation and auto-tuning
         """
-        self.kernel_autotune_defs.splice(
-            """
-            async_compile.wait(globals())
-            del async_compile
-        """
-        )
+        self.kernel_autotune_defs.writeline("async_compile.wait(globals())")
+        for line in self.kernel_post_compile_hook_lines:
+            self.kernel_autotune_defs.writeline(line)
+        self.kernel_autotune_defs.writeline("del async_compile")
         scope = {}  # type: ignore[var-annotated]
         if config.triton.autotune_at_compile_time and V.graph.autotuning_inputs:
             scope = {
@@ -2666,6 +2676,7 @@ class PythonWrapperCodegen(CodeGen):
         metadata: str | None = None,
         gpu: bool = True,
         cpp_definition: str | None = None,
+        post_compile_hook_lines: Sequence[str] | None = None,
     ):
         self.writeline(
             KernelDefinitionLine(
@@ -2675,6 +2686,7 @@ class PythonWrapperCodegen(CodeGen):
                 metadata=metadata,
                 gpu=gpu,
                 cpp_definition=cpp_definition,
+                post_compile_hook_lines=post_compile_hook_lines,
             )
         )
 
@@ -2697,7 +2709,11 @@ class PythonWrapperCodegen(CodeGen):
         metadata: str | None = None,
         gpu: bool = True,
         cpp_definition: str | None = None,
+        post_compile_hook_lines: Sequence[str] | None = None,
     ):
+        if post_compile_hook_lines:
+            self.kernel_post_compile_hook_lines.extend(post_compile_hook_lines)
+
         if config.triton.autotune_at_compile_time and gpu:
             body = self._format_kernel_definition(
                 kernel_name, kernel_body, metadata=metadata

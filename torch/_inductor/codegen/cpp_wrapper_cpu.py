@@ -1074,6 +1074,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
         metadata: str | None = None,
         gpu: bool = False,
         cpp_definition: str | None = None,
+        post_compile_hook_lines: Sequence[str] | None = None,
     ):
         if cpp_definition is not None:
             self.header.splice(cpp_definition)
