@@ -66,6 +66,7 @@ from ..utils import (
 from ..virtualized import V
 from .common import (
     ArgName,
+    call_backend_kernel_launcher,
     CodeGen,
     DeferredLine,
     get_backend_kernel_launcher,
@@ -3530,7 +3531,13 @@ class PythonWrapperCodegen(CodeGen):
             raise KeyError(
                 f"Unknown Inductor kernel launcher backend {launch_backend!r}"
             )
-        return launcher(kernel_name, call_args_str, stream_name)
+        return call_backend_kernel_launcher(
+            launcher,
+            kernel_name,
+            call_args_str,
+            stream_name,
+            inductor_meta=inductor_meta,
+        )
 
     def writeline(self, line):
         self.lines.append(line)

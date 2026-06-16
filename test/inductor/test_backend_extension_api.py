@@ -808,6 +808,76 @@ class BackendExtensionAPITests(TestCase):
                 inductor_meta={"kernel_launch_backend": 1},
             )
 
+    def test_backend_kernel_launcher_receives_inductor_meta(self):
+        wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
+        seen = []
+
+        def formatter(kernel_name, call_args, stream_name, inductor_meta):
+            seen.append(
+                (
+                    kernel_name,
+                    call_args,
+                    stream_name,
+                    dict(inductor_meta),
+                )
+            )
+            return (
+                f"meta_launch({kernel_name!r}, ({call_args}), {stream_name}, "
+                f"coop={inductor_meta['requires_cooperative_grid']})"
+            )
+
+        common.register_backend_kernel_launcher("dummy_launcher_backend", formatter)
+        inductor_meta = {
+            "kernel_launch_backend": "dummy_launcher_backend",
+            "requires_cooperative_grid": True,
+            "workspace_metadata": {"semaphore_count": 4, "workspace_bytes": 1024},
+        }
+
+        self.assertEqual(
+            wrapper.format_kernel_launch_line(
+                "kernel0",
+                "arg0, arg1",
+                "stream0",
+                inductor_meta=inductor_meta,
+            ),
+            "meta_launch('kernel0', (arg0, arg1), stream0, coop=True)",
+        )
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "kernel0",
+                    "arg0, arg1",
+                    "stream0",
+                    inductor_meta,
+                )
+            ],
+        )
+
+    def test_backend_kernel_launcher_accepts_keyword_only_inductor_meta(self):
+        wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
+
+        def formatter(kernel_name, call_args, stream_name, *, inductor_meta):
+            return (
+                f"meta_launch({kernel_name!r}, ({call_args}), {stream_name}, "
+                f"{inductor_meta['workspace_metadata']['workspace_bytes']})"
+            )
+
+        common.register_backend_kernel_launcher("dummy_launcher_backend", formatter)
+
+        self.assertEqual(
+            wrapper.format_kernel_launch_line(
+                "kernel0",
+                "arg0",
+                "stream0",
+                inductor_meta={
+                    "kernel_launch_backend": "dummy_launcher_backend",
+                    "workspace_metadata": {"workspace_bytes": 1024},
+                },
+            ),
+            "meta_launch('kernel0', (arg0), stream0, 1024)",
+        )
+
     def test_register_backend_inductor_meta_provider(self):
         def provider(kernel, inductor_meta):
             inductor_meta["mutated"] = True

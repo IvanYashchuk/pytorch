@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import inspect
 import itertools
 import keyword
 import logging
@@ -403,7 +404,7 @@ _dtype_propagation_backends: dict[str, bool] = {
     "cpp": True,
     "mps": False,
 }
-BackendKernelLauncher = Callable[[str, str, str], str]
+BackendKernelLauncher = Callable[..., str]
 _backend_kernel_launchers: dict[str, BackendKernelLauncher] = {}
 BackendInductorMetaProvider = Callable[
     [Any, dict[str, Any]], dict[str, Any] | None
@@ -507,11 +508,12 @@ def register_backend_kernel_launcher(
     """
     Register a generated Python wrapper launch formatter for a backend.
 
-    The formatter receives ``(kernel_name, call_args, stream_name)`` and returns
-    the Python statement used to launch the kernel. Backends opt into this path
-    by setting ``inductor_meta["kernel_launch_backend"]`` on generated kernels.
-    The default Triton-shaped ``kernel.run(..., stream=...)`` launch remains
-    unchanged when no backend launch metadata is present.
+    The formatter receives ``(kernel_name, call_args, stream_name,
+    inductor_meta)`` and returns the Python statement used to launch the
+    kernel. Existing three-argument formatters remain supported. Backends opt
+    into this path by setting ``inductor_meta["kernel_launch_backend"]`` on
+    generated kernels. The default Triton-shaped ``kernel.run(..., stream=...)``
+    launch remains unchanged when no backend launch metadata is present.
     """
     _validate_backend_name("kernel launcher", name)
     existing = _backend_kernel_launchers.get(name)
@@ -523,6 +525,48 @@ def register_backend_kernel_launcher(
 def get_backend_kernel_launcher(name: str) -> BackendKernelLauncher | None:
     _validate_backend_name("kernel launcher", name)
     return _backend_kernel_launchers.get(name)
+
+
+def call_backend_kernel_launcher(
+    launcher: BackendKernelLauncher,
+    kernel_name: str,
+    call_args: str,
+    stream_name: str,
+    *,
+    inductor_meta: dict[str, Any],
+) -> str:
+    try:
+        signature = inspect.signature(launcher)
+    except (TypeError, ValueError):
+        return launcher(kernel_name, call_args, stream_name, inductor_meta)
+
+    parameters = tuple(signature.parameters.values())
+    if any(param.kind is inspect.Parameter.VAR_POSITIONAL for param in parameters):
+        return launcher(kernel_name, call_args, stream_name, inductor_meta)
+    if (
+        "inductor_meta" in signature.parameters
+        and signature.parameters["inductor_meta"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    ):
+        return launcher(
+            kernel_name,
+            call_args,
+            stream_name,
+            inductor_meta=inductor_meta,
+        )
+
+    positional_params = [
+        param
+        for param in parameters
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(positional_params) >= 4:
+        return launcher(kernel_name, call_args, stream_name, inductor_meta)
+    return launcher(kernel_name, call_args, stream_name)
 
 
 def register_backend_inductor_meta_provider(
