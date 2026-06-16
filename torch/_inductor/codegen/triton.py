@@ -6917,7 +6917,6 @@ class TileKernelScheduling(SIMDScheduling):
             BackendFeature.SORT,
             BackendFeature.TRITON_TEMPLATES,
             BackendFeature.TUPLE_REDUCTION,
-            BackendFeature.COOPERATIVE_REDUCTION,
         ]
     )
 
@@ -6931,9 +6930,15 @@ class TileKernelScheduling(SIMDScheduling):
 
     @classmethod
     def get_backend_features(cls, device: torch.device):
+        supports_cooperative_reduction = (
+            BackendFeature.COOPERATIVE_REDUCTION in cls.backend_features
+        )
         if (
-            config.triton.cooperative_reductions
-            or config.triton.force_cooperative_reductions
+            supports_cooperative_reduction
+            and (
+                config.triton.cooperative_reductions
+                or config.triton.force_cooperative_reductions
+            )
         ):
             return OrderedSet(
                 [*cls.backend_features, BackendFeature.REDUCE_TO_SINGLE_ELEMENT]
@@ -7399,7 +7404,11 @@ class TritonScheduling(TileKernelScheduling):
     """Scheduling backend for Triton kernel code generation."""
 
     backend_features = OrderedSet(
-        [*TileKernelScheduling.backend_features, BackendFeature.ONLINE_SOFTMAX]
+        [
+            *TileKernelScheduling.backend_features,
+            BackendFeature.ONLINE_SOFTMAX,
+            BackendFeature.COOPERATIVE_REDUCTION,
+        ]
     )
     kernel_type = TritonKernel
 

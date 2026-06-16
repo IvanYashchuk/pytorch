@@ -2240,6 +2240,10 @@ class BackendExtensionAPITests(TestCase):
         )
         self.assertNotIn(
             common.BackendFeature.COOPERATIVE_REDUCTION,
+            TileKernelScheduling(None).get_backend_features(torch.device("cuda")),
+        )
+        self.assertNotIn(
+            common.BackendFeature.COOPERATIVE_REDUCTION,
             BaseScheduling(None).get_backend_features(torch.device("cuda")),
         )
 
