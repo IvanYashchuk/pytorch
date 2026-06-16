@@ -2218,6 +2218,60 @@ class BackendExtensionAPITests(TestCase):
         ):
             self.assertFalse(prepare_softmax_extra_check(match))
 
+    def test_cooperative_reduction_gate_uses_backend_feature(self):
+        class FakeGraph:
+            def __init__(self, features):
+                self._features = OrderedSet(features)
+
+            def get_current_device_or_throw(self):
+                return torch.device("cuda")
+
+            def has_feature(self, device, feature):
+                assert device == torch.device("cuda")
+                return feature in self._features
+
+        features = SimpleNamespace(
+            numel=sympy.Integer(128), reduction_numel=sympy.Integer(1)
+        )
+
+        self.assertIn(
+            common.BackendFeature.COOPERATIVE_REDUCTION,
+            TritonScheduling(None).get_backend_features(torch.device("cuda")),
+        )
+        self.assertNotIn(
+            common.BackendFeature.COOPERATIVE_REDUCTION,
+            BaseScheduling(None).get_backend_features(torch.device("cuda")),
+        )
+
+        with (
+            V.set_graph_handler(FakeGraph(OrderedSet())),
+            config.patch(
+                {
+                    "cuda_backend": "dummy_cuda_backend",
+                    "triton.cooperative_reductions": True,
+                    "triton.force_cooperative_reductions": False,
+                }
+            ),
+        ):
+            self.assertFalse(V.choices.should_use_cooperative_reduction(features))
+
+        with (
+            V.set_graph_handler(FakeGraph(OrderedSet())),
+            config.patch(
+                {
+                    "cuda_backend": "dummy_cuda_backend",
+                    "triton.force_cooperative_reductions": True,
+                }
+            ),
+        ):
+            with self.assertRaisesRegex(
+                NotImplementedError,
+                "BackendFeature.COOPERATIVE_REDUCTION",
+            ) as exc_info:
+                V.choices.should_use_cooperative_reduction(features)
+            self.assertIn("dummy_cuda_backend", str(exc_info.exception))
+            self.assertIn("inductor-cutile #242", str(exc_info.exception))
+
     def test_create_combo_kernel_nodes_skips_unsupported_backend(self):
         device = torch.device("cuda")
 

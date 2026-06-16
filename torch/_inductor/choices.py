@@ -13,6 +13,7 @@ from torch.utils._sympy.value_ranges import bound_sympy
 
 from . import config
 from .codecache import write_text
+from .codegen.common import BackendFeature
 from .kernel_inputs import KernelInputs  # noqa: TC001
 from .kernel_template_choice import make_ktc_generator
 from .metrics import get_metric_table, is_metric_table_enabled
@@ -365,11 +366,26 @@ class InductorChoices:
     @staticmethod
     def should_use_cooperative_reduction(features: SIMDKernelFeatures) -> bool:
         """Heuristic to decide if a cooperative reduction should be used."""
+        device = V.graph.get_current_device_or_throw()
+        has_cooperative_reduction = V.graph.has_feature(
+            device, BackendFeature.COOPERATIVE_REDUCTION
+        )
+        if not has_cooperative_reduction:
+            if config.triton.force_cooperative_reductions:
+                raise NotImplementedError(
+                    f"CUDA backend {config.cuda_backend!r} does not support "
+                    "cooperative reductions. Disable "
+                    "triton.force_cooperative_reductions or select a backend "
+                    "that advertises BackendFeature.COOPERATIVE_REDUCTION; "
+                    "tracking: inductor-cutile #38, inductor-cutile #133, "
+                    "and inductor-cutile #242."
+                )
+            return False
         if config.triton.force_cooperative_reductions:
             return True
         if (
             not config.triton.cooperative_reductions
-            or V.graph.get_current_device_or_throw().type == "cpu"
+            or device.type == "cpu"
         ):
             return False
 

@@ -6917,6 +6917,7 @@ class TileKernelScheduling(SIMDScheduling):
             BackendFeature.SORT,
             BackendFeature.TRITON_TEMPLATES,
             BackendFeature.TUPLE_REDUCTION,
+            BackendFeature.COOPERATIVE_REDUCTION,
         ]
     )
 
