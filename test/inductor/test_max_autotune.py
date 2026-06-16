@@ -12,7 +12,6 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
@@ -154,6 +153,16 @@ class FailChoiceCaller(ChoiceCaller):
 @config.patch(enable_caching_generated_triton_templates=True)
 @instantiate_parametrized_tests
 class TestMaxAutotune(TestCase):
+    @staticmethod
+    def _fake_device(device_type="cuda"):
+        return DeviceProperties(
+            type=device_type,
+            index=0,
+            multi_processor_count=1,
+            cc=100,
+            warp_size=32,
+        )
+
     def _make_matrices(self, M, K, N, *batch_dims, dtype, device, requires_grad):
         make_matrix = functools.partial(
             random_matrix_with_scaled_reduction_dim,
@@ -239,7 +248,7 @@ class TestMaxAutotune(TestCase):
         def high_warp_pairs(size_hints, extra_meta=None):
             configs = pointwise(
                 size_hints,
-                triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
+                triton_meta={"device": self._fake_device()},
                 inductor_meta={
                     **{
                         "autotune_pointwise": False,
@@ -271,9 +280,7 @@ class TestMaxAutotune(TestCase):
         def high_warp_pairs(size_hints, extra_meta=None, device_type="cuda"):
             configs = pointwise(
                 size_hints,
-                triton_meta={
-                    "device": SimpleNamespace(type=device_type, warp_size=32)
-                },
+                triton_meta={"device": self._fake_device(device_type)},
                 inductor_meta={
                     **{
                         "autotune_pointwise": False,
@@ -318,7 +325,7 @@ class TestMaxAutotune(TestCase):
 
         configs = pointwise(
             {"x": 2048},
-            triton_meta={"device": SimpleNamespace(type="cuda", warp_size=32)},
+            triton_meta={"device": self._fake_device()},
             inductor_meta={
                 "autotune_pointwise": False,
                 "max_autotune_pointwise": False,
