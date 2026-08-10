@@ -248,9 +248,9 @@ class TestMaxAutotune(TestCase):
                 )
 
     def test_rubin_pointwise_configs(self):
-        def configs_for_cc(cc):
+        def configs_for_cc(cc, x=1 << 23):
             return pointwise(
-                {"x": 16384},
+                {"x": x},
                 triton_meta={
                     "device": DeviceProperties(
                         type="cuda",
@@ -258,6 +258,7 @@ class TestMaxAutotune(TestCase):
                         multi_processor_count=212,
                         cc=cc,
                         major=10,
+                        max_threads_per_multi_processor=1024,
                         max_threads_per_block=1024,
                         warp_size=32,
                     )
@@ -276,8 +277,14 @@ class TestMaxAutotune(TestCase):
         blackwell_configs = {
             (cfg.kwargs["XBLOCK"], cfg.num_warps) for cfg in configs_for_cc(100)
         }
-        self.assertTrue({(2048, 4), (4096, 4)} <= rubin_configs)
-        self.assertFalse({(2048, 4), (4096, 4)} & blackwell_configs)
+        rubin_only = {(2048, 2), (2048, 4), (4096, 4)}
+        self.assertTrue(rubin_only <= rubin_configs)
+        self.assertFalse(rubin_only & blackwell_configs)
+        small_rubin_configs = {
+            (cfg.kwargs["XBLOCK"], cfg.num_warps)
+            for cfg in configs_for_cc(107, 1 << 22)
+        }
+        self.assertNotIn((2048, 2), small_rubin_configs)
 
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"

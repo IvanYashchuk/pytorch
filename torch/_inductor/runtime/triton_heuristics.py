@@ -3804,6 +3804,7 @@ def triton_config(
     kpack=None,
     *,
     warp_size: int = 32,
+    min_num_warps: int = 4,
 ) -> Config:
     """
     Construct a pointwise triton config with some adjustment heuristics
@@ -3874,7 +3875,7 @@ def triton_config(
     # in general
     # see https://github.com/pytorch/pytorch/pull/97950
     if conditional_product(x, y, z) >= 128 and not torch.version.hip:
-        num_warps = max(num_warps, 4)
+        num_warps = max(num_warps, min_num_warps)
     xnumel = size_hints["x"]
     ynumel = size_hints.get("y")
     znumel = size_hints.get("z")
@@ -4473,9 +4474,27 @@ def pointwise(
         inductor_meta=inductor_meta,
     )
     if _should_add_rubin_pointwise_configs(size_hints, triton_meta, inductor_meta):
+        device_props = triton_meta["device"]
+        candidate_settings = [(2048, 4, 4), (4096, 4, 4)]
+        max_threads_per_sm = device_props.max_threads_per_multi_processor or 1024
+        two_warp_blocks_per_sm = max_threads_per_sm // (
+            2 * device_props.warp_size_or_default
+        )
+        # Below one resident wave of 2048-element, two-warp blocks, the smaller
+        # launch ties or loses while adding another autotune compile.
+        two_warp_min_xnumel = (
+            device_props.multi_processor_count * two_warp_blocks_per_sm * 2048
+        )
+        if size_hints["x"] >= two_warp_min_xnumel:
+            candidate_settings.append((2048, 2, 2))
         configs.extend(
-            triton_config_with_settings(size_hints, xblock, num_warps=4)
-            for xblock in (2048, 4096)
+            triton_config_with_settings(
+                size_hints,
+                xblock,
+                num_warps=num_warps,
+                min_num_warps=min_num_warps,
+            )
+            for xblock, num_warps, min_num_warps in candidate_settings
             if xblock <= size_hints["x"]
         )
 
