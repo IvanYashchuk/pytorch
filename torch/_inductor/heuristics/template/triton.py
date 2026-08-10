@@ -1205,7 +1205,11 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
     # Flex attn helpers
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1416,7 +1420,11 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         ]
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
@@ -1440,6 +1448,18 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 default_config = self.sm_100_default_flex_config.get(
                     (dtype, head_dim), default_config
                 )
+                if (
+                    capability == (10, 7)
+                    and has_tanh_score_mod
+                    and 64 <= head_dim <= 256
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and V.graph.sizevars.statically_known_geq(seq_len, 4096)
+                ):
+                    # Long-running tanh score modifiers (for example softcap)
+                    # are register-pressure sensitive on Rubin. The one-stage
+                    # 128x128 tile is the stable max-autotune winner for head
+                    # dimensions 64 through 256.
+                    default_config = FlexConfig(128, 128, 1, 8)
             elif capability == (9, 0):
                 default_config = self.h100_default_flex_config.get(
                     (dtype, head_dim), default_config
@@ -1879,7 +1899,11 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
                 yield self.triton_config(**kwargs)
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -2043,7 +2067,11 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
             ]
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 

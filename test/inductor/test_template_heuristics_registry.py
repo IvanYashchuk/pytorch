@@ -1,4 +1,6 @@
 # Owner(s): ["module: inductor"]
+from unittest import mock
+
 import torch
 from torch._inductor.heuristics.registry import (
     _TEMPLATE_HEURISTIC_REGISTRY,
@@ -13,6 +15,7 @@ from torch._inductor.heuristics.template.triton import (
     FlexConfig,
 )
 from torch._inductor.test_case import run_tests, TestCase
+from torch._inductor.virtualized import V
 
 
 class TestBlackwellGPUGemmConfig(TestCase):
@@ -236,6 +239,39 @@ class TestA100DefaultFlexConfig(TestCase):
         h = CUDAConfigHeuristic()
         self.assertEqual(h.a100_default_flex_config[(torch.bfloat16, 192)], expected)
         self.assertEqual(h.a100_default_flex_config[(torch.float16, 192)], expected)
+
+
+class TestRubinDefaultFlexConfig(TestCase):
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_long_tanh_score_mod(self, _mock_capability):
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            heuristic = CUDAConfigHeuristic()
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 4096, torch.bfloat16, has_tanh_score_mod=True
+                ),
+                [FlexConfig(128, 128, 1, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 2048, torch.bfloat16, has_tanh_score_mod=True
+                ),
+                [FlexConfig(128, 128, 2, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 4096, torch.bfloat16, has_tanh_score_mod=False
+                ),
+                [FlexConfig(128, 128, 2, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    32, 4096, torch.bfloat16, has_tanh_score_mod=True
+                ),
+                [FlexConfig(64, 64, 3, 4)],
+            )
 
 
 if __name__ == "__main__":

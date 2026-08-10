@@ -66,6 +66,18 @@ prims = torch.ops.prims
 Expr = sympy.Expr
 
 
+def _score_graph_has_tanh(graph_module) -> bool:
+    tanh_targets = {
+        torch.tanh,
+        torch.ops.aten.tanh.default,
+        torch.ops.prims.tanh.default,
+    }
+    return any(
+        node.op == "call_function" and node.target in tanh_targets
+        for node in graph_module.graph.nodes
+    )
+
+
 def _sanitize_kernel_options_for_triton(
     kernel_options: dict[str, Any],
 ) -> tuple[dict[str, Any], _Backend]:
@@ -434,7 +446,11 @@ def flex_attention(
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
     configs: list[FlexConfig] = V.choices.get_flex_attention_fwd_configs(
-        head_dim, seq_len_q, dtype, query.get_device().type
+        head_dim,
+        seq_len_q,
+        dtype,
+        query.get_device().type,
+        has_tanh_score_mod=_score_graph_has_tanh(subgraph.graph_module),
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
