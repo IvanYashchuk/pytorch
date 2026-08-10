@@ -78,6 +78,23 @@ def _score_graph_has_tanh(graph_module) -> bool:
     )
 
 
+def _score_graph_has_transcendental(graph_module) -> bool:
+    transcendental_targets = {
+        torch.tanh,
+        torch.ops.aten.tanh.default,
+        torch.ops.prims.tanh.default,
+        torch.sigmoid,
+        torch.ops.aten.sigmoid.default,
+        torch.exp,
+        torch.ops.aten.exp.default,
+        torch.ops.prims.exp.default,
+    }
+    return any(
+        node.op == "call_function" and node.target in transcendental_targets
+        for node in graph_module.graph.nodes
+    )
+
+
 def _sanitize_kernel_options_for_triton(
     kernel_options: dict[str, Any],
 ) -> tuple[dict[str, Any], _Backend]:
@@ -1029,7 +1046,9 @@ def flex_attention_backward(*args, **kwargs):
         head_dim,
         dtype,
         query.get_device().type,
-        has_tanh_score_mod=_score_graph_has_tanh(fw_graph.graph_module),
+        has_transcendental_score_mod=_score_graph_has_transcendental(
+            fw_graph.graph_module
+        ),
     )
 
     # Default config for warp specialization

@@ -275,27 +275,27 @@ class TestRubinDefaultFlexConfig(TestCase):
             )
 
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
-    def test_tanh_score_mod_backward(self, _mock_capability):
+    def test_transcendental_score_mod_backward(self, _mock_capability):
         heuristic = CUDAConfigHeuristic()
-        tanh_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        transcendental_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
         for dtype in (torch.bfloat16, torch.float16):
             for head_dim in (64, 128, 256):
                 self.assertEqual(
                     heuristic.get_flex_attn_bwd_configs(
-                        head_dim, dtype, has_tanh_score_mod=True
+                        head_dim, dtype, has_transcendental_score_mod=True
                     ),
-                    [tanh_config],
+                    [transcendental_config],
                 )
 
         self.assertEqual(
             heuristic.get_flex_attn_bwd_configs(
-                128, torch.bfloat16, has_tanh_score_mod=False
+                128, torch.bfloat16, has_transcendental_score_mod=False
             ),
             [FlexBwDConfig(64, 128, 128, 64, 3, 4)],
         )
         self.assertEqual(
             heuristic.get_flex_attn_bwd_configs(
-                32, torch.bfloat16, has_tanh_score_mod=True
+                32, torch.bfloat16, has_transcendental_score_mod=True
             ),
             [FlexBwDConfig(32, 64, 64, 32, 3, 4)],
         )
