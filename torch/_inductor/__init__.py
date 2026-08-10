@@ -384,6 +384,7 @@ def list_mode_options(
         "max-autotune": {
             "max_autotune": True,
             "triton.cudagraphs": True,
+            "triton.cudagraph_min_partition_size": 3,
             "coordinate_descent_tuning": True,
         },
     }
