@@ -438,6 +438,21 @@ class _NestedReductionBase:
         self.check_numeric(f, (x,))
         self.check_fusion()
 
+    def test_outer_reduced_pointwise_feeds_grouped_reduction(self):
+        """Keep a reduced outer epilogue live for a grouped reduction prologue."""
+        B, D, G = 32, 4096, 2
+
+        def f(x):
+            scale = x.abs().amax(dim=-1, keepdim=True) + 1.0
+            normalized = x / scale
+            packed = normalized.reshape(B, D // G, G).sum(dim=-1)
+            return packed, scale
+
+        x = torch.randn(B, D, device=GPU_TYPE)
+        with inductor_config.patch("unroll_reductions_threshold", G):
+            self.check_numeric(f, (x,))
+        self.check_fusion()
+
     @parametrize("pointwise_kind", ["full", "row_broadcast", "col_broadcast"])
     @parametrize("epilogue_resolution", ["reduced", "full"])
     def test_reduction_fusion_pointwise_prologue_epilogue(

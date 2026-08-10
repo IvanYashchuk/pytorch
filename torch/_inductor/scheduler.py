@@ -577,6 +577,8 @@ class NestedReduction:
 
         # Local reduction output, e.g. [B, D // G].
         REDUCED = enum.auto()
+        # Outer reduction output before broadcast-back, e.g. [B].
+        OUTER_REDUCED = enum.auto()
         # Input domain before reducing the local group, e.g. [B, D // G, G].
         LOCAL_REDUCTION_INPUT = enum.auto()
         # Outer reduction tile after broadcast-back, e.g. [B, D].
@@ -676,17 +678,29 @@ class NestedReduction:
             if sn.is_reduction():
                 outer_reduction_names |= sn.get_operation_names()
 
-        # Full-resolution consumers already fused into the outer reduction feed
-        # the local reduction, so they run in that input domain.
+        outer_numel = domain_context.parent_full_domain[0]
+        grouped_full_numel = V.graph.sizevars.simplify(
+            domain_context.grouped_numel * domain_context.grouped_rnumel
+        )
+        # Consumers already fused into the outer reduction can either remain at
+        # the outer reduction's output resolution or broadcast back to the full
+        # parent domain before feeding the local reduction.
         for sn in outer_node.get_nodes():
             if sn.is_reduction():
                 continue
             if outer_reduction_names & sn.ancestors:
                 if not isinstance(sn, SchedulerNode):
                     return None
-                outer_pointwise_domains.append(
-                    (sn, cls.PointwiseDomain.LOCAL_REDUCTION_INPUT)
-                )
+                _, (sn_numel, _) = sn.group
+                if V.graph.sizevars.statically_known_equals(sn_numel, outer_numel):
+                    domain = cls.PointwiseDomain.OUTER_REDUCED
+                elif V.graph.sizevars.statically_known_equals(
+                    sn_numel, grouped_full_numel
+                ):
+                    domain = cls.PointwiseDomain.LOCAL_REDUCTION_INPUT
+                else:
+                    return None
+                outer_pointwise_domains.append((sn, domain))
 
         grouped_pointwise_domains = cls._classify_grouped_pointwise_nodes(
             domain_context,
@@ -772,11 +786,14 @@ class NestedReduction:
     ) -> bool:
         from .codegen.simd import SIMDKernel
 
-        iter_ranges, _ = domain_context.grouped_reduction.get_ranges()
+        iter_ranges = domain_context.local_reduction_domain[:-1]
         _, (sn_numel, _) = sn.group
         if domain is cls.PointwiseDomain.REDUCED:
             expected_numel = domain_context.grouped_numel
             expected_groups: Sequence[sympy.Expr] = tuple(iter_ranges)
+        elif domain is cls.PointwiseDomain.OUTER_REDUCED:
+            expected_numel = domain_context.parent_full_domain[0]
+            expected_groups = (expected_numel,)
         elif domain is cls.PointwiseDomain.LOCAL_REDUCTION_INPUT:
             expected_numel = V.graph.sizevars.simplify(
                 domain_context.grouped_numel * domain_context.grouped_rnumel
@@ -916,7 +933,22 @@ class NestedReduction:
         parent_grouped_axis = (
             outer_rnumel if grouped_axis is cls.GroupedAxis.R else outer_numel
         )
-        iter_ranges, _ = grouped_reduction.get_ranges()
+        target_iter_ranges = (
+            (outer_numel, FloorDiv(outer_rnumel, group_size))
+            if grouped_axis is cls.GroupedAxis.R
+            else (FloorDiv(outer_numel, group_size), outer_rnumel)
+        )
+        original_iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
+        needs_reindex = tuple(original_iter_ranges) != target_iter_ranges
+        if needs_reindex:
+            from .codegen.simd import SIMDKernel
+
+            if not SIMDKernel.is_compatible(
+                (*target_iter_ranges, grouped_rnumel),
+                grouped_reduction.get_ranges(),
+            ):
+                return False
+        iter_ranges = target_iter_ranges
         if len(iter_ranges) == 2:
             grouped_axis_groups = (
                 iter_ranges[1] if grouped_axis is cls.GroupedAxis.R else iter_ranges[0]
@@ -940,7 +972,6 @@ class NestedReduction:
             group_size=group_size_int,
         ):
             return False
-        iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
         domain_context = cls.PointwiseDomainContext(
             grouped_reduction=grouped_reduction,
             grouped_numel=grouped_numel,
@@ -954,6 +985,11 @@ class NestedReduction:
             domain_context,
         ):
             return False
+
+        if needs_reindex:
+            grouped_reduction.apply_loop_reindexing(target_iter_ranges)
+            if isinstance(grouped_node, FusedSchedulerNode):
+                refresh_group_node_dependencies(grouped_node)
 
         return True
 
@@ -8440,7 +8476,7 @@ class Scheduler:
             write_name = self.mutation_renames.get(cd.name, cd.name)
             remaining = remaining_deps_by_name.get(write_name)
             if remaining:
-                for rd in remaining:
+                for rd in tuple(remaining):
                     if isinstance(cd, MemoryDep) and self.fusable_read_and_write(
                         rd.rename(self.mutation_renames),
                         cd,
@@ -8670,6 +8706,37 @@ class Scheduler:
             )
             if read.normalize() == write.normalize():
                 return True
+
+        # A multidimensional consumer may flatten to a quotient of a dense
+        # one-dimensional producer. For example, ``256 * c0 + c1 // 16`` over
+        # [2048, 4096] becomes ``flat // 16``.
+        normalized_write = write.normalize()
+        if normalized_write.num_vars == 1:
+            write_var = normalized_write.var_names[0]
+            if normalized_write.index == write_var:
+                sizevars = V.graph.sizevars
+                read_numel = read.get_numel()
+                write_numel = normalized_write.get_numel()
+                if sizevars.statically_known_multiple_of(read_numel, write_numel):
+                    factor = sizevars.simplify(FloorDiv(read_numel, write_numel))
+                    if sizevars.statically_known_gt(factor, 1):
+                        flat_var = _FLATTENED_READ_VAR
+                        flattened_read = sympy_subs(
+                            read.index,
+                            dict(
+                                zip(
+                                    read.var_names,
+                                    decompose_index(flat_var, read.size),
+                                )
+                            ),
+                        )
+                        flattened_read = sizevars.simplify_with_ranges(
+                            flattened_read, {flat_var: read_numel}
+                        )
+                        if sizevars.statically_known_equals(
+                            flattened_read, FloorDiv(flat_var, factor)
+                        ):
+                            return True
 
         if read.num_vars != write.num_vars:
             return False
