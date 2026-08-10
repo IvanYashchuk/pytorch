@@ -449,9 +449,42 @@ class _NestedReductionBase:
             return packed, scale
 
         x = torch.randn(B, D, device=GPU_TYPE)
-        with inductor_config.patch("unroll_reductions_threshold", G):
-            self.check_numeric(f, (x,))
+        self.check_numeric(f, (x,))
         self.check_fusion()
+
+    def test_unrelated_small_reduction_still_unrolled(self):
+        B, D, G = 32, 4096, 2
+
+        def f(x):
+            return x.reshape(B, D // G, G).sum(dim=-1)
+
+        x = torch.randn(B, D, device=GPU_TYPE)
+
+        def compile_and_run():
+            return torch.compile(f)(x)
+
+        actual, codes = run_and_get_code(compile_and_run)
+        self.assertEqual(actual, f(x))
+        FileCheck().check_not("tl.sum(").run("\n".join(codes))
+        self.check_no_fusion()
+
+    def test_dependent_non_power_of_two_reduction_still_unrolled(self):
+        B, D, G = 32, 4095, 3
+
+        def f(x):
+            scale = x.abs().amax(dim=-1, keepdim=True) + 1.0
+            normalized = x / scale
+            return normalized.reshape(B, D // G, G).sum(dim=-1)
+
+        x = torch.randn(B, D, device=GPU_TYPE)
+
+        def compile_and_run():
+            return torch.compile(f)(x)
+
+        actual, codes = run_and_get_code(compile_and_run)
+        self.assertEqual(actual, f(x))
+        FileCheck().check_not("tl.sum(").run("\n".join(codes))
+        self.check_no_fusion()
 
     @parametrize("pointwise_kind", ["full", "row_broadcast", "col_broadcast"])
     @parametrize("epilogue_resolution", ["reduced", "full"])

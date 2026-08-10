@@ -1420,6 +1420,61 @@ class Reduction(Loops):
     def get_reduction_type(self) -> str | None:
         return self.reduction_type
 
+    @staticmethod
+    def _should_preserve_for_nested_reduction(
+        input_node: IRNode | None,
+        ranges: Sequence[_IntLike],
+        reduction_ranges: Sequence[_IntLike],
+        reduction_type: ReductionType,
+    ) -> bool:
+        """Keep a small dependent reduction visible to nested-reduction fusion."""
+        if (
+            not config.triton.nested_reduction
+            or input_node is None
+            or reduction_type not in {"any", "max", "min", "prod", "sum", "xor_sum"}
+        ):
+            return False
+
+        sizevars = V.graph.sizevars
+        target_numel = sizevars.simplify(
+            sympy_product(ranges) * sympy_product(reduction_ranges)
+        )
+        target_rnumel = sizevars.simplify(sympy_product(reduction_ranges))
+        if not isinstance(target_rnumel, Integer):
+            return False
+        target_rnumel_int = int(target_rnumel)
+        if target_rnumel_int < 1 or target_rnumel_int & (target_rnumel_int - 1) != 0:
+            return False
+        seen_buffers: OrderedSet[str] = OrderedSet()
+
+        def depends_on_compatible_reduction(node: IRNode) -> bool:
+            if isinstance(node, (TensorBox, StorageBox)):
+                return depends_on_compatible_reduction(node.data)
+            if isinstance(node, BaseView):
+                return depends_on_compatible_reduction(node.unwrap_view())
+            if isinstance(node, ComputedBuffer):
+                return depends_on_compatible_reduction(node.data)
+            if isinstance(node, Reduction):
+                producer_rnumel = sizevars.simplify(
+                    sympy_product(node.reduction_ranges)
+                )
+                producer_numel = sizevars.simplify(
+                    sympy_product(node.ranges) * producer_rnumel
+                )
+                return not sizevars.statically_known_equals(
+                    producer_rnumel, target_rnumel
+                ) and sizevars.statically_known_equals(producer_numel, target_numel)
+            if isinstance(node, Pointwise):
+                for name in node.get_read_names():
+                    if name in seen_buffers or name not in V.graph.name_to_buffer:
+                        continue
+                    seen_buffers.add(name)
+                    if depends_on_compatible_reduction(V.graph.name_to_buffer[name]):
+                        return True
+            return False
+
+        return depends_on_compatible_reduction(input_node)
+
     def store_reduction(
         self,
         output_name: str | None,
@@ -1819,6 +1874,9 @@ class Reduction(Loops):
             and int(reduction_numel) < config.unroll_reductions_threshold
             and (sympy_product(ranges) != 1 or is_gpu(device.type))
             and reduction_type != "dot"
+            and not cls._should_preserve_for_nested_reduction(
+                input_node, ranges, reduction_ranges, reduction_type
+            )
         ):
             # When native matmul, don't unroll the dot reduction.
 
