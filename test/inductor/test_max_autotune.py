@@ -247,6 +247,38 @@ class TestMaxAutotune(TestCase):
                     "max_autotune should include all pointwise configs from max_autotune_pointwise",
                 )
 
+    def test_rubin_pointwise_configs(self):
+        def configs_for_cc(cc):
+            return pointwise(
+                {"x": 16384},
+                triton_meta={
+                    "device": DeviceProperties(
+                        type="cuda",
+                        index=0,
+                        multi_processor_count=212,
+                        cc=cc,
+                        major=10,
+                        max_threads_per_block=1024,
+                        warp_size=32,
+                    )
+                },
+                inductor_meta={
+                    "num_load": 1,
+                    "num_store": 1,
+                    "num_reduction": 0,
+                },
+                return_configs=True,
+            )
+
+        rubin_configs = {
+            (cfg.kwargs["XBLOCK"], cfg.num_warps) for cfg in configs_for_cc(107)
+        }
+        blackwell_configs = {
+            (cfg.kwargs["XBLOCK"], cfg.num_warps) for cfg in configs_for_cc(100)
+        }
+        self.assertTrue({(2048, 4), (4096, 4)} <= rubin_configs)
+        self.assertFalse({(2048, 4), (4096, 4)} & blackwell_configs)
+
     @unittest.skipIf(
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
