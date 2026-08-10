@@ -12,6 +12,7 @@ from torch._inductor.heuristics.template.base import TemplateConfigHeuristics
 from torch._inductor.heuristics.template.triton import (
     BlackwellGPUGemmConfig,
     CUDAConfigHeuristic,
+    FlexBwDConfig,
     FlexConfig,
 )
 from torch._inductor.test_case import run_tests, TestCase
@@ -272,6 +273,32 @@ class TestRubinDefaultFlexConfig(TestCase):
                 ),
                 [FlexConfig(64, 64, 3, 4)],
             )
+
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_tanh_score_mod_backward(self, _mock_capability):
+        heuristic = CUDAConfigHeuristic()
+        tanh_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        for dtype in (torch.bfloat16, torch.float16):
+            for head_dim in (64, 128, 256):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        head_dim, dtype, has_tanh_score_mod=True
+                    ),
+                    [tanh_config],
+                )
+
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128, torch.bfloat16, has_tanh_score_mod=False
+            ),
+            [FlexBwDConfig(64, 128, 128, 64, 3, 4)],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                32, torch.bfloat16, has_tanh_score_mod=True
+            ),
+            [FlexBwDConfig(32, 64, 64, 32, 3, 4)],
+        )
 
 
 if __name__ == "__main__":

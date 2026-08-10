@@ -1235,7 +1235,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self, head_dim: int, dtype: Any, has_tanh_score_mod: bool = False
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1480,7 +1480,7 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self, head_dim: int, dtype: Any, has_tanh_score_mod: bool = False
     ) -> list[FlexBwDConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
@@ -1548,6 +1548,18 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
             default_config = config_map[capability_class](head_dim)
         else:
             default_config = FlexBwDConfig(16, 16, 16, 16, 1, 4)
+
+        if (
+            capability == (10, 7)
+            and has_tanh_score_mod
+            and 64 <= head_dim <= 256
+            and dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Tanh score modifiers (for example softcap) make the larger
+            # backward tiles register-pressure sensitive on Rubin. This tile
+            # is the stable max-autotune winner across head dimensions 64,
+            # 128, and 256.
+            default_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
 
         if default_config not in flex_attn_bwd_configs:
             flex_attn_bwd_configs.append(default_config)
@@ -1954,7 +1966,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self, head_dim: int, dtype: Any, has_tanh_score_mod: bool = False
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -2100,7 +2112,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self, head_dim: int, dtype: Any, has_tanh_score_mod: bool = False
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 

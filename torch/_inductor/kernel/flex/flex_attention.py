@@ -1026,7 +1026,10 @@ def flex_attention_backward(*args, **kwargs):
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
     configs: list[FlexBwDConfig] = V.choices.get_flex_attention_bwd_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        has_tanh_score_mod=_score_graph_has_tanh(fw_graph.graph_module),
     )
 
     # Default config for warp specialization
