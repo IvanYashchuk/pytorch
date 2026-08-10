@@ -4280,6 +4280,24 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _should_add_rubin_pointwise_configs(
+    size_hints: dict[str, int], triton_meta: TritonMeta, inductor_meta: dict[str, Any]
+) -> bool:
+    device_props = triton_meta["device"]
+    return (
+        torch.version.hip is None
+        and device_props.type == "cuda"
+        and device_props.cc == 107
+        and len(size_hints) == 1
+        and isinstance(size_hints.get("x"), int)
+        and size_hints["x"] >= 2048
+        and not inductor_meta.get("atomic_add_found")
+        and inductor_meta.get("num_reduction", 0) == 0
+        and inductor_meta.get("num_load", 0) > 0
+        and inductor_meta.get("num_store", 0) > 0
+    )
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4381,6 +4399,14 @@ def pointwise(
                     [  # intel-xpu-backend-for-triton #5133
                         triton_config_with_settings(size_hints, 32),
                     ]
+                )
+            if _should_add_rubin_pointwise_configs(
+                size_hints, triton_meta, inductor_meta
+            ):
+                configs.extend(
+                    triton_config_with_settings(size_hints, xblock, num_warps=4)
+                    for xblock in (2048, 4096)
+                    if xblock <= size_hints["x"]
                 )
     if len(size_hints) == 2:
         # Only avoiding tuning on TileHint.SQUARE if not on ROCm builds
