@@ -332,6 +332,60 @@ class TestRubinDefaultFlexConfig(TestCase):
                 [FlexConfig(128, 64, 3, 8)],
             )
 
+            short_gqa_configs = {
+                (False, 64): FlexConfig(64, 128, 3, 4),
+                (False, 128): FlexConfig(64, 128, 3, 4),
+                (False, 256): FlexConfig(64, 64, 3, 4),
+                (True, 64): FlexConfig(64, 64, 3, 4),
+                (True, 128): FlexConfig(64, 64, 3, 4),
+                (True, 256): FlexConfig(64, 64, 3, 4),
+            }
+            for dtype in (torch.bfloat16, torch.float16):
+                for (has_tanh, head_dim), config in short_gqa_configs.items():
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            64,
+                            dtype,
+                            has_tanh_score_mod=has_tanh,
+                            batch_heads=32,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    127,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 128, 3, 4)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    128,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(128, 128, 3, 4)],
+            )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    64,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=32,
+                ),
+                [FlexConfig(128, 128, 3, 4)],
+            )
+
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
     def test_transcendental_score_mod_backward(self, _mock_capability):
         heuristic = CUDAConfigHeuristic()

@@ -167,6 +167,7 @@ class InductorChoices:
         has_tanh_score_mod: bool = False,
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_fwd_configs(
@@ -176,6 +177,7 @@ class InductorChoices:
             has_tanh_score_mod,
             batch_heads,
             is_causal,
+            is_gqa,
         )
 
     def get_flex_attention_bwd_configs(

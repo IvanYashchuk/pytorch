@@ -1212,6 +1212,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         has_tanh_score_mod: bool = False,
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1432,6 +1433,7 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         has_tanh_score_mod: bool = False,
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
@@ -1456,6 +1458,27 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     (dtype, head_dim), default_config
                 )
                 if (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and V.graph.sizevars.statically_known_lt(seq_len, 128)
+                ):
+                    # Once AUTO rejects an over-packed decode kernel, short
+                    # Rubin GQA should use the max-autotune-winning general
+                    # attention tiles instead of inherited SM100 defaults.
+                    if has_tanh_score_mod:
+                        default_config = {
+                            64: FlexConfig(64, 64, 3, 4),
+                            128: FlexConfig(64, 64, 3, 4),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
+                    else:
+                        default_config = {
+                            64: FlexConfig(64, 128, 3, 4),
+                            128: FlexConfig(64, 128, 3, 4),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
+                elif (
                     capability == (10, 7)
                     and dtype in (torch.bfloat16, torch.float16)
                     and V.graph.sizevars.statically_known_geq(seq_len, 4096)
@@ -1956,6 +1979,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         has_tanh_score_mod: bool = False,
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -2129,6 +2153,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         has_tanh_score_mod: bool = False,
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 

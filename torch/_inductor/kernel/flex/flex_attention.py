@@ -501,6 +501,7 @@ def flex_attention(
                 SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE
             )
         ),
+        is_gqa=V.graph.sizevars.statically_known_gt(gqa_shared_heads, 1),
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
