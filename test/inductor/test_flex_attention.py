@@ -4941,6 +4941,51 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 )
             )
 
+    def test_rubin_flex_decoding_preference_uses_packed_query_width(self, device):
+        from torch._inductor.kernel.flex.flex_decoding import _prefer_flex_decoding
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        class FakeBuffer:
+            def __init__(self, size):
+                self.size = size
+
+            def get_size(self):
+                return self.size
+
+        graph = mock.Mock(sizevars=SizeVarAllocator(ShapeEnv()))
+
+        def preferred(
+            q_heads, kv_heads, q_len, head_dim, batch=1, enable_gqa=True
+        ):
+            return _prefer_flex_decoding(
+                FakeBuffer([batch, q_heads, q_len, head_dim]),
+                FakeBuffer([batch, kv_heads, 4096, head_dim]),
+                enable_gqa,
+            )
+
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch.xpu.is_available", return_value=False),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+        ):
+            self.assertTrue(preferred(32, 8, 1, 128))
+            self.assertFalse(preferred(32, 8, 16, 128))
+            self.assertTrue(preferred(32, 8, 16, 128, batch=8))
+            self.assertFalse(preferred(32, 8, 32, 128))
+            self.assertFalse(preferred(32, 8, 32, 64))
+            self.assertTrue(preferred(32, 8, 32, 64, batch=8))
+            self.assertFalse(preferred(32, 8, 64, 64))
+            self.assertTrue(preferred(32, 32, 64, 128, enable_gqa=False))
+
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch.xpu.is_available", return_value=False),
+            mock.patch("torch.cuda.get_device_capability", return_value=(10, 3)),
+        ):
+            self.assertTrue(preferred(32, 8, 64, 128))
+
     def test_backward_fake_symbolic_query_key_batch_metadata(self, device):
         from torch._dynamo.source import LocalSource
         from torch._higher_order_ops.flex_attention import (
