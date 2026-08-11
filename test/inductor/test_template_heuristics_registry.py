@@ -15,6 +15,11 @@ from torch._inductor.heuristics.template.triton import (
     FlexBwDConfig,
     FlexConfig,
 )
+from torch._inductor.kernel.flex.common import (
+    create_causal_indices_fake_generator,
+    create_causal_num_blocks_fake_generator,
+)
+from torch._inductor.kernel.flex.flex_attention import _mask_graph_is_causal
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.virtualized import V
 
@@ -299,6 +304,61 @@ class TestRubinDefaultFlexConfig(TestCase):
             ),
             [FlexBwDConfig(32, 64, 64, 32, 3, 4)],
         )
+
+
+class TestFlexAttentionAutotuneInputs(TestCase):
+    def test_causal_block_mask_generators(self):
+        sizevars = mock.Mock()
+        sizevars.optimization_hints.side_effect = lambda value: value
+        num_blocks = mock.Mock()
+        num_blocks.get_size.return_value = [1, 1, 4]
+        num_blocks.get_dtype.return_value = torch.int32
+        num_blocks.get_device.return_value = torch.device("cpu")
+        indices = mock.Mock()
+        indices.get_size.return_value = [1, 1, 4, 4]
+        indices.get_dtype.return_value = torch.int32
+        indices.get_device.return_value = torch.device("cpu")
+
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            partial_counts = create_causal_num_blocks_fake_generator(full=False)(
+                num_blocks
+            )
+            full_kv_counts = create_causal_num_blocks_fake_generator(full=True)(
+                num_blocks
+            )
+            full_q_counts = create_causal_num_blocks_fake_generator(
+                full=True, transposed=True
+            )(num_blocks)
+            partial_indices = create_causal_indices_fake_generator(partial_block=True)(
+                indices
+            )
+            full_q_indices = create_causal_indices_fake_generator(
+                partial_block=False, transposed=True
+            )(indices)
+
+        self.assertEqual(partial_counts.tolist(), [[[1, 1, 1, 1]]])
+        self.assertEqual(full_kv_counts.tolist(), [[[0, 1, 2, 3]]])
+        self.assertEqual(full_q_counts.tolist(), [[[3, 2, 1, 0]]])
+        self.assertEqual(
+            partial_indices.tolist(),
+            [[[[0, 1, 2, 3], [1, 0, 2, 3], [2, 0, 1, 3], [3, 0, 1, 2]]]],
+        )
+        self.assertEqual(
+            full_q_indices.tolist(),
+            [[[[1, 2, 3, 0], [2, 3, 0, 1], [3, 0, 1, 2], [0, 1, 2, 3]]]],
+        )
+
+    def test_causal_mask_graph_detection(self):
+        graph = torch.fx.Graph()
+        placeholders = [graph.placeholder(f"arg{index}") for index in range(4)]
+        graph.output(
+            graph.call_function(
+                torch.ops.aten.ge.Tensor,
+                (placeholders[2], placeholders[3]),
+            )
+        )
+
+        self.assertTrue(_mask_graph_is_causal(torch.fx.GraphModule({}, graph)))
 
 
 if __name__ == "__main__":
