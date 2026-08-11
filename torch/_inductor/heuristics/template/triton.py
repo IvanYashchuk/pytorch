@@ -1468,6 +1468,46 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     capability == (10, 7)
                     and dtype in (torch.bfloat16, torch.float16)
                     and is_gqa
+                    and not has_tanh_score_mod
+                    and head_dim in (64, 256)
+                    and batch_heads is not None
+                ):
+                    # Packed GQA query rows predict the D64 occupancy regime
+                    # across batch/head and query-length changes. D256 uses the
+                    # same resource-matched tile throughout the measured range.
+                    if head_dim == 256:
+                        default_config = FlexConfig(64, 64, 3, 4)
+                    else:
+                        sm_count = torch.cuda.get_device_properties(
+                            "cuda"
+                        ).multi_processor_count
+                        packed_query_rows = batch_heads * seq_len
+                        # With BLOCK_M=64, these are 1.25, 5, 7.5, and
+                        # 10 packed-query CTA waves per SM.
+                        if V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 80
+                        ):
+                            default_config = FlexConfig(64, 128, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 320
+                        ):
+                            default_config = FlexConfig(64, 64, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 480
+                        ):
+                            default_config = FlexConfig(128, 64, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 640
+                        ):
+                            default_config = FlexConfig(64, 128, 3, 4)
+                        elif V.graph.sizevars.statically_known_gt(
+                            packed_query_rows, sm_count * 640
+                        ):
+                            default_config = FlexConfig(128, 64, 3, 4)
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
                     and V.graph.sizevars.statically_known_lt(seq_len, 128)
                 ):
                     # Once AUTO rejects an over-packed decode kernel, short

@@ -252,6 +252,9 @@ class TestRubinDefaultFlexConfig(TestCase):
     def test_long_tanh_score_mod(self, _mock_capability):
         sizevars = mock.Mock()
         sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_gt.side_effect = lambda value, limit: value > limit
+        sizevars.statically_known_leq.side_effect = lambda value, limit: value <= limit
+        sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
             heuristic = CUDAConfigHeuristic()
             self.assertEqual(
@@ -283,8 +286,10 @@ class TestRubinDefaultFlexConfig(TestCase):
                 [FlexConfig(64, 64, 3, 4)],
             )
 
+    @mock.patch("torch.cuda.get_device_properties")
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
-    def test_long_forward_configs(self, _mock_capability):
+    def test_long_forward_configs(self, _mock_capability, mock_properties):
+        mock_properties.return_value.multi_processor_count = 212
         sizevars = mock.Mock()
         sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
@@ -369,6 +374,54 @@ class TestRubinDefaultFlexConfig(TestCase):
                     64,
                     128,
                     torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 128, 3, 4)],
+            )
+
+            packed_gqa_configs = (
+                (64, 128, 128, FlexConfig(64, 128, 3, 4)),
+                (64, 266, 64, FlexConfig(64, 64, 3, 4)),
+                (64, 1060, 64, FlexConfig(64, 64, 3, 4)),
+                (64, 1061, 64, FlexConfig(128, 64, 3, 4)),
+                (64, 1590, 64, FlexConfig(128, 64, 3, 4)),
+                (64, 1591, 64, FlexConfig(64, 128, 3, 4)),
+                (64, 2120, 64, FlexConfig(64, 128, 3, 4)),
+                (64, 2121, 64, FlexConfig(128, 64, 3, 4)),
+                (256, 128, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 2048, 128, FlexConfig(64, 64, 3, 4)),
+            )
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, seq_len, batch_heads, config in packed_gqa_configs:
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            seq_len,
+                            dtype,
+                            batch_heads=batch_heads,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            # D128 and tanh retain their existing independent policies.
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128,
+                    512,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(128, 64, 3, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    512,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
                     batch_heads=32,
                     is_gqa=True,
                 ),
