@@ -165,10 +165,17 @@ class InductorChoices:
         dtype: torch.dtype,
         device_type: str | None = "cuda",
         has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_fwd_configs(
-            head_dim, seq_len, dtype, has_tanh_score_mod
+            head_dim,
+            seq_len,
+            dtype,
+            has_tanh_score_mod,
+            batch_heads,
+            is_causal,
         )
 
     def get_flex_attention_bwd_configs(

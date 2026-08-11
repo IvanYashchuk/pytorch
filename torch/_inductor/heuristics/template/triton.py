@@ -1210,6 +1210,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         seq_len: sympy.Expr,
         dtype: Any,
         has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1425,6 +1427,8 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         seq_len: sympy.Expr,
         dtype: Any,
         has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
     ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
@@ -1450,16 +1454,41 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 )
                 if (
                     capability == (10, 7)
-                    and has_tanh_score_mod
-                    and 64 <= head_dim <= 256
                     and dtype in (torch.bfloat16, torch.float16)
                     and V.graph.sizevars.statically_known_geq(seq_len, 4096)
                 ):
-                    # Long-running tanh score modifiers (for example softcap)
-                    # are register-pressure sensitive on Rubin. The one-stage
-                    # 128x128 tile is the stable max-autotune winner for head
-                    # dimensions 64 through 256.
-                    default_config = FlexConfig(128, 128, 1, 8)
+                    # Long Rubin kernels have different tile resource limits
+                    # from the inherited SM100 policy. Tanh additionally needs
+                    # the causal workload and batch/head parallelism to avoid
+                    # selecting the one-stage tile for short effective grids.
+                    if has_tanh_score_mod:
+                        large_batch_heads = (
+                            batch_heads is not None
+                            and V.graph.sizevars.statically_known_geq(batch_heads, 64)
+                        )
+                        medium_batch_heads = (
+                            batch_heads is not None
+                            and V.graph.sizevars.statically_known_geq(batch_heads, 32)
+                        )
+                        if (not is_causal and large_batch_heads) or (
+                            head_dim == 256 and medium_batch_heads
+                        ):
+                            default_config = FlexConfig(128, 128, 1, 8)
+                        else:
+                            tanh_configs = {
+                                64: FlexConfig(64, 64, 3, 4),
+                                128: FlexConfig(128, 128, 2, 8),
+                                256: FlexConfig(64, 64, 3, 4),
+                            }
+                            if is_causal:
+                                tanh_configs[128] = FlexConfig(64, 64, 3, 4)
+                            default_config = tanh_configs.get(head_dim, default_config)
+                    else:
+                        default_config = {
+                            64: FlexConfig(64, 128, 3, 4),
+                            128: FlexConfig(128, 128, 2, 8),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
             elif capability == (9, 0):
                 default_config = self.h100_default_flex_config.get(
                     (dtype, head_dim), default_config
@@ -1916,6 +1945,8 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         seq_len: sympy.Expr,
         dtype: Any,
         has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -2084,6 +2115,8 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         seq_len: sympy.Expr,
         dtype: Any,
         has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 

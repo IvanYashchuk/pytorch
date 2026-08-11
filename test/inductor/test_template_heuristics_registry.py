@@ -256,7 +256,11 @@ class TestRubinDefaultFlexConfig(TestCase):
             heuristic = CUDAConfigHeuristic()
             self.assertEqual(
                 heuristic.get_flex_attn_fwd_configs(
-                    128, 4096, torch.bfloat16, has_tanh_score_mod=True
+                    128,
+                    4096,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=64,
                 ),
                 [FlexConfig(128, 128, 1, 8)],
             )
@@ -277,6 +281,55 @@ class TestRubinDefaultFlexConfig(TestCase):
                     32, 4096, torch.bfloat16, has_tanh_score_mod=True
                 ),
                 [FlexConfig(64, 64, 3, 4)],
+            )
+
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_long_forward_configs(self, _mock_capability):
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            heuristic = CUDAConfigHeuristic()
+            expected = {
+                64: FlexConfig(64, 128, 3, 4),
+                128: FlexConfig(128, 128, 2, 8),
+                256: FlexConfig(64, 64, 3, 4),
+            }
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, config in expected.items():
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim, 4096, dtype, batch_heads=1
+                        ),
+                        [config],
+                    )
+
+            tanh_cases = (
+                (64, 32, False, FlexConfig(64, 64, 3, 4)),
+                (64, 64, False, FlexConfig(128, 128, 1, 8)),
+                (128, 32, False, FlexConfig(128, 128, 2, 8)),
+                (128, 64, False, FlexConfig(128, 128, 1, 8)),
+                (128, 64, True, FlexConfig(64, 64, 3, 4)),
+                (256, 8, False, FlexConfig(64, 64, 3, 4)),
+                (256, 32, True, FlexConfig(128, 128, 1, 8)),
+            )
+            for head_dim, batch_heads, is_causal, config in tanh_cases:
+                self.assertEqual(
+                    heuristic.get_flex_attn_fwd_configs(
+                        head_dim,
+                        4096,
+                        torch.bfloat16,
+                        has_tanh_score_mod=True,
+                        batch_heads=batch_heads,
+                        is_causal=is_causal,
+                    ),
+                    [config],
+                )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 2048, torch.bfloat16, batch_heads=64
+                ),
+                [FlexConfig(128, 64, 3, 8)],
             )
 
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))

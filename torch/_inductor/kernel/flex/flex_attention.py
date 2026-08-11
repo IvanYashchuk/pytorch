@@ -485,6 +485,14 @@ def flex_attention(
         dtype,
         query.get_device().type,
         has_tanh_score_mod=_score_graph_has_tanh(subgraph.graph_module),
+        batch_heads=query.get_size()[0] * query.get_size()[1],
+        is_causal=(
+            _mask_graph_is_causal(mask_graph.graph_module)
+            and V.graph.sizevars.statically_known_equals(seq_len_q, seq_len_kv)
+            and V.graph.sizevars.statically_known_equals(
+                SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE
+            )
+        ),
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
