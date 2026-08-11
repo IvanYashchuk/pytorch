@@ -8405,7 +8405,12 @@ class TritonScheduling(SIMDScheduling):
         kernel_kwargs: dict[str, Any],
     ) -> list[TritonKernel]:
         kernels: list[TritonKernel] = [kernel]
-        if not config.triton.multi_kernel:
+        autotune_online_softmax_algorithms = (
+            config.max_autotune
+            and kernel.features.contains_reduction_type("online_softmax_reduce")
+            and isinstance(kernel.features.reduction_numel, (int, sympy.Integer))
+        )
+        if not config.triton.multi_kernel and not autotune_online_softmax_algorithms:
             return kernels
 
         optional_persistent = kernel.persistent_reduction and not kernel_kwargs.get(

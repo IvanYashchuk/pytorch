@@ -128,6 +128,32 @@ class TestOnlineSoftmax(TestCase):
             len(re.findall(r"(?:libdevice|tl_math)\.exp\(", wrapper_code)), 1
         )
 
+    @parametrize("use_log_softmax", [False, True])
+    @inductor_config.patch({"max_autotune": True, "triton.multi_kernel": 0})
+    def test_codegen_softmax_max_autotune_compares_reduction_algorithms(
+        self, use_log_softmax
+    ):
+        wrapper_code = self.get_softmax_wrapper(
+            4096, N=2, use_log_softmax=use_log_softmax
+        )
+        self.assertIn("async_compile.multi_kernel(", wrapper_code)
+        self.assertEqual(wrapper_code.count("@triton_heuristics.reduction("), 1)
+        self.assertEqual(
+            wrapper_code.count("@triton_heuristics.persistent_reduction("), 1
+        )
+        self.assertEqual(wrapper_code.count("for r0_offset in"), 2)
+
+    @inductor_config.patch({"max_autotune": True, "triton.multi_kernel": 0})
+    def test_codegen_softmax_max_autotune_symbolic_width(self):
+        @torch.compile(dynamic=True)
+        def f(x):
+            return torch.softmax(x, dim=-1)
+
+        x = torch.randn(2, 4096, dtype=torch.bfloat16, device=GPU_TYPE)
+        _, source_codes = run_and_get_code(f, x)
+        wrapper_code = "\n".join(source_codes)
+        self.assertNotIn("async_compile.multi_kernel(", wrapper_code)
+
     @parametrize("V,expected_loops", [(65536, 0), (65537, 2)])
     def test_codegen_softmax_persistent_reduction_boundary(self, V, expected_loops):
         wrapper_code = self.get_softmax_wrapper(V, N=2)
