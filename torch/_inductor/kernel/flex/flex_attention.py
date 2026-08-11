@@ -1099,6 +1099,7 @@ def flex_attention_backward(*args, **kwargs):
         seq_len_q=seq_len_q,
         batch_heads=query.get_size()[0] * query.get_size()[1],
         is_gqa=V.graph.sizevars.statically_known_gt(gqa_shared_heads, 1),
+        has_tanh_score_mod=_score_graph_has_tanh(fw_graph.graph_module),
     )
 
     # Default config for warp specialization

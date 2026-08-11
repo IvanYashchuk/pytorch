@@ -189,6 +189,7 @@ class InductorChoices:
         seq_len_q: sympy.Expr | None = None,
         batch_heads: sympy.Expr | None = None,
         is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_bwd_configs(
@@ -198,6 +199,7 @@ class InductorChoices:
             seq_len_q,
             batch_heads,
             is_gqa,
+            has_tanh_score_mod,
         )
 
     def get_flex_decode_configs(

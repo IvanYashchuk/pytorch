@@ -474,6 +474,43 @@ class TestRubinDefaultFlexConfig(TestCase):
             [small_config],
         )
 
+        # Long GQA D64 uses symmetric tiles below 128 packed query heads, but
+        # tanh/softcap and higher-parallelism workloads retain the small tile.
+        for dtype in (torch.bfloat16, torch.float16):
+            for has_transcendental, has_tanh in (
+                (False, False),
+                (True, False),
+            ):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        64,
+                        dtype,
+                        has_transcendental_score_mod=has_transcendental,
+                        seq_len_q=4096,
+                        batch_heads=32,
+                        is_gqa=True,
+                        has_tanh_score_mod=has_tanh,
+                    ),
+                    [symmetric_config],
+                )
+            for seq_len_q, batch_heads, has_tanh in (
+                (129, 32, True),
+                (4096, 32, True),
+                (4096, 128, False),
+            ):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        64,
+                        dtype,
+                        has_transcendental_score_mod=has_tanh,
+                        seq_len_q=seq_len_q,
+                        batch_heads=batch_heads,
+                        is_gqa=True,
+                        has_tanh_score_mod=has_tanh,
+                    ),
+                    [small_config],
+                )
+
 
 class TestFlexAttentionAutotuneInputs(TestCase):
     def test_causal_block_mask_generators(self):
