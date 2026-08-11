@@ -387,7 +387,7 @@ class TestRubinDefaultFlexConfig(TestCase):
             )
 
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
-    def test_transcendental_score_mod_backward(self, _mock_capability):
+    def test_rubin_backward_configs(self, _mock_capability):
         heuristic = CUDAConfigHeuristic()
         transcendental_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
         for dtype in (torch.bfloat16, torch.float16):
@@ -410,6 +410,68 @@ class TestRubinDefaultFlexConfig(TestCase):
                 32, torch.bfloat16, has_transcendental_score_mod=True
             ),
             [FlexBwDConfig(32, 64, 64, 32, 3, 4)],
+        )
+
+        small_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        symmetric_config = FlexBwDConfig(64, 64, 64, 64, 3, 4)
+        for dtype in (torch.bfloat16, torch.float16):
+            for has_transcendental in (False, True):
+                for head_dim, config in (
+                    (64, symmetric_config),
+                    (128, symmetric_config),
+                    (256, small_config),
+                ):
+                    self.assertEqual(
+                        heuristic.get_flex_attn_bwd_configs(
+                            head_dim,
+                            dtype,
+                            has_transcendental_score_mod=has_transcendental,
+                            seq_len_q=128,
+                            batch_heads=32,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=129,
+                batch_heads=32,
+                is_gqa=True,
+            ),
+            [small_config],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=256,
+                batch_heads=32,
+                is_gqa=True,
+            ),
+            [FlexBwDConfig(64, 128, 128, 64, 3, 4)],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=64,
+                batch_heads=64,
+                is_gqa=True,
+            ),
+            [small_config],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                64,
+                torch.bfloat16,
+                seq_len_q=64,
+                batch_heads=256,
+                is_gqa=True,
+            ),
+            [small_config],
         )
 
 

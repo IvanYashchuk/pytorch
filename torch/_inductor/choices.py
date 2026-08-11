@@ -186,10 +186,18 @@ class InductorChoices:
         dtype: torch.dtype,
         device_type: str | None = "cuda",
         has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_bwd_configs(
-            head_dim, dtype, has_transcendental_score_mod
+            head_dim,
+            dtype,
+            has_transcendental_score_mod,
+            seq_len_q,
+            batch_heads,
+            is_gqa,
         )
 
     def get_flex_decode_configs(

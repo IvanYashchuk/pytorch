@@ -1238,7 +1238,13 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any, has_transcendental_score_mod: bool = False
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1535,7 +1541,13 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any, has_transcendental_score_mod: bool = False
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
     ) -> list[FlexBwDConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
@@ -1615,6 +1627,40 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
             # tile is the stable max-autotune winner across head dimensions
             # 64, 128, and 256.
             default_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+
+        if (
+            capability == (10, 7)
+            and is_gqa
+            and dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Rubin GQA changes the backward work balance: short, low-grid
+            # queries favor symmetric tiles, while D256 and higher-parallelism
+            # cases need smaller dQ/dK tiles to match max-autotune.
+            small_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+            symmetric_config = FlexBwDConfig(64, 64, 64, 64, 3, 4)
+            if head_dim == 256:
+                default_config = small_config
+            elif head_dim == 128 and seq_len_q is not None:
+                if (
+                    V.graph.sizevars.statically_known_leq(seq_len_q, 128)
+                    and batch_heads is not None
+                    and V.graph.sizevars.statically_known_lt(batch_heads, 64)
+                ):
+                    default_config = symmetric_config
+                elif V.graph.sizevars.statically_known_lt(seq_len_q, 256):
+                    default_config = small_config
+            elif (
+                head_dim == 64
+                and seq_len_q is not None
+                and V.graph.sizevars.statically_known_leq(seq_len_q, 128)
+            ):
+                if (
+                    batch_heads is not None
+                    and V.graph.sizevars.statically_known_lt(batch_heads, 256)
+                ):
+                    default_config = symmetric_config
+                else:
+                    default_config = small_config
 
         if default_config not in flex_attn_bwd_configs:
             flex_attn_bwd_configs.append(default_config)
@@ -2030,7 +2076,13 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any, has_transcendental_score_mod: bool = False
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -2182,7 +2234,13 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any, has_transcendental_score_mod: bool = False
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
