@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast, TYPE_CHECKING
@@ -30,6 +31,8 @@ from .common import (
     _flex_kernel_tuning_options,
     build_subgraph_buffer,
     can_skip_boundary_checks,
+    create_causal_indices_fake_generator,
+    create_causal_num_blocks_fake_generator,
     create_indices_fake,
     create_num_blocks_fake_generator,
     create_placeholder,
@@ -64,6 +67,20 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
 Expr = sympy.Expr
+
+
+def _mask_graph_is_causal(graph_module) -> bool:
+    nodes = list(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    outputs = [node for node in nodes if node.op == "output"]
+    if len(placeholders) != 4 or len(outputs) != 1:
+        return False
+    output = outputs[0].args[0]
+    return (
+        output.op == "call_function"
+        and output.target in (operator.ge, torch.ops.aten.ge.Tensor)
+        and output.args == (placeholders[2], placeholders[3])
+    )
 
 
 def _sanitize_kernel_options_for_triton(
@@ -586,12 +603,25 @@ def flex_attention(
         + list(score_mod_other_buffers)
         + list(mask_mod_other_buffers)
     )
-    input_gen_fns = {
-        5: create_num_blocks_fake_generator(kv_indices),
-        6: create_indices_fake,
-        7: create_num_blocks_fake_generator(full_kv_indices),
-        8: create_indices_fake,
-    }
+    causal_self_attention = (
+        _mask_graph_is_causal(mask_graph.graph_module)
+        and V.graph.sizevars.statically_known_equals(seq_len_q, seq_len_kv)
+        and (SPARSE_Q_BLOCK_SIZE == SPARSE_KV_BLOCK_SIZE)
+    )
+    if causal_self_attention:
+        input_gen_fns = {
+            5: create_causal_num_blocks_fake_generator(full=False),
+            6: create_causal_indices_fake_generator(partial_block=True),
+            7: create_causal_num_blocks_fake_generator(full=True),
+            8: create_causal_indices_fake_generator(partial_block=False),
+        }
+    else:
+        input_gen_fns = {
+            5: create_num_blocks_fake_generator(kv_indices),
+            6: create_indices_fake,
+            7: create_num_blocks_fake_generator(full_kv_indices),
+            8: create_indices_fake,
+        }
 
     out, _ = autotune_select_algorithm(
         "flex_attention",
@@ -1172,16 +1202,35 @@ def flex_attention_backward(*args, **kwargs):
         + list(mask_mod_other_buffers)
         + joint_outputs.mutated_grads
     )
-    input_gen_fns = {
-        8: create_num_blocks_fake_generator(kv_indices),  # kv_num_blocks
-        9: create_indices_fake,
-        10: create_num_blocks_fake_generator(q_indices),  # q_num_blocks
-        11: create_indices_fake,
-        12: create_num_blocks_fake_generator(full_kv_indices),  # full_kv_num_blocks
-        13: create_indices_fake,
-        14: create_num_blocks_fake_generator(full_q_indices),  # full_q_num_blocks
-        15: create_indices_fake,
-    }
+    causal_self_attention = (
+        _mask_graph_is_causal(mask_graph.graph_module)
+        and V.graph.sizevars.statically_known_equals(seq_len_q, seq_len_kv)
+        and (SPARSE_Q_BLOCK_SIZE == SPARSE_KV_BLOCK_SIZE)
+    )
+    if causal_self_attention:
+        input_gen_fns = {
+            8: create_causal_num_blocks_fake_generator(full=False),
+            9: create_causal_indices_fake_generator(partial_block=True),
+            10: create_causal_num_blocks_fake_generator(full=False),
+            11: create_causal_indices_fake_generator(partial_block=True),
+            12: create_causal_num_blocks_fake_generator(full=True),
+            13: create_causal_indices_fake_generator(partial_block=False),
+            14: create_causal_num_blocks_fake_generator(full=True, transposed=True),
+            15: create_causal_indices_fake_generator(
+                partial_block=False, transposed=True
+            ),
+        }
+    else:
+        input_gen_fns = {
+            8: create_num_blocks_fake_generator(kv_indices),  # kv_num_blocks
+            9: create_indices_fake,
+            10: create_num_blocks_fake_generator(q_indices),  # q_num_blocks
+            11: create_indices_fake,
+            12: create_num_blocks_fake_generator(full_kv_indices),  # full_kv_num_blocks
+            13: create_indices_fake,
+            14: create_num_blocks_fake_generator(full_q_indices),  # full_q_num_blocks
+            15: create_indices_fake,
+        }
 
     broadcasted_grad_key, _ = autotune_select_algorithm(
         "flex_attention_backward",

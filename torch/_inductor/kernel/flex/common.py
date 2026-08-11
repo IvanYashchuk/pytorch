@@ -447,6 +447,51 @@ def create_num_blocks_fake_generator(sparse_indices):
     return create_num_blocks_fake
 
 
+def create_causal_num_blocks_fake_generator(*, full: bool, transposed: bool = False):
+    """Create representative block counts for a square causal block mask."""
+
+    def create_causal_num_blocks_fake(x) -> torch.Tensor:
+        size = V.graph.sizevars.optimization_hints(x.get_size())
+        if not full:
+            return torch.ones(size, dtype=x.get_dtype(), device=x.get_device())
+
+        num_blocks = size[-1]
+        values = torch.arange(num_blocks, dtype=x.get_dtype(), device=x.get_device())
+        if transposed:
+            values = values.flip(0)
+        view_shape = [1] * (len(size) - 1) + [num_blocks]
+        return values.view(view_shape).expand(size).contiguous()
+
+    return create_causal_num_blocks_fake
+
+
+def create_causal_indices_fake_generator(
+    *, partial_block: bool, transposed: bool = False
+):
+    """Create representative block indices for a square causal block mask."""
+
+    def create_causal_indices_fake(x) -> torch.Tensor:
+        size = V.graph.sizevars.optimization_hints(x.get_size())
+        num_rows, max_blocks = size[-2:]
+        columns = torch.arange(max_blocks, dtype=x.get_dtype(), device=x.get_device())
+        rows = torch.arange(num_rows, dtype=x.get_dtype(), device=x.get_device())
+        rows = rows.view([1] * (len(size) - 2) + [num_rows, 1])
+        if partial_block:
+            values = torch.where(columns == 0, rows, columns)
+            values = torch.where(
+                (columns > 0) & (columns <= rows), columns - 1, values
+            ).expand(size)
+        elif transposed:
+            values = (rows + columns + 1) % max_blocks
+            values = values.expand(size)
+        else:
+            view_shape = [1] * (len(size) - 1) + [max_blocks]
+            values = columns.view(view_shape).expand(size)
+        return values.contiguous()
+
+    return create_causal_indices_fake
+
+
 def contiguous_last_dim(x):
     """Ensure that realized IR node has a contiguous stride in the last dimension."""
     strides = x.maybe_get_stride()
