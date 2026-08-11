@@ -43,6 +43,7 @@ from torch._inductor.runtime.hints import (
     HeuristicType,
     native_matmul_block_numel,
     native_matmul_persistent_rblock,
+    ReductionHint,
     TRITON_MAX_BLOCK,
     TRITON_MAX_TENSOR_NUMEL,
 )
@@ -166,6 +167,55 @@ class TestTritonHeuristics(TestCase):
 
         with self.assertRaisesRegex(AssertionError, "exceeds Triton maximum"):
             make_matmul_triton_config({"x": 256, "y": 128, "r": 64}, 8, 1)
+
+    def test_persistent_reduction_max_autotune_includes_default(self):
+        device = self._fake_cuda_device_properties()
+        triton_meta = {"device": device}
+
+        def config_key(cfg):
+            return (tuple(sorted(cfg.kwargs.items())), cfg.num_warps, cfg.num_stages)
+
+        def assert_default_subset(
+            reduction_hint, xnumels, rnumels, extra_meta=None
+        ):
+            extra_meta = extra_meta or {}
+            for xnumel in xnumels:
+                for rnumel in rnumels:
+                    size_hints = {"x": xnumel, "r0_": rnumel}
+                    default_configs = _persistent_reduction_configs(
+                        size_hints=size_hints,
+                        reduction_hint=reduction_hint,
+                        inductor_meta=extra_meta,
+                        triton_meta=triton_meta,
+                    )
+                    for max_flag in ("max_autotune", "max_autotune_pointwise"):
+                        max_configs = _persistent_reduction_configs(
+                            size_hints=size_hints,
+                            reduction_hint=reduction_hint,
+                            inductor_meta={**extra_meta, max_flag: True},
+                            triton_meta=triton_meta,
+                        )
+                        default_keys = [config_key(cfg) for cfg in default_configs]
+                        max_keys = [config_key(cfg) for cfg in max_configs]
+                        self.assertEqual(len(max_keys), len(set(max_keys)))
+                        self.assertTrue(set(default_keys) <= set(max_keys))
+
+        assert_default_subset(
+            ReductionHint.INNER,
+            xnumels=(1023, 1024),
+            rnumels=(128, 256, 1024, 2048),
+        )
+        assert_default_subset(
+            ReductionHint.INNER,
+            xnumels=(1024,),
+            rnumels=(256, 1024),
+            extra_meta={"RSPLIT_SIZE": 8},
+        )
+        assert_default_subset(
+            ReductionHint.OUTER_TINY,
+            xnumels=(512, 1024),
+            rnumels=(1, 16, 64, 128, 256, 512, 1024, 2048),
+        )
 
     def test_reduction_min_block_preserves_tile_product(self):
         cfg = _enforce_reduction_config_block_minimums(

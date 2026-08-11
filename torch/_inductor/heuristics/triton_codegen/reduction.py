@@ -436,19 +436,19 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                 warp_size=warp_size,
             )
         ]
+        use_persistent_inner_specialization = (
+            reduction_hint == ReductionHint.INNER
+            and 256 <= rnumel <= 1024
+            and xnumel // 8 >= 128
+            and not inductor_meta.get("RSPLIT_SIZE")
+        )
 
         # Defer to more autotuning for 3d tiling
         if "y" in size_hints:
             pass
         elif not max_autotune_enabled:
             if reduction_hint == ReductionHint.INNER and rnumel >= 256:
-                if (
-                    rnumel > 1024
-                    or xnumel // 8 < 128
-                    or inductor_meta.get("RSPLIT_SIZE")
-                ):
-                    configs = configs[:1]
-                else:
+                if use_persistent_inner_specialization:
                     configs = self._persistent_inner_config(
                         size_hints,
                         rnumel,
@@ -457,11 +457,32 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                         reduction_hint,
                         warp_size,
                     )
+                else:
+                    configs = configs[:1]
             elif reduction_hint == ReductionHint.OUTER:
                 configs = configs[-1:]
             elif reduction_hint == ReductionHint.OUTER_TINY:
                 configs = tiny_configs
         else:
+            # Max autotune must include the configuration used by the default
+            # heuristic.  In particular, the INNER specialization uses
+            # XBLOCK=4/2/1 with one warp for R=256/512/1024; those candidates
+            # are not present in the generic persistent XBLOCK sweep.
+            default_configs = []
+            if use_persistent_inner_specialization:
+                default_configs = self._persistent_inner_config(
+                    size_hints,
+                    rnumel,
+                    xnumel,
+                    inductor_meta,
+                    reduction_hint,
+                    warp_size,
+                )
+            elif reduction_hint == ReductionHint.OUTER_TINY:
+                default_configs = tiny_configs
+            for default_config in default_configs:
+                if default_config not in configs:
+                    configs.append(default_config)
             configs = self._persistent_max_autotune_extras(configs, tiny_configs)
 
         for c in configs:
