@@ -92,6 +92,46 @@ def make_cpp_wrapper_test(orig_test, **extra_args):
 )
 @instantiate_parametrized_tests
 class MultiKernelTest(TestCase):
+    @unittest.mock.patch.dict(
+        os.environ, {"TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE": "1"}
+    )
+    def test_cache_file_path_rehydrates_subkernels(self):
+        state = {"loaded": False}
+
+        class FakeFn:
+            @property
+            def cache_key(self):
+                if not state["loaded"]:
+                    raise AssertionError("cache key read before kernel rehydration")
+                return "cache_key"
+
+        kernel = unittest.mock.Mock(
+            fn=FakeFn(), size_hints={"x": 1}, triton_meta={"device": "cuda"}
+        )
+        kernel._ensure_kernel_loaded.side_effect = lambda: state.__setitem__(
+            "loaded", True
+        )
+        multi_kernel = MultiKernelCall("multi_kernel_0", [kernel], arg_index={})
+        multi_kernel.cache_file_path()
+        self.assertTrue(state["loaded"])
+
+    @unittest.mock.patch.dict(
+        os.environ, {"TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE": "1"}
+    )
+    def test_run_specializes_identical_argument_kernel(self):
+        kernel = unittest.mock.Mock()
+        kernel.inductor_meta = {"kernel_name": "kernel_0"}
+        multi_kernel = MultiKernelCall(
+            "multi_kernel_0", [kernel], arg_index={0: [slice(0, 2)]}
+        )
+        multi_kernel.picked_kernel = 0
+        arg0, arg1 = object(), object()
+
+        multi_kernel.run(arg0, arg1)
+        self.assertIs(multi_kernel.run, kernel.run)
+        multi_kernel.run(arg0, arg1)
+        self.assertEqual(kernel.run.call_count, 2)
+
     def test_softmax(self, expect_multi_kernel=True):
         x = torch.rand(2, 1024).to(GPU_TYPE)
         ref = torch.softmax(x, -1)

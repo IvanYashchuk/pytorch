@@ -336,6 +336,11 @@ class MultiKernelCall:
         self._recorded = False
 
     def cache_file_path(self):
+        # Parallel compilation strips the live JITFunction state before pickling.
+        # An FX graph cache hit can reach this path before anything else needs the
+        # function, so restore it before asking Triton to compute its cache key.
+        for kernel in self.kernels:
+            kernel._ensure_kernel_loaded()
         key = code_hash(
             ",".join(
                 [
@@ -501,9 +506,26 @@ class MultiKernelCall:
                 raise AssertionError("expected picked_kernel_name to not be None")
             self.record_choice(self.multi_kernel_name, picked_kernel_name)
 
-        run = self.kernels[self.picked_kernel].run  # type: ignore[method-assign]
+        kernel = self.kernels[self.picked_kernel]
         filtered_args = self._get_filtered_args(args, self.picked_kernel)
-        run(*filtered_args, **kwargs)
+        if len(filtered_args) == len(args) and all(
+            filtered is original for filtered, original in zip(filtered_args, args)
+        ):
+            # The common case has identical argument lists. Bypass this Python
+            # dispatcher entirely after selection so small kernels do not pay a
+            # persistent multi-kernel launch tax.
+            self.run = kernel.run  # type: ignore[method-assign]
+        else:
+            arg_index = self.arg_index[self.picked_kernel]
+
+            def run_selected(*selected_args, **selected_kwargs):
+                filtered_selected_args = [
+                    item for s in arg_index for item in selected_args[s]
+                ]
+                return kernel.run(*filtered_selected_args, **selected_kwargs)
+
+            self.run = run_selected  # type: ignore[method-assign]
+        self.run(*args, **kwargs)
 
     def _metrics_table_row(self, timings):
         def get_kernel_path(k):
