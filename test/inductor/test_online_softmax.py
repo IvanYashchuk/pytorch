@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 
 import torch
 import torch._inductor.config as inductor_config
@@ -64,8 +65,9 @@ class TestOnlineSoftmax(TestCase):
     def test_prepare_softmax_perf(self):
         self.do_test_acc_and_perf(_prepare_softmax)
 
-    def get_softmax_wrapper(self, V=50304, use_log_softmax=False, device=GPU_TYPE):
-        N = 32 * 1024
+    def get_softmax_wrapper(
+        self, V=50304, use_log_softmax=False, device=GPU_TYPE, N=32 * 1024
+    ):
 
         @torch.compile
         def f(x):
@@ -89,7 +91,7 @@ class TestOnlineSoftmax(TestCase):
     def test_codegen_online_softmax(self, use_log_softmax, V):
         wrapper_code = self.get_softmax_wrapper(use_log_softmax=use_log_softmax, V=V)
 
-        self.assertEqual(wrapper_code.count("for r0_offset in"), 2)
+        self.assertEqual(wrapper_code.count("for r0_offset in"), 0)
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     @parametrize("use_log_softmax", [False, True])
@@ -106,7 +108,7 @@ class TestOnlineSoftmax(TestCase):
         _, source_codes = run_and_get_code(torch.compile(f, fullgraph=True), x, n)
         wrapper_code = "\n".join(source_codes)
 
-        self.assertEqual(wrapper_code.count("for r0_offset in"), 2)
+        self.assertEqual(wrapper_code.count("for r0_offset in"), 0)
         self.assertTrue("online_softmax_reduce" in wrapper_code)
 
     def test_no_online_softmax_for_cpu(self):
@@ -122,6 +124,14 @@ class TestOnlineSoftmax(TestCase):
         """
         wrapper_code = self.get_softmax_wrapper(1024)
         self.assertEqual(wrapper_code.count("for r0_offset in"), 0)
+        self.assertEqual(
+            len(re.findall(r"(?:libdevice|tl_math)\.exp\(", wrapper_code)), 1
+        )
+
+    @parametrize("V,expected_loops", [(65536, 0), (65537, 2)])
+    def test_codegen_softmax_persistent_reduction_boundary(self, V, expected_loops):
+        wrapper_code = self.get_softmax_wrapper(V, N=2)
+        self.assertEqual(wrapper_code.count("for r0_offset in"), expected_loops)
 
     @inductor_config.patch("triton.persistent_reductions", False)
     def test_sdpa(self):
@@ -171,13 +181,7 @@ class TestOnlineSoftmax(TestCase):
 
             self.assertTrue(code.count("def triton") >= num_kernels)
         else:
-            if nrow == 2 and dim == 0:
-                # persistent reduction triggered
-                expected_num_loop = 0
-            else:
-                # A single loop due to online softmax
-                expected_num_loop = 1
-            self.assertEqual(code.count("for r0_offset in"), expected_num_loop)
+            self.assertEqual(code.count("for r0_offset in"), 0)
 
     @inductor_config.patch(strict_signed_zero=True)
     def test_prepare_softmax_signed_zero(self):

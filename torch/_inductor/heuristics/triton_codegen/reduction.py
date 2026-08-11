@@ -7,6 +7,7 @@ from the base.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -463,6 +464,43 @@ class ReductionHeuristic(CodegenConfigHeuristics):
                 configs = tiny_configs
         else:
             configs = self._persistent_max_autotune_extras(configs, tiny_configs)
+
+        is_rubin_softmax = (
+            inductor_meta.get("is_online_softmax")
+            and triton_meta["device"].cc == 107
+            and rnumel >= 2048
+        )
+        if is_rubin_softmax:
+            # Retained-exp softmax on Rubin performs best with roughly 64
+            # reduction elements per thread, with two warps as the floor for
+            # enough rows in flight at the small end of this range.
+            softmax_num_warps = min(32, max(2, rnumel // (32 * 64)))
+            for config in configs:
+                config.num_warps = softmax_num_warps
+
+        if (
+            max_autotune_enabled
+            and inductor_meta.get("is_online_softmax")
+            and rnumel <= 32768
+            and triton_meta["device"].type == "cuda"
+            and triton_meta["device"].cc == 107
+            and warp_size == 32
+        ):
+            if rnumel <= 256:
+                warp_candidates = (1, 2, 4, 8)
+            elif rnumel <= 2048:
+                warp_candidates = (1, 2, 4, 8, 16)
+            elif rnumel <= 8192:
+                warp_candidates = (2, 4, 8, 16)
+            else:
+                warp_candidates = (4, 8, 16, 32)
+            warp_configs = []
+            for config in configs:
+                for num_warps in warp_candidates:
+                    variant = copy.deepcopy(config)
+                    variant.num_warps = num_warps
+                    warp_configs.append(variant)
+            configs = warp_configs
 
         for c in configs:
             for p in size_hints:

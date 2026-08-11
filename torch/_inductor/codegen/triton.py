@@ -5303,15 +5303,27 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # tmp0 in the triton code is either a scalar, or single-element tensor
         # so if we emit tl.sum directly, it will only give 1 instead of RBLOCK * 1
         # To avoid this, we broadcast to the expected shape first.
-        value = self._map_tuple_or_scalar(
-            lambda v: self.cse.generate(
+        retain_persistent_softmax_value = (
+            reduction_type == "online_softmax_reduce"
+            and self.persistent_reduction
+            and not self.cooperative_reduction
+            and not isinstance(value, tuple)
+        )
+
+        def broadcast_to_dense(v):
+            # The persistent softmax input is already dense.  Preserving its
+            # CSE identity lets the fused epilogue reuse exp(x - max) instead
+            # of recomputing the same full-row tensor after the sum reduction.
+            if retain_persistent_softmax_value and v.shape == value_shape:
+                return v
+            return self.cse.generate(
                 self.compute,
                 f"tl.broadcast_to({v}, {dense_size_str})",
                 dtype=v.dtype,
                 shape=value_shape,
-            ),
-            value,
-        )
+            )
+
+        value = self._map_tuple_or_scalar(broadcast_to_dense, value)
 
         arg_index_reduction_types = ("argmax", "argmin")
         arg_value_reduction_types = ("argmax_value", "argmin_value")
@@ -7051,6 +7063,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             out["native_matmul_persistent_rblock"] = rblock
         if self.add_persistent_rblock:
             out["add_persistent_rblock"] = True
+        if self.features.contains_reduction_type("online_softmax_reduce"):
+            out["is_online_softmax"] = True
         if (rblock := self._strict_sum_rblock()) is not None:
             out["strict_sum_rblock"] = rblock
         if (

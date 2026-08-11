@@ -455,9 +455,14 @@ class InductorChoices:
                 V.graph.sizevars.statically_known_geq(rblock, features.reduction_numel)
             ):
                 return False
-        threshold = {
-            ReductionHint.INNER: 1024,
-        }.get(reduction_hint, 64)
+        is_online_softmax = features.contains_reduction_type(
+            "online_softmax_reduce"
+        )
+        threshold = (
+            65536
+            if is_online_softmax and reduction_hint == ReductionHint.INNER
+            else {ReductionHint.INNER: 1024}.get(reduction_hint, 64)
+        )
 
         if reduction_hint not in (
             ReductionHint.INNER,
@@ -499,7 +504,7 @@ class InductorChoices:
         # This may result in some persistent reductions slower than the
         # corresponding non-persistent reductions. MultiKernel will do benchmarking
         # to pick the faster one.
-        if config.triton.multi_kernel:
+        if config.triton.multi_kernel and not is_online_softmax:
             threshold *= 16
 
         return V.graph.sizevars.statically_known_leq(

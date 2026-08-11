@@ -43,6 +43,7 @@ from torch._inductor.runtime.hints import (
     HeuristicType,
     native_matmul_block_numel,
     native_matmul_persistent_rblock,
+    ReductionHint,
     TRITON_MAX_BLOCK,
     TRITON_MAX_TENSOR_NUMEL,
 )
@@ -166,6 +167,86 @@ class TestTritonHeuristics(TestCase):
 
         with self.assertRaisesRegex(AssertionError, "exceeds Triton maximum"):
             make_matmul_triton_config({"x": 256, "y": 128, "r": 64}, 8, 1)
+
+    def test_persistent_softmax_warp_configs(self):
+        device = DeviceProperties(
+            type="cuda",
+            index=0,
+            multi_processor_count=212,
+            cc=107,
+            major=10,
+            regs_per_multiprocessor=65536,
+            max_threads_per_multi_processor=1024,
+            max_threads_per_block=1024,
+            warp_size=32,
+        )
+        configs = _persistent_reduction_configs(
+            size_hints={"x": 2048, "r0_": 8192},
+            inductor_meta={
+                "is_online_softmax": True,
+                "max_autotune": True,
+                "reduction_hint": ReductionHint.INNER,
+            },
+            triton_meta={"device": device},
+        )
+        self.assertEqual({config.num_warps for config in configs}, {2, 4, 8, 16})
+
+        blackwell_device = DeviceProperties(
+            type="cuda",
+            index=0,
+            multi_processor_count=152,
+            cc=100,
+            major=10,
+            regs_per_multiprocessor=65536,
+            max_threads_per_multi_processor=1024,
+            max_threads_per_block=1024,
+            warp_size=32,
+        )
+        blackwell_meta = {
+            "max_autotune": True,
+            "reduction_hint": ReductionHint.INNER,
+        }
+        blackwell_softmax = _persistent_reduction_configs(
+            size_hints={"x": 2048, "r0_": 8192},
+            inductor_meta={**blackwell_meta, "is_online_softmax": True},
+            triton_meta={"device": blackwell_device},
+        )
+        blackwell_control = _persistent_reduction_configs(
+            size_hints={"x": 2048, "r0_": 8192},
+            inductor_meta=blackwell_meta,
+            triton_meta={"device": blackwell_device},
+        )
+        def config_key(config):
+            return (
+                frozenset(config.kwargs.items()),
+                config.num_warps,
+                config.num_stages,
+            )
+
+        self.assertEqual(
+            {config_key(config) for config in blackwell_softmax},
+            {config_key(config) for config in blackwell_control},
+        )
+
+        for rnumel, expected_num_warps in (
+            (2048, 2),
+            (4096, 2),
+            (8192, 4),
+            (16384, 8),
+            (32768, 16),
+            (65536, 32),
+        ):
+            configs = _persistent_reduction_configs(
+                size_hints={"x": 2048, "r0_": rnumel},
+                inductor_meta={
+                    "is_online_softmax": True,
+                    "reduction_hint": ReductionHint.INNER,
+                },
+                triton_meta={"device": device},
+            )
+            self.assertEqual(
+                {config.num_warps for config in configs}, {expected_num_warps}
+            )
 
     def test_reduction_min_block_preserves_tile_product(self):
         cfg = _enforce_reduction_config_block_minimums(

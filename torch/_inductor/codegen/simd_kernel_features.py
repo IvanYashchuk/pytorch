@@ -145,6 +145,12 @@ class SIMDKernelFeatures:
     def reduction_nodes(self) -> list[SchedulerNode]:
         return [n for n in self.scheduler_nodes() if n.is_reduction()]
 
+    def contains_reduction_type(self, reduction_type: str) -> bool:
+        return any(
+            node.node.get_reduction_type() == reduction_type
+            for node in self.reduction_nodes()
+        )
+
     @cache_on_self
     def strict_sum_reductions(self) -> tuple[ir.Reduction, ...]:
         return tuple(
