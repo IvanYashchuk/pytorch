@@ -1468,6 +1468,63 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     capability == (10, 7)
                     and dtype in (torch.bfloat16, torch.float16)
                     and is_gqa
+                    and has_tanh_score_mod
+                    and not is_causal
+                    and head_dim in (64, 128, 256)
+                    and batch_heads is not None
+                    and V.graph.sizevars.statically_known_geq(seq_len, 128)
+                ):
+                    # Dense GQA softcap is sensitive to the number of packed
+                    # query CTAs available per Rubin SM. Scale the measured
+                    # wave bands with the runtime SM count so that batch/head
+                    # parallelism and query length follow the same policy.
+                    sm_count = torch.cuda.get_device_properties(
+                        "cuda"
+                    ).multi_processor_count
+                    packed_query_rows = batch_heads * seq_len
+                    small = FlexConfig(64, 64, 3, 4)
+                    large_two_stage = FlexConfig(128, 128, 2, 8)
+                    large_one_stage = FlexConfig(128, 128, 1, 8)
+                    wave_bands = {
+                        64: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (160, small),
+                            (240, large_one_stage),
+                            (320, small),
+                            (480, large_one_stage),
+                            (800, small),
+                        ),
+                        128: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (240, large_one_stage),
+                            (320, large_two_stage),
+                        ),
+                        256: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (160, small),
+                            (240, large_one_stage),
+                            (320, small),
+                        ),
+                    }[head_dim]
+                    for max_rows_per_sm, candidate in wave_bands:
+                        if V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * max_rows_per_sm
+                        ):
+                            default_config = candidate
+                            break
+                    else:
+                        last_max_rows_per_sm = wave_bands[-1][0]
+                        if V.graph.sizevars.statically_known_gt(
+                            packed_query_rows, sm_count * last_max_rows_per_sm
+                        ):
+                            default_config = large_one_stage
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
                     and not has_tanh_score_mod
                     and head_dim in (64, 256)
                     and batch_heads is not None

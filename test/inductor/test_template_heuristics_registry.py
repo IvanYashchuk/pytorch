@@ -405,7 +405,7 @@ class TestRubinDefaultFlexConfig(TestCase):
                         [config],
                     )
 
-            # D128 and tanh retain their existing independent policies.
+            # D128 retains its existing independent non-tanh policy.
             self.assertEqual(
                 heuristic.get_flex_attn_fwd_configs(
                     128,
@@ -416,16 +416,67 @@ class TestRubinDefaultFlexConfig(TestCase):
                 ),
                 [FlexConfig(128, 64, 3, 8)],
             )
+
+            softcap_gqa_configs = (
+                (64, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 512, 32, FlexConfig(128, 128, 2, 8)),
+                (64, 1024, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (64, 2048, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 3072, 32, FlexConfig(128, 128, 1, 8)),
+                (64, 4096, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 8192, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (128, 768, 32, FlexConfig(128, 128, 2, 8)),
+                (128, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 2048, 32, FlexConfig(128, 128, 2, 8)),
+                (128, 4096, 32, FlexConfig(128, 128, 1, 8)),
+                (256, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 768, 32, FlexConfig(128, 128, 2, 8)),
+                (256, 1024, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (256, 2048, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 4096, 32, FlexConfig(128, 128, 1, 8)),
+            )
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, seq_len, batch_heads, config in softcap_gqa_configs:
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            seq_len,
+                            dtype,
+                            has_tanh_score_mod=True,
+                            batch_heads=batch_heads,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            # Packed rows, not batch size alone, select the wave band.
             self.assertEqual(
                 heuristic.get_flex_attn_fwd_configs(
                     64,
-                    512,
+                    768,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=64,
+                    is_gqa=True,
+                ),
+                [FlexConfig(128, 128, 1, 8)],
+            )
+
+            # Causal softcap retains its separately tuned policy.
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128,
+                    4096,
                     torch.bfloat16,
                     has_tanh_score_mod=True,
                     batch_heads=32,
+                    is_causal=True,
                     is_gqa=True,
                 ),
-                [FlexConfig(128, 128, 3, 4)],
+                [FlexConfig(64, 64, 3, 4)],
             )
 
             self.assertEqual(
