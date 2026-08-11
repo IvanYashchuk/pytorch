@@ -3778,11 +3778,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return self.features.strict_sum_rblock()
 
     def want_no_x_dim(self):
+        # Wide persistent online softmax can only use XBLOCK=1 under the
+        # block-product cap.  Make that static instead of carrying a singleton
+        # X dimension through Triton, which adds register and stack pressure.
+        wide_online_softmax = (
+            self.features.contains_reduction_type("online_softmax_reduce")
+            and V.graph.sizevars.statically_known_gt(
+                self.features.reduction_numel, 32768
+            )
+        )
+        fixed_xblock_one = bool(
+            self.fixed_config and self.fixed_config["XBLOCK"] == 1
+        )
         return (
             self.persistent_reduction
             and len(self.numels) == self.num_reduction_dims + 1
-            and self.fixed_config
-            and self.fixed_config["XBLOCK"] == 1
+            and (wide_online_softmax or fixed_xblock_one)
         )
 
     @property

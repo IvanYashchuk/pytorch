@@ -154,10 +154,18 @@ class TestOnlineSoftmax(TestCase):
         wrapper_code = "\n".join(source_codes)
         self.assertNotIn("async_compile.multi_kernel(", wrapper_code)
 
-    @parametrize("V,expected_loops", [(65536, 0), (65537, 2)])
-    def test_codegen_softmax_persistent_reduction_boundary(self, V, expected_loops):
+    @parametrize(
+        "V,expected_loops,expected_no_x",
+        [(32768, 0, False), (65536, 0, True), (65537, 2, False)],
+    )
+    def test_codegen_softmax_persistent_reduction_boundary(
+        self, V, expected_loops, expected_no_x
+    ):
         wrapper_code = self.get_softmax_wrapper(V, N=2)
         self.assertEqual(wrapper_code.count("for r0_offset in"), expected_loops)
+        if expected_no_x:
+            self.assertIn("XBLOCK: tl.constexpr = 1", wrapper_code)
+            self.assertNotIn("tl.arange(0, XBLOCK)", wrapper_code)
 
     @inductor_config.patch("triton.persistent_reductions", False)
     def test_sdpa(self):
