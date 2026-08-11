@@ -821,7 +821,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             FlexConfig(BLOCK_M, BLOCK_N, num_stages, num_warps)
             for BLOCK_M in [16, 32, 64, 128]
             for BLOCK_N in [32, 64, 128]
-            for num_stages in [1, 3, 4, 5]
+            for num_stages in [1, 2, 3, 4, 5]
             for num_warps in [2, 4, 8]
         ]
 
@@ -1449,6 +1449,10 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
             if config.max_autotune_flex_search_space == "EXHAUSTIVE":
                 return self.exhaustive_flex_attn_fwd_configs
             flex_attn_fwd_configs += self.flex_attn_fwd_autotune_configs
+            if capability == (10, 7):
+                # Rubin softcap/GQA sweeps found this stage-2 rectangular tile
+                # outside the inherited standard search space.
+                flex_attn_fwd_configs.append(FlexConfig(128, 64, 2, 8))
 
         if head_dim <= 256:
             if dtype == torch.float32:
@@ -1465,6 +1469,26 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     (dtype, head_dim), default_config
                 )
                 if (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and has_tanh_score_mod
+                    and is_causal
+                    and head_dim in (64, 128, 256)
+                    and V.graph.sizevars.statically_known_geq(seq_len, 128)
+                    and V.graph.sizevars.statically_known_lt(seq_len, 4096)
+                ):
+                    # Prefix-causal GQA visits a triangular subset of KV blocks.
+                    # Smaller D64/D128 tiles preserve parallelism, while D256
+                    # benefits from a larger tile once the triangle is large.
+                    if head_dim == 256:
+                        if V.graph.sizevars.statically_known_lt(seq_len, 512):
+                            default_config = FlexConfig(64, 32, 3, 4)
+                        else:
+                            default_config = FlexConfig(128, 64, 2, 8)
+                    else:
+                        default_config = FlexConfig(64, 64, 3, 4)
+                elif (
                     capability == (10, 7)
                     and dtype in (torch.bfloat16, torch.float16)
                     and is_gqa
@@ -1751,18 +1775,16 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     default_config = small_config
             elif head_dim == 64 and seq_len_q is not None:
                 if V.graph.sizevars.statically_known_leq(seq_len_q, 128):
-                    if (
-                        batch_heads is not None
-                        and V.graph.sizevars.statically_known_lt(batch_heads, 256)
+                    if batch_heads is not None and V.graph.sizevars.statically_known_lt(
+                        batch_heads, 256
                     ):
                         default_config = symmetric_config
                     else:
                         default_config = small_config
                 elif has_tanh_score_mod:
                     default_config = small_config
-                elif (
-                    batch_heads is not None
-                    and V.graph.sizevars.statically_known_lt(batch_heads, 128)
+                elif batch_heads is not None and V.graph.sizevars.statically_known_lt(
+                    batch_heads, 128
                 ):
                     default_config = symmetric_config
                 else:

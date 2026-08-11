@@ -448,7 +448,7 @@ def create_num_blocks_fake_generator(sparse_indices):
 
 
 def create_causal_num_blocks_fake_generator(*, full: bool, transposed: bool = False):
-    """Create representative block counts for a square causal block mask."""
+    """Create representative block counts for a causal block mask."""
 
     def create_causal_num_blocks_fake(x) -> torch.Tensor:
         size = V.graph.sizevars.optimization_hints(x.get_size())
@@ -468,7 +468,7 @@ def create_causal_num_blocks_fake_generator(*, full: bool, transposed: bool = Fa
 def create_causal_indices_fake_generator(
     *, partial_block: bool, transposed: bool = False
 ):
-    """Create representative block indices for a square causal block mask."""
+    """Create representative block indices for a causal block mask."""
 
     def create_causal_indices_fake(x) -> torch.Tensor:
         size = V.graph.sizevars.optimization_hints(x.get_size())
