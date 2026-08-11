@@ -1254,7 +1254,10 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -1596,7 +1599,10 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         capability = torch.cuda.get_device_capability()
 
@@ -1609,15 +1615,18 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 return self.exhaustive_flex_decode_configs
             flex_decode_configs += self.flex_decode_autotune_configs
 
-        if capability in [(9, 0), (10, 0), (10, 3)]:  # sm_90, sm_100, sm_103
-            if head_dim > 128 and dtype == torch.float32:
-                default_config = FlexDecodeConfig(64, 1, 2)
-            else:
-                default_config = FlexDecodeConfig(64, 3, 2)
-        if capability == (11, 0):
+        if capability == (10, 7) and dtype in (torch.bfloat16, torch.float16):
+            # The one-stage decode default is register/latency limited on
+            # Rubin. A 128-wide tile wins for small packed queries, while a
+            # 64-wide tile avoids excess work as the packed query grows.
+            use_wide_tile = packed_query_width is not None and (
+                V.graph.sizevars.statically_known_lt(packed_query_width, 32)
+            )
+            default_config = FlexDecodeConfig(
+                128 if head_dim <= 128 and use_wide_tile else 64, 3, 2
+            )
+        elif capability == (11, 0):
             default_config = FlexDecodeConfig(16, 1, 2)
-        else:
-            default_config = FlexDecodeConfig(64, 1, 2)
 
         if default_config not in flex_decode_configs:
             flex_decode_configs.append(default_config)
@@ -2035,7 +2044,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -2172,7 +2184,10 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 

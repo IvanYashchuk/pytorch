@@ -47,7 +47,11 @@ from .common import (
     SubgraphResults,
 )
 from .flex_cpu import lower_cpu
-from .flex_decoding import _use_flex_decoding, create_flex_decoding_kernel
+from .flex_decoding import (
+    _prefer_flex_decoding,
+    _use_flex_decoding,
+    create_flex_decoding_kernel,
+)
 from .flex_flash_attention import (
     _use_flex_flash_attention,
     _use_flex_flash_attention_backward,
@@ -327,7 +331,11 @@ def flex_attention(
     can_use_decode = _use_flex_decoding(
         query, kv_indices, value, kernel_options, enable_gqa
     )
-    use_decode = (backend == "TRITON_DECODE") or (backend == "AUTO" and can_use_decode)
+    use_decode = (backend == "TRITON_DECODE") or (
+        backend == "AUTO"
+        and can_use_decode
+        and _prefer_flex_decoding(query, value, enable_gqa)
+    )
 
     if backend == "TRITON_DECODE" and not can_use_decode:
         raise RuntimeError(

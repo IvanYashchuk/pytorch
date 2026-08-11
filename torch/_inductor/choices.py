@@ -191,10 +191,16 @@ class InductorChoices:
         )
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
+        return flex_heuristics.get_flex_decode_configs(
+            head_dim, dtype, packed_query_width
+        )
 
     def append_flex_attention_choices(
         self,
