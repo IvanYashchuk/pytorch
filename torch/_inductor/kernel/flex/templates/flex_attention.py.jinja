@@ -44,18 +44,95 @@
     KV_LEN = {{size("K", 2)}}
 
     MATMUL_PRECISION = Q.dtype.element_ty
+    G: tl.constexpr = GQA_SHARED_HEADS
+    {%- if PACK_GQA_HEADS %}
+    HKV: tl.constexpr = HQ // G
+    tl.static_assert(BLOCK_M == G * QUERY_TILE_M)
 
-    q_start = tl.program_id(0).to(INDEX_DTYPE)
-    off_zq = tl.program_id(1).to(INDEX_DTYPE)
-    off_hq = tl.program_id(2).to(INDEX_DTYPE)
+    flat_program = tl.program_id(0).to(INDEX_DTYPE)
+    full_query_blocks = Q_LEN // BLOCK_M
+    query_tail = Q_LEN % BLOCK_M
+    packed_tail_blocks = tl.cdiv(query_tail, QUERY_TILE_M)
+    prefix_programs = full_query_blocks * ZQ * HQ
+    tail_programs = packed_tail_blocks * ZQ * HKV
 
-    # We support two cases for batch dimension. a) (ZKV == ZQ) where off_zkv = off_zq.
-    # b) (ZKV == 1 and ZQ > 1) where KV is broadcasted along the batch dimension and off_zkv=0.
+    if CAUSAL_LOAD_BALANCE:
+        # The tail is the most expensive causal region. Schedule its packed
+        # CTAs first, followed by ordinary prefix blocks in descending Q order.
+        is_packed_tail = flat_program < tail_programs
+        tail_program = flat_program
+        prefix_program = flat_program - tail_programs
+    else:
+        # Preserve the ordinary prefix-first order outside the specialized
+        # causal load-balancing policy.
+        is_packed_tail = flat_program >= prefix_programs
+        tail_program = flat_program - prefix_programs
+        prefix_program = flat_program
+
+    tail_off_hkv = tail_program % HKV
+    tail_off_zq = (tail_program // HKV) % ZQ
+    tail_q_program = tail_program // (HKV * ZQ)
+    if CAUSAL_LOAD_BALANCE:
+        tail_q_program = packed_tail_blocks - 1 - tail_q_program
+
+    if CAUSAL_LOAD_BALANCE:
+        prefix_off_hq = prefix_program % HQ
+        prefix_off_zq = (prefix_program // HQ) % ZQ
+        prefix_q_program = prefix_program // (HQ * ZQ)
+        prefix_q_program = full_query_blocks - 1 - prefix_q_program
+    else:
+        # Match the legacy 3-D grid's q-fastest linear launch order.
+        prefix_q_program = prefix_program % full_query_blocks
+        prefix_off_zq = (prefix_program // full_query_blocks) % ZQ
+        prefix_off_hq = prefix_program // (full_query_blocks * ZQ)
+
+    if is_packed_tail:
+        off_zq = tail_off_zq
+        off_hkv = tail_off_hkv
+        first_q = full_query_blocks * BLOCK_M + tail_q_program * QUERY_TILE_M
+        off_g = tl.arange(0, G)
+        offs_hq = tl.ravel(
+            tl.broadcast_to(
+                (off_hkv * G + off_g)[:, None], [G, QUERY_TILE_M]
+            )
+        )
+        off_m = first_q + tl.arange(0, QUERY_TILE_M)
+        offs_m = tl.ravel(
+            tl.broadcast_to(off_m[None, :], [G, QUERY_TILE_M])
+        )
+    else:
+        off_zq = prefix_off_zq
+        off_hkv = prefix_off_hq // G
+        first_q = prefix_q_program * BLOCK_M
+        offs_hq = tl.full([BLOCK_M], prefix_off_hq, INDEX_DTYPE)
+        offs_m = first_q + tl.arange(0, BLOCK_M)
+    score_offs_m = tl.where(is_packed_tail, offs_m % Q_LEN, offs_m)
+    sparse_q_idx = first_q // SPARSE_Q_BLOCK_SIZE
+    {%- else %}
+    if CAUSAL_LOAD_BALANCE:
+        flat_program = tl.program_id(0).to(INDEX_DTYPE)
+        off_hq = flat_program % HQ
+        off_zq = (flat_program // HQ) % ZQ
+        q_program = flat_program // (HQ * ZQ)
+        # Prefix-causal block cost grows with the query index. Launch all
+        # heads' expensive blocks first so a partial final wave is cheap.
+        q_start = tl.cdiv(Q_LEN, BLOCK_M) - 1 - q_program
+    else:
+        q_start = tl.program_id(0).to(INDEX_DTYPE)
+        off_zq = tl.program_id(1).to(INDEX_DTYPE)
+        off_hq = tl.program_id(2).to(INDEX_DTYPE)
+    off_hkv = off_hq // G
+    offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
+    sparse_q_idx = q_start // (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+    {%- endif %}
+
+    # KV either matches Q's batch or broadcasts from one batch.
     off_zkv = off_zq % ZKV
-    off_hkv = off_hq // GQA_SHARED_HEADS
-    off_g = off_hq % GQA_SHARED_HEADS
 
-    q_offset = off_zq * stride_qz + off_hq * stride_qh
+    q_offset = off_zq * stride_qz
+    {%- if not PACK_GQA_HEADS %}
+    q_offset += off_hq * stride_qh
+    {%- endif %}
     k_offset = off_zkv * stride_kz + off_hkv * stride_kh
     v_offset = off_zkv * stride_vz + off_hkv * stride_vh
 
@@ -94,9 +171,12 @@
     SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
 
     sparse_idx_z = off_zq % SPARSE_Z
+    {%- if PACK_GQA_HEADS %}
+    sparse_idx_hq = off_hkv % SPARSE_HQ
+    {%- else %}
     sparse_idx_hq = off_hq % SPARSE_HQ
+    {%- endif %}
 
-    SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
     SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
 
     stride_kv_num_blks_h = {{stride("KV_NUM_BLKS", 1)}}
@@ -113,15 +193,13 @@
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, V_HEAD_DIM_ROUNDED], dtype=tl.float32)
 
-    offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
-
     # KV_IDX and KV_NUM_BLKS are always contiguous.
     sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
-    sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
-    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+    sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + sparse_q_idx
+    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + sparse_q_idx * stride_kv_idx_m  # noqa: B950
     {%- if HAS_FULL_BLOCKS %}
-    sparse_full_kv_num_blks_offset = sparse_hz_offset * stride_full_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
-    sparse_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_full_kv_idx_m  # noqa: B950
+    sparse_full_kv_num_blks_offset = sparse_hz_offset * stride_full_kv_num_blks_h + sparse_q_idx
+    sparse_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + sparse_q_idx * stride_full_kv_idx_m  # noqa: B950
     {%- endif %}
 
     {%- if USE_TMA %}
@@ -130,9 +208,33 @@
         [(q_start * BLOCK_M).to(tl.int32), 0],
     )
     {%- else %}
-    offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
-    q = load_checked_2d(Q, offs_m, offs_k, stride_qm, stride_qk, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+    {%- if PACK_GQA_HEADS %}
+    if is_packed_tail:
+        q_ptrs = Q + offs_hq[:, None] * stride_qh + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+        if IS_DIVISIBLE_Q and SAFE_HEAD_DIM:
+            q = tl.load(q_ptrs)
+        elif IS_DIVISIBLE_Q and not SAFE_HEAD_DIM:
+            q = tl.load(
+                q_ptrs, mask=offs_k[None, :] < QK_HEAD_DIM, other=0.0
+            )
+        elif not IS_DIVISIBLE_Q and SAFE_HEAD_DIM:
+            q = tl.load(q_ptrs, mask=offs_m[:, None] < Q_LEN, other=0.0)
+        else:
+            q = tl.load(
+                q_ptrs,
+                mask=(offs_m[:, None] < Q_LEN)
+                & (offs_k[None, :] < QK_HEAD_DIM),
+                other=0.0,
+            )
+    else:
+        # Every prefix program covers one complete physical BLOCK_M tile, so
+        # retain the ordinary contiguous per-head Q load even when the final
+        # packed tail requires query boundary checks.
+        q = load_checked_2d(Q + prefix_off_hq * stride_qh, offs_m, offs_k, stride_qm, stride_qk, True, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+    {%- else %}
+    q = load_checked_2d(Q, offs_m, offs_k, stride_qm, stride_qk, IS_DIVISIBLE_Q, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+    {%- endif %}
     {%- endif %}
 
     # ~~~~~~~~~~~~~~ normal blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -154,13 +256,18 @@
         q, K, V,
         desc_k, desc_v, Q_LEN, KV_LEN,
         acc, l_i, m_i,
-        off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+        off_zq,
+        {%- if PACK_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
+        {%- if PACK_GQA_HEADS %} score_offs_m[:, None], {%- else %} offs_m[:, None], {%- endif %}
+        offs_n[None, :],
         kv_start,
         kv_indices, kv_num_blocks,
         0, block_n_end,
         MATMUL_PRECISION,
         stride_kk, stride_kn, stride_vn, stride_vk,
         IS_FULL_BLOCKS=False,
+        CHECK_Q_BOUNDARY=
+        {%- if PACK_GQA_HEADS %} False, {%- else %} not IS_DIVISIBLE_Q, {%- endif %}
     )
 
     # ~~~~~~~~~~~~~~ "full" blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -180,13 +287,18 @@
             q, K, V,
             desc_k, desc_v, Q_LEN, KV_LEN,
             acc, l_i, m_i,
-            off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+            off_zq,
+            {%- if PACK_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
+            {%- if PACK_GQA_HEADS %} score_offs_m[:, None], {%- else %} offs_m[:, None], {%- endif %}
+            offs_n[None, :],
             kv_start,
             kv_indices, kv_num_blocks,
             0, block_n_end,
             MATMUL_PRECISION,
             stride_kk, stride_kn, stride_vn, stride_vk,
             IS_FULL_BLOCKS=True,
+            CHECK_Q_BOUNDARY=
+            {%- if PACK_GQA_HEADS %} False, {%- else %} not IS_DIVISIBLE_Q, {%- endif %}
         )
 
 
@@ -196,29 +308,53 @@
     l_i = tl.where(l_i == 0.0, 1, l_i)
 
     acc = acc / l_i[:, None]
-    idx_zq = tl.program_id(1).to(INDEX_DTYPE)
-    idx_hq = tl.program_id(2).to(INDEX_DTYPE)
+    tl.static_assert(acc.shape == [BLOCK_M, V_HEAD_DIM_ROUNDED])
+    idx_zq = off_zq
+    {%- if PACK_GQA_HEADS %}
+    idx_hq = offs_hq[:, None].to(INDEX_DTYPE)
+    {%- else %}
+    idx_hq = off_hq
+    {%- endif %}
     idx_m = offs_m[:, None].to(INDEX_DTYPE)
     idx_d = tl.arange(0, V_HEAD_DIM_ROUNDED)[None, :].to(INDEX_DTYPE)
-
+    {%- if PACK_GQA_HEADS %}
+    mask = ((~is_packed_tail) | (idx_m < Q_LEN)) & (idx_d < V_HEAD_DIM)
+    {%- else %}
     mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
-
-    tl.static_assert(acc.shape == [BLOCK_M, V_HEAD_DIM_ROUNDED])
+    {%- endif %}
     {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"))}}
 
     if OUTPUT_LOGSUMEXP:
+        lse = m_i + tl.math.log2(l_i)
+        {%- if PACK_GQA_HEADS %}
+        off_hz = off_zq * HQ + offs_hq
+        l_ptrs = LSE + off_hz * Q_LEN + offs_m
+        if is_packed_tail:
+            tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
+        else:
+            tl.store(l_ptrs, lse)
+        {%- else %}
         off_hz = off_zq * HQ + off_hq
         l_ptrs = LSE + off_hz * Q_LEN + offs_m
-        lse = m_i + tl.math.log2(l_i)
-        if IS_DIVISIBLE:
+        if IS_DIVISIBLE_Q:
             tl.store(l_ptrs, lse)
         else:
             tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
+        {%- endif %}
 
     if OUTPUT_MAX:
+        {%- if PACK_GQA_HEADS %}
+        off_hz = off_zq * HQ + offs_hq
+        max_ptrs = MAX + off_hz * Q_LEN + offs_m
+        if is_packed_tail:
+            tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
+        else:
+            tl.store(max_ptrs, m_i)
+        {%- else %}
         off_hz = off_zq * HQ + off_hq
         max_ptrs = MAX + off_hz * Q_LEN + offs_m
-        if IS_DIVISIBLE:
+        if IS_DIVISIBLE_Q:
             tl.store(max_ptrs, m_i)
         else:
             tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
+        {%- endif %}

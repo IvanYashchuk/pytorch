@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 from unittest import mock
 
+import sympy
 import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.heuristics.registry import (
@@ -21,10 +22,14 @@ from torch._inductor.kernel.flex.common import (
     create_causal_num_blocks_fake_generator,
 )
 from torch._inductor.kernel.flex.flex_attention import (
+    _can_pack_gqa_query_tail,
     _can_use_causal_fwd_autotune_inputs,
+    _fast_tanh_min_rows_per_sm,
     _mask_graph_is_causal,
     _score_graph_is_softcap,
+    _use_causal_load_balance,
     _use_fast_tanh_for_softcap,
+    flex_attention_grid,
 )
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.virtualized import V
@@ -261,7 +266,9 @@ class TestRubinDefaultFlexConfig(TestCase):
         heuristic = CUDAConfigHeuristic()
         candidate = FlexConfig(128, 64, 2, 8)
         sizevars = mock.Mock()
-        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_geq.side_effect = (
+            lambda value, limit: value >= limit
+        )
         sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
         with (
             V.set_graph_handler(mock.Mock(sizevars=sizevars)),
@@ -291,9 +298,13 @@ class TestRubinDefaultFlexConfig(TestCase):
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
     def test_long_tanh_score_mod(self, _mock_capability):
         sizevars = mock.Mock()
-        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_geq.side_effect = (
+            lambda value, limit: value >= limit
+        )
         sizevars.statically_known_gt.side_effect = lambda value, limit: value > limit
-        sizevars.statically_known_leq.side_effect = lambda value, limit: value <= limit
+        sizevars.statically_known_leq.side_effect = (
+            lambda value, limit: value <= limit
+        )
         sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
             heuristic = CUDAConfigHeuristic()
@@ -374,7 +385,7 @@ class TestRubinDefaultFlexConfig(TestCase):
                 heuristic.get_flex_attn_fwd_configs(
                     128, 2048, torch.bfloat16, batch_heads=64
                 ),
-                [FlexConfig(128, 64, 3, 8)],
+                [FlexConfig(128, 128, 2, 8)],
             )
 
     @mock.patch("torch.cuda.get_device_properties")
@@ -384,14 +395,20 @@ class TestRubinDefaultFlexConfig(TestCase):
         sizevars = mock.Mock()
         sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
         sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
+        sizevars.statically_known_leq.side_effect = (
+            lambda value, limit: value <= limit
+        )
+        sizevars.statically_known_gt.side_effect = lambda value, limit: value > limit
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
             heuristic = CUDAConfigHeuristic()
             for dtype in (torch.bfloat16, torch.float16):
                 for seq_len, expected in (
                     (128, FlexConfig(64, 32, 3, 4)),
                     (384, FlexConfig(64, 32, 3, 4)),
+                    (385, FlexConfig(128, 64, 2, 8)),
                     (512, FlexConfig(128, 64, 2, 8)),
                     (2048, FlexConfig(128, 64, 2, 8)),
+                    (4096, FlexConfig(128, 64, 2, 8)),
                 ):
                     self.assertEqual(
                         heuristic.get_flex_attn_fwd_configs(
@@ -418,19 +435,6 @@ class TestRubinDefaultFlexConfig(TestCase):
                         ),
                         [FlexConfig(64, 64, 3, 4)],
                     )
-
-            self.assertEqual(
-                heuristic.get_flex_attn_fwd_configs(
-                    256,
-                    4096,
-                    torch.bfloat16,
-                    has_tanh_score_mod=True,
-                    batch_heads=8,
-                    is_causal=True,
-                    is_gqa=True,
-                ),
-                [FlexConfig(64, 64, 3, 4)],
-            )
 
             short_gqa_configs = {
                 (False, 64): FlexConfig(64, 128, 3, 4),
@@ -509,29 +513,29 @@ class TestRubinDefaultFlexConfig(TestCase):
                     batch_heads=32,
                     is_gqa=True,
                 ),
-                [FlexConfig(128, 64, 3, 8)],
+                [FlexConfig(128, 128, 2, 8)],
             )
 
             softcap_gqa_configs = (
-                (64, 256, 32, FlexConfig(64, 64, 3, 4)),
-                (64, 512, 32, FlexConfig(128, 128, 2, 8)),
+                (64, 256, 32, FlexConfig(64, 128, 3, 4)),
+                (64, 512, 32, FlexConfig(64, 128, 3, 4)),
                 (64, 1024, 32, FlexConfig(64, 64, 3, 4)),
-                (64, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (64, 1536, 32, FlexConfig(128, 64, 3, 8)),
                 (64, 2048, 32, FlexConfig(64, 64, 3, 4)),
-                (64, 3072, 32, FlexConfig(128, 128, 1, 8)),
-                (64, 4096, 32, FlexConfig(64, 64, 3, 4)),
-                (64, 8192, 32, FlexConfig(128, 128, 1, 8)),
-                (128, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 3072, 32, FlexConfig(128, 64, 2, 8)),
+                (64, 4096, 32, FlexConfig(128, 64, 2, 8)),
+                (64, 8192, 32, FlexConfig(128, 64, 2, 8)),
+                (128, 256, 32, FlexConfig(64, 128, 3, 4)),
                 (128, 768, 32, FlexConfig(128, 128, 2, 8)),
-                (128, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 1536, 32, FlexConfig(128, 128, 2, 8)),
                 (128, 2048, 32, FlexConfig(128, 128, 2, 8)),
-                (128, 4096, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 4096, 32, FlexConfig(128, 128, 2, 8)),
                 (256, 256, 32, FlexConfig(64, 64, 3, 4)),
-                (256, 768, 32, FlexConfig(128, 128, 2, 8)),
-                (256, 1024, 32, FlexConfig(64, 64, 3, 4)),
-                (256, 1536, 32, FlexConfig(128, 128, 1, 8)),
-                (256, 2048, 32, FlexConfig(64, 64, 3, 4)),
-                (256, 4096, 32, FlexConfig(128, 128, 1, 8)),
+                (256, 768, 32, FlexConfig(128, 64, 2, 8)),
+                (256, 1024, 32, FlexConfig(128, 64, 2, 8)),
+                (256, 1536, 32, FlexConfig(128, 64, 2, 8)),
+                (256, 2048, 32, FlexConfig(128, 64, 2, 8)),
+                (256, 4096, 32, FlexConfig(128, 64, 2, 8)),
             )
             for dtype in (torch.bfloat16, torch.float16):
                 for head_dim, seq_len, batch_heads, config in softcap_gqa_configs:
@@ -543,6 +547,7 @@ class TestRubinDefaultFlexConfig(TestCase):
                             has_tanh_score_mod=True,
                             batch_heads=batch_heads,
                             is_gqa=True,
+                            is_dense=True,
                         ),
                         [config],
                     )
@@ -556,8 +561,9 @@ class TestRubinDefaultFlexConfig(TestCase):
                     has_tanh_score_mod=True,
                     batch_heads=64,
                     is_gqa=True,
+                    is_dense=True,
                 ),
-                [FlexConfig(128, 128, 1, 8)],
+                [FlexConfig(128, 64, 3, 8)],
             )
 
             # Causal softcap retains its separately tuned policy.
@@ -582,11 +588,17 @@ class TestRubinDefaultFlexConfig(TestCase):
                     has_tanh_score_mod=True,
                     batch_heads=32,
                 ),
-                [FlexConfig(128, 128, 3, 4)],
+                [FlexConfig(128, 64, 3, 4)],
             )
 
     @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
     def test_rubin_backward_configs(self, _mock_capability):
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_gt.side_effect = lambda value, limit: value > limit
+        sizevars.statically_known_leq.side_effect = lambda value, limit: value <= limit
+        sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
+        self.enterContext(V.set_graph_handler(mock.Mock(sizevars=sizevars)))
         heuristic = CUDAConfigHeuristic()
         transcendental_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
         for dtype in (torch.bfloat16, torch.float16):
@@ -710,8 +722,268 @@ class TestRubinDefaultFlexConfig(TestCase):
                     [small_config],
                 )
 
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 3))
+    def test_dense_softcap_config_does_not_change_blackwell(self, _mock_capability):
+        heuristic = CUDAConfigHeuristic()
+        expected = {
+            64: FlexConfig(128, 64, 3, 4),
+            128: FlexConfig(128, 128, 2, 8),
+            256: FlexConfig(64, 32, 3, 4),
+        }
+        for dtype in (torch.bfloat16, torch.float16):
+            for head_dim, config in expected.items():
+                self.assertEqual(
+                    heuristic.get_flex_attn_fwd_configs(
+                        head_dim,
+                        512,
+                        dtype,
+                        has_tanh_score_mod=True,
+                        batch_heads=32,
+                        is_gqa=True,
+                        is_dense=True,
+                    ),
+                    [config],
+                )
+
 
 class TestFlexAttentionAutotuneInputs(TestCase):
+    def test_causal_gqa_head_packing_static_tail_gate(self):
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.side_effect = lambda expr: expr is sympy.true
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            for q_len in (769, 800, 1665):
+                self.assertTrue(_can_pack_gqa_query_tail(q_len, 32, 128, 32, 212))
+            for q_len in (
+                1,
+                31,
+                32,
+                127,
+                128,
+                129,
+                160,
+                161,
+                672,
+                768,
+                801,
+                832,
+                896,
+                897,
+                1025,
+            ):
+                self.assertFalse(_can_pack_gqa_query_tail(q_len, 32, 128, 32, 212))
+
+            # The packed grid must remove a complete logical SM wave. Moving
+            # the mocked SM count moves the gate, while exact equality stays
+            # on the ordinary path.
+            self.assertFalse(_can_pack_gqa_query_tail(6657, 4, 128, 32, 212))
+            self.assertTrue(_can_pack_gqa_query_tail(769, 32, 128, 32, 223))
+            self.assertFalse(_can_pack_gqa_query_tail(769, 32, 128, 32, 224))
+
+            dynamic_q = sympy.Symbol("dynamic_q", integer=True, positive=True)
+            dynamic_heads = sympy.Symbol("dynamic_heads", integer=True, positive=True)
+            self.assertFalse(_can_pack_gqa_query_tail(dynamic_q, 32, 128, 32, 212))
+            self.assertFalse(
+                _can_pack_gqa_query_tail(769, dynamic_heads, 128, 32, 212)
+            )
+
+    def test_causal_mask_classifier_rejects_constant_output(self):
+        graph = torch.fx.Graph()
+        for name in ("b", "h", "q", "kv"):
+            graph.placeholder(name)
+        graph.output(True)
+        self.assertFalse(_mask_graph_is_causal(torch.fx.GraphModule({}, graph)))
+
+    def test_causal_gqa_head_packing_grid(self):
+        packed_meta = {
+            "BLOCK_M": 128,
+            "QUERY_TILE_M": 32,
+            "PACK_GQA_HEADS": True,
+            "GQA_SHARED_HEADS": 4,
+        }
+        expected_programs = {
+            129: 40,
+            160: 40,
+            769: 200,
+            800: 200,
+            897: 232,
+            1025: 264,
+        }
+        for q_len, programs in expected_programs.items():
+            self.assertEqual(
+                flex_attention_grid(1, 32, q_len, 256, packed_meta),
+                (programs, 1, 1),
+            )
+            self.assertEqual(
+                flex_attention_grid(
+                    1,
+                    32,
+                    q_len,
+                    256,
+                    {**packed_meta, "CAUSAL_LOAD_BALANCE": True},
+                ),
+                (programs, 1, 1),
+            )
+
+        # Shapes outside the static 1..32 tail gate retain the exact ordinary
+        # grid. Causal load balancing still flattens that legacy work.
+        ordinary_meta = {"BLOCK_M": 128, "PACK_GQA_HEADS": False}
+        for q_len, query_blocks in (
+            (31, 1),
+            (128, 1),
+            (161, 2),
+            (768, 6),
+            (831, 7),
+            (832, 7),
+            (833, 7),
+            (895, 7),
+            (896, 7),
+        ):
+            self.assertEqual(
+                flex_attention_grid(1, 32, q_len, 256, ordinary_meta),
+                (query_blocks, 1, 32),
+            )
+            self.assertEqual(
+                flex_attention_grid(
+                    1,
+                    32,
+                    q_len,
+                    256,
+                    {**ordinary_meta, "CAUSAL_LOAD_BALANCE": True},
+                ),
+                (query_blocks * 32, 1, 1),
+            )
+
+    def test_causal_load_balanced_grid(self):
+        self.assertEqual(
+            flex_attention_grid(
+                2,
+                32,
+                769,
+                256,
+                {"BLOCK_M": 128, "CAUSAL_LOAD_BALANCE": True},
+            ),
+            (448, 1, 1),
+        )
+        self.assertEqual(
+            flex_attention_grid(
+                2,
+                32,
+                769,
+                256,
+                {"BLOCK_M": 128, "CAUSAL_LOAD_BALANCE": False},
+            ),
+            (7, 2, 32),
+        )
+
+    def test_rubin_fast_tanh_thresholds(self):
+        for head_dim in (64, 128, 256):
+            self.assertIsNone(
+                _fast_tanh_min_rows_per_sm(
+                    head_dim, dense_attention=True, causal_prefix_attention=False
+                )
+            )
+
+        self.assertEqual(
+            _fast_tanh_min_rows_per_sm(
+                64, dense_attention=False, causal_prefix_attention=True
+            ),
+            128,
+        )
+        self.assertEqual(
+            _fast_tanh_min_rows_per_sm(
+                128, dense_attention=False, causal_prefix_attention=True
+            ),
+            64,
+        )
+        self.assertEqual(
+            _fast_tanh_min_rows_per_sm(
+                256, dense_attention=False, causal_prefix_attention=True
+            ),
+            58,
+        )
+
+        self.assertEqual(
+            _fast_tanh_min_rows_per_sm(
+                128, dense_attention=False, causal_prefix_attention=False
+            ),
+            128,
+        )
+        self.assertEqual(
+            _fast_tanh_min_rows_per_sm(
+                256, dense_attention=False, causal_prefix_attention=False
+            ),
+            96,
+        )
+
+    def test_rubin_causal_load_balance_scope(self):
+        graph = torch.fx.Graph()
+        placeholders = [graph.placeholder(f"arg{index}") for index in range(5)]
+        divided = graph.call_function(
+            torch.ops.aten.div.Tensor, (placeholders[0], 20.0)
+        )
+        tanh = graph.call_function(torch.ops.aten.tanh.default, (divided,))
+        graph.output(graph.call_function(torch.ops.aten.mul.Tensor, (tanh, 20.0)))
+        softcap_graph = torch.fx.GraphModule({}, graph)
+
+        with mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(10, 7)
+        ):
+            self.assertTrue(
+                _use_causal_load_balance(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    256,
+                    True,
+                )
+            )
+            for dtype, head_dim, is_causal in (
+                (torch.float32, 256, True),
+                (torch.bfloat16, 128, True),
+                (torch.bfloat16, 256, False),
+            ):
+                self.assertFalse(
+                    _use_causal_load_balance(
+                        softcap_graph,
+                        dtype,
+                        torch.device("cuda"),
+                        head_dim,
+                        is_causal,
+                    )
+                )
+
+            arbitrary_graph = torch.fx.Graph()
+            arbitrary = [
+                arbitrary_graph.placeholder(f"arg{index}") for index in range(5)
+            ]
+            arbitrary_graph.output(
+                arbitrary_graph.call_function(
+                    torch.ops.aten.tanh.default, (arbitrary[0],)
+                )
+            )
+            self.assertFalse(
+                _use_causal_load_balance(
+                    torch.fx.GraphModule({}, arbitrary_graph),
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    256,
+                    True,
+                )
+            )
+
+        with mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(10, 3)
+        ):
+            self.assertFalse(
+                _use_causal_load_balance(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    256,
+                    True,
+                )
+            )
+
     def test_causal_block_mask_generators(self):
         sizevars = mock.Mock()
         sizevars.optimization_hints.side_effect = lambda value: value
@@ -857,6 +1129,17 @@ class TestFlexAttentionAutotuneInputs(TestCase):
                     512,
                     32,
                     64,
+                )
+            )
+            self.assertTrue(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    128,
+                    32,
+                    None,
                 )
             )
             self.assertFalse(

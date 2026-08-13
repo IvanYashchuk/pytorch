@@ -24,10 +24,12 @@ import torch
 import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._inductor import config, metrics
+from torch._inductor.choices import InductorChoices
 from torch._inductor.exc import InductorError
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.nn.attention import SDPBackend
 from torch.nn.attention.experimental._paged_attention import PagedAttention
 from torch.nn.attention.flex_attention import (
@@ -2956,48 +2958,403 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @dtypesIfCUDA(*device_configs["cuda"].dtypes_fast)
     @dtypesIfXPU(*device_configs["xpu"].dtypes_fast)
     @skip_on_cpu
-    @skip_on_mps  # asserts Triton "IS_DIVISIBLE : tl.constexpr" in generated code
+    @skip_on_mps  # asserts Triton divisibility constexprs in generated code
     def test_dynamic_divisibility_guards(self, device, dtype):
-        """Test guards for divisible/non-divisible shape transitions"""
+        """Test independent Q/KV guards across divisible shape transitions."""
         if device == "cpu" and dtype is torch.float16:
             dtype = torch.float32
 
         def score_mod(qk, b, h, q, kv):
             return torch.where(q >= kv, qk, -float("inf"))
 
-        def test_shape(S, backend):
+        def test_shape(q_len, kv_len, backend, kernel_options=None, expected=None):
             """Test a single shape configuration"""
-            block_mask = create_block_mask(noop_mask, 1, 1, S, S, device=device)
-            sdpa_partial = create_attention(score_mod, block_mask=block_mask)
-
-            tensors = [
-                torch.randn(
-                    2, 4, S, 64, dtype=dtype, device=device, requires_grad=False
-                )
-                for _ in range(3)
-            ]
-
-            compiled_sdpa = torch.compile(sdpa_partial, backend=backend)
-            out, code = run_and_get_code(compiled_sdpa, *tensors)
-
-            # Check divisibility flag
-            is_divisible = S % 128 == 0
-            expected_flag = f"IS_DIVISIBLE : tl.constexpr = {is_divisible}"
-            self.assertIn(
-                expected_flag,
-                str(code),
-                lambda msg: f"{msg}\nS={S} should have {expected_flag}",
+            block_mask = create_block_mask(
+                noop_mask, 1, 1, q_len, kv_len, device=device
+            )
+            sdpa_partial = create_attention(
+                score_mod, block_mask=block_mask, kernel_options=kernel_options
             )
 
-            self.assertEqual(out.shape, (2, 4, S, 64))
+            q = torch.randn(
+                2, 4, q_len, 64, dtype=dtype, device=device, requires_grad=False
+            )
+            k, v = (
+                torch.randn(
+                    2,
+                    4,
+                    kv_len,
+                    64,
+                    dtype=dtype,
+                    device=device,
+                    requires_grad=False,
+                )
+                for _ in range(2)
+            )
+
+            compiled_sdpa = torch.compile(sdpa_partial, backend=backend)
+            out, code = run_and_get_code(compiled_sdpa, q, k, v)
+
+            for axis, seq_len in (("Q", q_len), ("KV", kv_len)):
+                is_divisible = (
+                    expected[axis] if expected is not None else seq_len % 128 == 0
+                )
+                expected_flag = (
+                    f"IS_DIVISIBLE_{axis} : tl.constexpr = {is_divisible}"
+                )
+                self.assertIn(
+                    expected_flag,
+                    str(code),
+                    lambda msg: (
+                        f"{msg}\nq_len={q_len}, kv_len={kv_len} should have "
+                        f"{expected_flag}"
+                    ),
+                )
+
+            self.assertEqual(out.shape, (2, 4, q_len, 64))
             return out, code
 
         torch._dynamo.reset()
         backend = CompileCounterWithBackend("inductor")
 
-        # Test divisible and non-divisible shapes
-        test_shapes = [256, 255, 383, 384]
-        _ = [test_shape(S, backend) for S in test_shapes]
+        # Cover the four combinations so a tail on one axis cannot silently
+        # force the other onto its checked-load path.
+        test_shapes = [(256, 256), (255, 256), (256, 255), (383, 383)]
+        _ = [test_shape(q_len, kv_len, backend) for q_len, kv_len in test_shapes]
+
+        # Divisibility is specialized after selecting the kernel config. Q832
+        # is a full set of 64-row tiles even though it is not divisible by the
+        # sparse block size or by a 128-row candidate.
+        test_shape(
+            832,
+            4096,
+            backend,
+            {
+                "fwd_BLOCK_M": 64,
+                "fwd_BLOCK_N": 64,
+                "fwd_num_stages": 2,
+                "fwd_num_warps": 4,
+            },
+            {"Q": True, "KV": True},
+        )
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps  # asserts Triton packing constexprs in generated code
+    def test_causal_gqa_head_packing_static_aux(self, device):
+        """Pack four causal GQA heads while preserving per-head score indices."""
+
+        if (
+            torch.device(device).type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 7)
+        ):
+            self.skipTest("Requires Rubin GQA head packing")
+
+        dtype = torch.float16
+        batch_q, batch_kv = 2, 1
+        query_heads, kv_heads = 32, 8
+        kv_len, head_dim = 385, 64
+        query_len = 385
+        query_bias = torch.randn(
+            query_heads, query_len, device=device, dtype=dtype
+        ) / 16
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        def score_mod(score, b, h, q, kv):
+            return score + query_bias[h, q]
+
+        def attention(query, key, value, block_mask):
+            return flex_attention(
+                query,
+                key,
+                value,
+                score_mod=score_mod,
+                block_mask=block_mask,
+                enable_gqa=True,
+                return_aux=AuxRequest(lse=True, max_scores=True),
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 4,
+                    # The packed Q mapping must override this request.
+                    "USE_TMA": True,
+                },
+            )
+
+        compiled_attention = torch.compile(attention, fullgraph=True)
+        key = torch.randn(
+            batch_kv,
+            kv_heads,
+            kv_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        value = torch.randn_like(key)
+
+        query = torch.randn(
+            batch_q,
+            query_heads,
+            query_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        # H=1 is the broadcast sparse-metadata contract required by the
+        # packed traversal. Q has two batches while KV has one, exercising
+        # the independent KV batch-broadcast path.
+        block_mask = create_block_mask(
+            causal_mask,
+            B=batch_q,
+            H=1,
+            Q_LEN=query_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+        expected_out, expected_aux = attention(query, key, value, block_mask)
+        (actual_out, actual_aux), code = run_and_get_code(
+            compiled_attention, query, key, value, block_mask
+        )
+        source = "\n".join(code)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = True", source)
+        self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
+        self.assertIn("BLOCK_M : tl.constexpr = 128", source)
+        self.assertIn("USE_TMA : tl.constexpr = False", source)
+
+        # Identical causal metadata materialized with SPARSE_HQ=2 forces the
+        # ordinary head grid, providing an exact kernel-to-kernel oracle.
+        fallback_block_mask = create_block_mask(
+            causal_mask,
+            B=batch_q,
+            H=2,
+            Q_LEN=query_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+        fallback_out, fallback_aux = compiled_attention(
+            query, key, value, fallback_block_mask
+        )
+        self.assertTrue(torch.equal(actual_out, fallback_out))
+        self.assertTrue(torch.equal(actual_aux.lse, fallback_aux.lse))
+        self.assertTrue(torch.equal(actual_aux.max_scores, fallback_aux.max_scores))
+
+        torch.testing.assert_close(actual_out, expected_out, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            actual_aux.lse, expected_aux.lse, atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual_aux.max_scores,
+            expected_aux.max_scores,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps  # asserts Triton packing constexprs in generated code
+    def test_causal_gqa_head_packing_dynamic_fallback(self, device):
+        """Unknown dynamic Q retains the ordinary per-head kernel."""
+
+        if (
+            torch.device(device).type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 7)
+        ):
+            self.skipTest("Requires Rubin GQA head packing")
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        def attention(query, key, value, block_mask):
+            return flex_attention(
+                query,
+                key,
+                value,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={"BACKEND": "TRITON", "BLOCK_M": 128},
+            )
+
+        compiled_attention = torch.compile(attention, fullgraph=True, dynamic=True)
+        key = torch.randn(1, 2, 161, 64, device=device, dtype=torch.float16)
+        value = torch.randn_like(key)
+        for query_len in (129, 160):
+            query = torch.randn(
+                1, 8, query_len, 64, device=device, dtype=torch.float16
+            )
+            block_mask = create_block_mask(
+                causal_mask, 1, 1, query_len, 161, device=device
+            )
+            actual, code = run_and_get_code(
+                compiled_attention, query, key, value, block_mask
+            )
+            self.assertIn(
+                "PACK_GQA_HEADS : tl.constexpr = False", "\n".join(code)
+            )
+            expected = attention(query, key, value, block_mask)
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps  # asserts Triton packing constexprs in generated code
+    def test_causal_gqa_head_packing_sparse_head_fallback(self, device):
+        """Head-specific BlockMask metadata retains the ordinary head grid."""
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        query = torch.randn(1, 8, 128, 64, device=device, dtype=torch.float16)
+        key = torch.randn(1, 2, 161, 64, device=device, dtype=torch.float16)
+        value = torch.randn_like(key)
+        block_mask = create_block_mask(
+            causal_mask,
+            B=1,
+            H=2,
+            Q_LEN=128,
+            KV_LEN=161,
+            device=device,
+        )
+
+        def attention(query, key, value):
+            return flex_attention(
+                query,
+                key,
+                value,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 4,
+                },
+            )
+
+        expected = attention(query, key, value)
+        actual, code = run_and_get_code(
+            torch.compile(attention, fullgraph=True), query, key, value
+        )
+        source = "\n".join(code)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
+        self.assertIn("QUERY_TILE_M : tl.constexpr = 128", source)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps  # exercises Rubin packed causal load balancing
+    def test_causal_gqa_head_packing_load_balanced_aux(self, device):
+        """Exercise reverse query scheduling with a packed query tail."""
+
+        if (
+            torch.device(device).type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 7)
+        ):
+            self.skipTest("Requires Rubin GQA head packing")
+
+        query_len, kv_len = 769, 769
+        query_heads, kv_heads, head_dim = 32, 8, 256
+        dtype = torch.bfloat16
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        def softcap(score, b, h, q, kv):
+            return 20.0 * torch.tanh(score / 20.0)
+
+        query = torch.randn(
+            1, query_heads, query_len, head_dim, device=device, dtype=dtype
+        )
+        key = torch.randn(1, kv_heads, kv_len, head_dim, device=device, dtype=dtype)
+        value = torch.randn_like(key)
+
+        def run(block_mask):
+            return flex_attention(
+                query,
+                key,
+                value,
+                score_mod=softcap,
+                block_mask=block_mask,
+                enable_gqa=True,
+                return_aux=AuxRequest(lse=True, max_scores=True),
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 4,
+                },
+            )
+
+        packed_mask = create_block_mask(
+            causal_mask, 1, 1, query_len, kv_len, device=device
+        )
+        fallback_mask = create_block_mask(
+            causal_mask, 1, 2, query_len, kv_len, device=device
+        )
+        compiled_run = torch.compile(run, fullgraph=True)
+        (packed_out, packed_aux), code = run_and_get_code(compiled_run, packed_mask)
+        (fallback_out, fallback_aux), fallback_code = run_and_get_code(
+            compiled_run, fallback_mask
+        )
+        source = "\n".join(code)
+        fallback_source = "\n".join(fallback_code)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = True", source)
+        self.assertIn("CAUSAL_LOAD_BALANCE : tl.constexpr = True", source)
+        self.assertEqual(source.count("def forward_inner("), 1)
+        self.assertEqual(source.count("acc, l_i, m_i = forward_inner("), 2)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", fallback_source)
+        self.assertIn("CAUSAL_LOAD_BALANCE : tl.constexpr = True", fallback_source)
+        self.assertTrue(torch.equal(packed_out, fallback_out))
+        self.assertTrue(torch.equal(packed_aux.lse, fallback_aux.lse))
+        self.assertTrue(
+            torch.equal(packed_aux.max_scores, fallback_aux.max_scores)
+        )
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    def test_legacy_divisibility_metadata_for_backend_choices(self, device):
+        """Backend extension hooks retain the pre-split conservative flag."""
+
+        class CaptureFlexOptions(InductorChoices):
+            def __init__(self):
+                super().__init__()
+                self.seen = []
+
+            def append_flex_attention_choices(
+                self,
+                choices,
+                configs,
+                input_nodes,
+                subgraphs,
+                layout,
+                kernel_options,
+                sparse_q_block_size,
+                sparse_kv_block_size,
+            ):
+                self.seen.append(dict(kernel_options))
+                return choices
+
+        choices = CaptureFlexOptions()
+        q = torch.randn(1, 1, 255, 64, device=device, dtype=torch.float16)
+        k = torch.randn(1, 1, 256, 64, device=device, dtype=torch.float16)
+        v = torch.randn_like(k)
+        with V.set_choices_handler(choices):
+            torch.compile(
+                functools.partial(
+                    flex_attention, kernel_options={"BACKEND": "TRITON"}
+                ),
+                fullgraph=True,
+            )(q, k, v)
+
+        self.assertEqual(len(choices.seen), 1)
+        self.assertFalse(choices.seen[0]["IS_DIVISIBLE"])
+        self.assertNotIn("IS_DIVISIBLE_Q", choices.seen[0])
+        self.assertNotIn("IS_DIVISIBLE_KV", choices.seen[0])
 
     @supported_platform
     @skip_on_cpu
@@ -5500,7 +5857,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
-    @skip_on_mps  # exercises the Triton IS_DIVISIBLE sparse-block guard
+    @skip_on_mps  # exercises the Triton per-axis divisibility guards
     def test_sparse_block_not_dividing_seqlen(self, device):
         """Sparse blocks that overhang a 128-divisible seq len must not be
         walked unmasked past KV_LEN (silent OOB corruption)."""
@@ -5718,6 +6075,26 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         self.run_test_with_call(
             attention, Q_S=Q_S, KV_S=KV_S, dtype=torch.bfloat16, device=device
+        )
+
+    @supported_platform
+    def test_independent_q_kv_divisibility_with_captured_buffers(self, device):
+        q_len = 255
+        kv_len = 256
+        offset_q = torch.randn(q_len, device=device, dtype=torch.bfloat16)
+        offset_kv = torch.randn(kv_len, device=device, dtype=torch.bfloat16)
+
+        def score_mod(score, b, h, q, kv):
+            return score + offset_q[q] + offset_kv[kv]
+
+        attention = functools.partial(flex_attention, score_mod=score_mod)
+
+        self.run_test_with_call(
+            attention,
+            Q_S=q_len,
+            KV_S=kv_len,
+            dtype=torch.bfloat16,
+            device=device,
         )
 
     @supported_platform

@@ -15,7 +15,7 @@ import sympy
 import torch
 from torch._inductor.virtualized import V
 from torch.nn.attention.flex_attention import _Backend
-from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import CeilDiv, FloorDiv
 
 from ...ir import ComputedBuffer, ExternKernel, FixedLayout, TensorBox
 from ...lowering import empty, empty_strided, lowerings, register_lowering, to_dtype
@@ -31,6 +31,7 @@ from .common import (
     _flex_kernel_tuning_options,
     build_subgraph_buffer,
     can_skip_boundary_checks,
+    can_skip_query_boundary_checks,
     create_causal_indices_fake_generator,
     create_causal_num_blocks_fake_generator,
     create_indices_fake,
@@ -140,7 +141,7 @@ def _use_fast_tanh_for_softcap(
     head_dim: int,
     seq_len_q: Expr,
     batch_heads: Expr,
-    min_rows_per_sm: int,
+    min_rows_per_sm: int | None,
 ) -> bool:
     if (
         device.type != "cuda"
@@ -150,9 +151,44 @@ def _use_fast_tanh_for_softcap(
     ):
         return False
 
+    if min_rows_per_sm is None:
+        return True
+
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     return V.graph.sizevars.statically_known_geq(
         batch_heads * seq_len_q, sm_count * min_rows_per_sm
+    )
+
+
+def _fast_tanh_min_rows_per_sm(
+    head_dim: int, dense_attention: bool, causal_prefix_attention: bool
+) -> int | None:
+    if dense_attention:
+        return None
+    if causal_prefix_attention:
+        # Paired Rubin sweeps found the first exact-tanh cliff above 58 rows/SM
+        # for D256. D64 and D128 use their independently measured later gates.
+        if head_dim == 256:
+            return 58
+        if head_dim == 128:
+            return 64
+    return 96 if head_dim >= 256 else 128
+
+
+def _use_causal_load_balance(
+    graph_module,
+    dtype,
+    device,
+    head_dim: int,
+    causal_prefix_attention: bool,
+) -> bool:
+    return (
+        causal_prefix_attention
+        and device.type == "cuda"
+        and dtype in (torch.float16, torch.bfloat16)
+        and head_dim == 256
+        and torch.cuda.get_device_capability(device) == (10, 7)
+        and _score_graph_is_softcap(graph_module)
     )
 
 
@@ -181,7 +217,8 @@ def _mask_graph_is_causal(graph_module) -> bool:
         return False
     output = outputs[0].args[0]
     return (
-        output.op == "call_function"
+        isinstance(output, torch.fx.Node)
+        and output.op == "call_function"
         and output.target in (operator.ge, torch.ops.aten.ge.Tensor)
         and output.args == (placeholders[2], placeholders[3])
     )
@@ -259,7 +296,53 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
     Each block is responsible for iterating over blocks of keys and values calculating
     the final attention output.
     """
-    return (cdiv(num_queries, meta["BLOCK_M"]), batch_size, q_heads)
+    if meta.get("PACK_GQA_HEADS", False):
+        # Full BLOCK_M query blocks keep the ordinary per-head mapping. Only
+        # the final partial block is split into QUERY_TILE_M rows and packed
+        # across the G query heads which share one KV head.
+        full_query_blocks = num_queries // meta["BLOCK_M"]
+        query_tail = num_queries % meta["BLOCK_M"]
+        packed_tail_blocks = cdiv(query_tail, meta["QUERY_TILE_M"])
+        kv_heads = q_heads // meta["GQA_SHARED_HEADS"]
+        programs = (
+            full_query_blocks * batch_size * q_heads
+            + packed_tail_blocks * batch_size * kv_heads
+        )
+        return (programs, 1, 1)
+
+    num_query_blocks = cdiv(num_queries, meta["BLOCK_M"])
+    if meta.get("CAUSAL_LOAD_BALANCE", False):
+        # Flatten the grid so the template can group all heads of each causal
+        # query block. This keeps expensive late-query blocks out of a partial
+        # final hardware wave.
+        return (num_query_blocks * batch_size * q_heads, 1, 1)
+    return (num_query_blocks, batch_size, q_heads)
+
+
+def _can_pack_gqa_query_tail(
+    seq_len_q: Expr,
+    batch_heads: Expr,
+    block_m: int,
+    query_tile_m: int,
+    sm_count: int,
+):
+    """True for a static small tail only when packing removes an SM wave."""
+    tail = sympy.Mod(seq_len_q, block_m)
+    ordinary_ctas = CeilDiv(seq_len_q, block_m) * batch_heads
+    packed_ctas = (
+        FloorDiv(seq_len_q, block_m) * batch_heads
+        + CeilDiv(tail, query_tile_m) * FloorDiv(batch_heads, 4)
+    )
+    return V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Ge(tail, 1),
+            sympy.Le(tail, query_tile_m),
+            sympy.Gt(
+                CeilDiv(ordinary_ctas, sm_count),
+                CeilDiv(packed_ctas, sm_count),
+            ),
+        )
+    )
 
 
 def get_float32_precision():
@@ -517,12 +600,14 @@ def flex_attention(
 
     B = Bq
 
+    # Preserve the conservative legacy metadata for backend-specific choice
+    # appenders. Triton forward specializes the two axes independently below,
+    # after each candidate's BLOCK_M/BLOCK_N are known.
     seq_q_divisible = can_skip_boundary_checks(seq_len_q, SPARSE_Q_BLOCK_SIZE)
     seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, SPARSE_KV_BLOCK_SIZE)
-    if seq_q_divisible and seq_kv_divisible:
-        kernel_options.setdefault("IS_DIVISIBLE", True)
-    else:
-        kernel_options.setdefault("IS_DIVISIBLE", False)
+    kernel_options.setdefault(
+        "IS_DIVISIBLE", seq_q_divisible and seq_kv_divisible
+    )
 
     # NB it is okay that the v_head_dim is different
     # We are using these to match fill order of the output.
@@ -555,7 +640,10 @@ def flex_attention(
 
     # Determine GQA broadcast factor.
     gqa_shared_heads = FloorDiv(Hq, Hkv)
-    kernel_options.setdefault("GQA_SHARED_HEADS", gqa_shared_heads)
+    # This is derived from the actual Q/KV shapes. A stale or user-provided
+    # value would make the packed grid, address mapping, and physical row shape
+    # disagree, so do not treat it as a tunable option.
+    kernel_options["GQA_SHARED_HEADS"] = gqa_shared_heads
 
     # Inside of Triton kernel, only apply partial masking if partial blocks are computed.
     # full_kv_num_blocks is None if partial blocks are not computed
@@ -580,6 +668,40 @@ def flex_attention(
         SPARSE_Q_BLOCK_SIZE,
         SPARSE_KV_BLOCK_SIZE,
     )
+    # Pack the four query heads which share one KV head into the physical
+    # 128-row MMA tile. Restrict the first implementation to exact causal masks
+    # with head-broadcast BlockMask metadata, so every packed head has the same
+    # partial/full sparse traversal.
+    pack_gqa_heads_candidate = (
+        query.get_device().type == "cuda"
+        and not torch.version.hip
+        and torch.cuda.get_device_capability(query.get_device()) == (10, 7)
+        and _mask_graph_is_causal(mask_graph.graph_module)
+        and V.graph.sizevars.statically_known_equals(gqa_shared_heads, 4)
+        and V.graph.sizevars.statically_known_equals(
+            kv_num_blocks.get_size()[1], 1
+        )
+    )
+    kernel_options.setdefault(
+        "CAUSAL_LOAD_BALANCE",
+        _use_causal_load_balance(
+            subgraph.graph_module,
+            dtype,
+            query.get_device(),
+            head_dim,
+            causal_prefix_attention,
+        ),
+    )
+    dense_attention = (
+        not has_full_blocks
+        and is_trivial_mask_graph(mask_graph.graph_module)
+        and V.graph.sizevars.statically_known_equals(
+            SPARSE_Q_BLOCK_SIZE, 1 << 30
+        )
+        and V.graph.sizevars.statically_known_equals(
+            SPARSE_KV_BLOCK_SIZE, 1 << 30
+        )
+    )
     if _use_fast_tanh_for_softcap(
         subgraph.graph_module,
         dtype,
@@ -587,7 +709,9 @@ def flex_attention(
         head_dim,
         seq_len_q,
         batch_heads,
-        96 if head_dim >= 256 else 128,
+        _fast_tanh_min_rows_per_sm(
+            head_dim, dense_attention, causal_prefix_attention
+        ),
     ):
         kernel_options.setdefault("USE_FAST_TANH", True)
     configs: list[FlexConfig] = V.choices.get_flex_attention_fwd_configs(
@@ -599,6 +723,7 @@ def flex_attention(
         batch_heads=batch_heads,
         is_causal=causal_prefix_attention,
         is_gqa=V.graph.sizevars.statically_known_gt(gqa_shared_heads, 1),
+        is_dense=dense_attention,
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
@@ -652,11 +777,59 @@ def flex_attention(
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
+        sm_count = (
+            torch.cuda.get_device_properties(query.get_device()).multi_processor_count
+            if pack_gqa_heads_candidate
+            else 0
+        )
+        pack_gqa_heads = (
+            pack_gqa_heads_candidate
+            and cur_kernel_options["BLOCK_M"] == 128
+            and SPARSE_Q_BLOCK_SIZE % cur_kernel_options["BLOCK_M"] == 0
+            and _can_pack_gqa_query_tail(
+                seq_len_q,
+                batch_heads,
+                cur_kernel_options["BLOCK_M"],
+                32,
+                sm_count,
+            )
+        )
+        # This is a derived safety property rather than a user tuning option.
+        # Overwrite any forwarded value so an unsafe BlockMask cannot force the
+        # packed traversal.
+        cur_kernel_options["PACK_GQA_HEADS"] = pack_gqa_heads
+        if pack_gqa_heads:
+            # The static-equality proof above establishes this literal. Keep
+            # the grid and Triton constexpr independent of symbolic head
+            # expressions after specializing the packed candidate.
+            cur_kernel_options["GQA_SHARED_HEADS"] = 4
+        cur_kernel_options["QUERY_TILE_M"] = (
+            cur_kernel_options["BLOCK_M"] // 4
+            if pack_gqa_heads
+            else cur_kernel_options["BLOCK_M"]
+        )
+        if pack_gqa_heads:
+            # Packed Q addresses span the head and sequence dimensions and
+            # cannot be represented by the current rank-2 Q descriptor.
+            cur_kernel_options["USE_TMA"] = False
+        cur_kernel_options.setdefault(
+            "IS_DIVISIBLE_Q",
+            can_skip_query_boundary_checks(
+                seq_len_q, cur_kernel_options["QUERY_TILE_M"]
+            ),
+        )
+        cur_kernel_options.setdefault(
+            "IS_DIVISIBLE_KV",
+            can_skip_boundary_checks(
+                seq_len_kv, SPARSE_KV_BLOCK_SIZE, cur_kernel_options["BLOCK_N"]
+            ),
+        )
 
         if (
             cur_kernel_options["SPARSE_KV_BLOCK_SIZE"] % cur_kernel_options["BLOCK_N"]
             != 0
-            or cur_kernel_options["SPARSE_Q_BLOCK_SIZE"] % cur_kernel_options["BLOCK_M"]
+            or cur_kernel_options["SPARSE_Q_BLOCK_SIZE"]
+            % cur_kernel_options["BLOCK_M"]
             != 0
         ):
             invalid_block_options = cur_kernel_options
