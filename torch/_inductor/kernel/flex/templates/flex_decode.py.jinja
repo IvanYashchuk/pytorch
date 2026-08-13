@@ -175,6 +175,7 @@
         MATMUL_PRECISION,
         stride_kk, stride_kn, stride_vn, stride_vk,
         IS_FULL_BLOCKS=False,
+        CHECK_Q_BOUNDARY=not SAFE_M_BOUNDARY,
     )
 
 
@@ -210,6 +211,7 @@
             MATMUL_PRECISION,
             stride_kk, stride_kn, stride_vn, stride_vk,
             IS_FULL_BLOCKS=True,
+            CHECK_Q_BOUNDARY=not SAFE_M_BOUNDARY,
         )
 
     m_offset = off_t * stride_mt + off_z * stride_mz

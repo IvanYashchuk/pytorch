@@ -50,21 +50,33 @@ from ...utils import load_template
 SubgraphResults = list[ComputedBuffer | None] | ComputedBuffer | None
 
 
-def can_skip_boundary_checks(seq_len, sparse_block_size) -> bool:
+def can_skip_boundary_checks(seq_len, sparse_block_size, tile_size=128) -> bool:
     """True when per-tile bounds masking can be skipped along this dim.
 
-    This is decided before a config is chosen, so divisibility is checked
-    against 128, the max (and LCM) of all candidate pow2 tile sizes for
-    inner block_m/n.
+    ``tile_size`` defaults to 128 for call sites which decide before selecting
+    a kernel config. FlexAttention forward passes the selected BLOCK_M/BLOCK_N
+    so each autotuning choice gets the least conservative safe specialization.
     """
     return V.graph.sizevars.statically_known_true(
         sympy.And(
-            sympy.Eq(Mod(seq_len, 128), 0),
+            sympy.Eq(Mod(seq_len, tile_size), 0),
             sympy.Or(
                 sympy.Eq(Mod(seq_len, sparse_block_size), 0),
                 sympy.Ge(sparse_block_size, seq_len),
             ),
         )
+    )
+
+
+def can_skip_query_boundary_checks(seq_len, tile_size) -> bool:
+    """True when every selected query tile is in bounds.
+
+    Unlike the KV traversal, query tiles are launched directly from Q_LEN and
+    cannot walk the padded tail of a sparse block. Consequently this only
+    depends on the selected BLOCK_M, not SPARSE_Q_BLOCK_SIZE.
+    """
+    return V.graph.sizevars.statically_known_true(
+        sympy.Eq(Mod(seq_len, tile_size), 0)
     )
 
 

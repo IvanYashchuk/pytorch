@@ -15,7 +15,7 @@ def forward_block_mn(
     MATMUL_PRECISION, RCP_LN2,
     # Strides for K and V
     stride_kk, stride_kn, stride_vn, stride_vk,
-    IS_FULL_BLOCKS, CHECK_BLOCK_BOUNDARY=False,
+    IS_FULL_BLOCKS, CHECK_Q_BOUNDARY=False, CHECK_KV_BOUNDARY=False,
 
 ):
     # Redefines all kernel parameters (BLOCK_M, etc.) so we don't need to plumb them all through
@@ -34,7 +34,7 @@ def forward_block_mn(
     # Load K as [BLOCK_N, QK_HEAD_DIM_ROUNDED] then transpose to [QK_HEAD_DIM_ROUNDED, BLOCK_N]
     offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
     offs_n_load = kv_base_offset + tl.arange(0, BLOCK_N)
-    k = load_checked_2d(K, offs_n_load, offs_k, stride_kn, stride_kk, IS_DIVISIBLE, SAFE_HEAD_DIM, KV_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+    k = load_checked_2d(K, offs_n_load, offs_k, stride_kn, stride_kk, IS_DIVISIBLE_KV, SAFE_HEAD_DIM, KV_LEN, QK_HEAD_DIM, INDEX_DTYPE)
     {%- endif %}
 
     k = tl.trans(k)
@@ -47,8 +47,8 @@ def forward_block_mn(
     # If this is the last block of a non divisible seqlen, we still need to load [BLOCK_M, BLOCK_N] elements,
     # which is larger than the actual number of elements. To avoid access memory out of bound,
     # we need to mask out the elements that are out of Q_LEN & KV_LEN.
-    m = get_bounded_indices(offs_m, Q_LEN if CHECK_BLOCK_BOUNDARY else None)
-    n = get_bounded_indices(offs_n, KV_LEN if CHECK_BLOCK_BOUNDARY else None)
+    m = get_bounded_indices(offs_m, Q_LEN if CHECK_Q_BOUNDARY else None)
+    n = get_bounded_indices(offs_n, KV_LEN if CHECK_KV_BOUNDARY else None)
 
     {{ modification(
         subgraph_number=0,
@@ -72,7 +72,7 @@ def forward_block_mn(
         }
     ) | indent_except_first(1) }}
 
-    if CHECK_BLOCK_BOUNDARY:
+    if CHECK_KV_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
         post_mod_scores = tl.where(offs_n < KV_LEN, post_mod_scores, float("-inf"))
 
@@ -98,7 +98,7 @@ def forward_block_mn(
             }
         ) | indent_except_first(2) }}
 
-        if CHECK_BLOCK_BOUNDARY:
+        if CHECK_KV_BOUNDARY:
             mask_mod_output = tl.where(offs_n < KV_LEN, mask_mod_output, False)
         # apply mask for partially unmasked blocks
         post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
@@ -132,7 +132,7 @@ def forward_block_mn(
     {%- else %}
     # Calculate offsets for V loading - reuse kv_base_offset from K loading
     offs_v = tl.arange(0, V_HEAD_DIM_ROUNDED)
-    v = load_checked_2d(V, offs_n_load, offs_v, stride_vn, stride_vk, IS_DIVISIBLE, SAFE_HEAD_DIM, KV_LEN, V_HEAD_DIM, INDEX_DTYPE)
+    v = load_checked_2d(V, offs_n_load, offs_v, stride_vn, stride_vk, IS_DIVISIBLE_KV, SAFE_HEAD_DIM, KV_LEN, V_HEAD_DIM, INDEX_DTYPE)
     {%- endif %}
     acc = tl.dot(p.to(MATMUL_PRECISION), v.to(q.dtype), acc, input_precision=FLOAT32_PRECISION)
 
@@ -160,7 +160,7 @@ def forward_inner(
     MATMUL_PRECISION,
     # Strides for K and V
     stride_kk, stride_kn, stride_vn, stride_vk,
-    IS_FULL_BLOCKS,
+    IS_FULL_BLOCKS, CHECK_Q_BOUNDARY: tl.constexpr,
 ):
     # Redefines all kernel parameters (BLOCK_M, etc.) so we don't need to plumb them all through
     {{gen_defines() | indent_except_first(1)}}
@@ -175,43 +175,27 @@ def forward_inner(
 
     # loop over k, v and update accumulator until block_n_end
     for start_n in range(block_n_start, block_n_end):
-        # Here IS_DIVISIBLE acts are the start_n = tl.multiple_of(start_n, BLOCK_N) from triton_fused_attention.
-        if IS_DIVISIBLE:
-            acc, l_i, m_i = forward_block_mn(
-                {{gen_argdefs()}},
-                q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
-                # accumulated values
-                acc, l_i, m_i,
-                # Offsets
-                off_z, off_h, offs_m, offs_n,
-                # Offsets needed for TMA loads
-                kv_start,
-                kv_offset,
-                MATMUL_PRECISION, RCP_LN2,
-                # Strides for K and V
-                stride_kk, stride_kn, stride_vn, stride_vk,
-                IS_FULL_BLOCKS,
-            )
-        else:
-            # Benchmark shows even we applied mod & mask to each block for non divisible seqlen,
-            # it's on par or slightly faster than only applying to the last block in fwd.
-            # However, we choose different strategy for bwd, where we only apply mod & mask
-            # to the last block because it's faster a lot.
-            acc, l_i, m_i = forward_block_mn(
-                {{gen_argdefs()}},
-                q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
-                # accumulated values
-                acc, l_i, m_i,
-                # Offsets
-                off_z, off_h, offs_m, offs_n,
-                # Offsets needed for TMA loads
-                kv_start,
-                kv_offset,
-                MATMUL_PRECISION, RCP_LN2,
-                # Strides for K and V
-                stride_kk, stride_kn, stride_vn, stride_vk,
-                IS_FULL_BLOCKS, CHECK_BLOCK_BOUNDARY=True,
-            )
+        # A query tail still needs bounded score/mask-mod indices, but must not
+        # force the divisible KV axis onto masked K/V loads and KV predicates.
+        # Both expressions are constexprs, so each candidate retains one fully
+        # specialized inner implementation without duplicating the call site.
+        acc, l_i, m_i = forward_block_mn(
+            {{gen_argdefs()}},
+            q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
+            # accumulated values
+            acc, l_i, m_i,
+            # Offsets
+            off_z, off_h, offs_m, offs_n,
+            # Offsets needed for TMA loads
+            kv_start,
+            kv_offset,
+            MATMUL_PRECISION, RCP_LN2,
+            # Strides for K and V
+            stride_kk, stride_kn, stride_vn, stride_vk,
+            IS_FULL_BLOCKS,
+            CHECK_Q_BOUNDARY=CHECK_Q_BOUNDARY,
+            CHECK_KV_BOUNDARY=not IS_DIVISIBLE_KV,
+        )
 
 
 

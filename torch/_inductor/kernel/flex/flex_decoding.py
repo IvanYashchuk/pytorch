@@ -253,10 +253,13 @@ def create_flex_decoding_kernel(*args, **kwargs):
 
     seq_q_divisible = can_skip_boundary_checks(seq_len_q, SPARSE_Q_BLOCK_SIZE)
     seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, SPARSE_KV_BLOCK_SIZE)
-    if seq_q_divisible and seq_kv_divisible:
-        kernel_options.setdefault("IS_DIVISIBLE", True)
-    else:
-        kernel_options.setdefault("IS_DIVISIBLE", False)
+    is_divisible = seq_q_divisible and seq_kv_divisible
+    # FlexDecoding shares the forward inner template but retains its existing
+    # conservative combined decision until its packed-query and split-KV
+    # traversals are audited independently.
+    kernel_options.setdefault("IS_DIVISIBLE", is_divisible)
+    kernel_options.setdefault("IS_DIVISIBLE_Q", is_divisible)
+    kernel_options.setdefault("IS_DIVISIBLE_KV", is_divisible)
 
     # Calculate GQA head sharing
     gqa_shared_heads = FloorDiv(Hq, Hkv)
