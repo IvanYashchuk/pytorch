@@ -168,6 +168,7 @@ class InductorChoices:
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
         is_gqa: bool = False,
+        is_dense: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_fwd_configs(
@@ -178,6 +179,7 @@ class InductorChoices:
             batch_heads,
             is_causal,
             is_gqa,
+            is_dense,
         )
 
     def get_flex_attention_bwd_configs(

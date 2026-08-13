@@ -22,6 +22,7 @@ from torch._inductor.kernel.flex.common import (
     create_causal_num_blocks_fake_generator,
 )
 from torch._inductor.kernel.flex.flex_attention import (
+    _can_pack_all_gqa_heads,
     _can_pack_gqa_query_tail,
     _can_use_causal_fwd_autotune_inputs,
     _fast_tanh_min_rows_per_sm,
@@ -747,6 +748,20 @@ class TestRubinDefaultFlexConfig(TestCase):
 
 
 class TestFlexAttentionAutotuneInputs(TestCase):
+    def test_causal_gqa_full_head_packing_gate(self):
+        sizevars = mock.Mock()
+        sizevars.statically_known_true.side_effect = lambda expr: expr is sympy.true
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            for q_len in (1025, 1028, 1032):
+                self.assertTrue(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
+            for q_len in (1024, 1033, 1040, 1056, 1057, 1088, 897, 1665):
+                self.assertFalse(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
+            self.assertFalse(_can_pack_all_gqa_heads(1025, 64, 128, 32, 212))
+            self.assertFalse(_can_pack_all_gqa_heads(1025, 32, 128, 32, 216))
+
+            dynamic_q = sympy.Symbol("dynamic_q", integer=True, positive=True)
+            self.assertFalse(_can_pack_all_gqa_heads(dynamic_q, 32, 128, 32, 212))
+
     def test_causal_gqa_head_packing_static_tail_gate(self):
         sizevars = mock.Mock()
         sizevars.statically_known_true.side_effect = lambda expr: expr is sympy.true
@@ -823,6 +838,26 @@ class TestFlexAttentionAutotuneInputs(TestCase):
                 ),
                 (programs, 1, 1),
             )
+
+        full_meta = {
+            "BLOCK_M": 128,
+            "QUERY_TILE_M": 32,
+            "PACK_ALL_GQA_HEADS": True,
+            "GQA_SHARED_HEADS": 4,
+        }
+        self.assertEqual(
+            flex_attention_grid(1, 32, 1025, 256, full_meta), (33, 1, 8)
+        )
+        self.assertEqual(
+            flex_attention_grid(
+                1,
+                32,
+                1025,
+                256,
+                {**full_meta, "CAUSAL_LOAD_BALANCE": True},
+            ),
+            (264, 1, 1),
+        )
 
         # Shapes outside the static 1..32 tail gate retain the exact ordinary
         # grid. Causal load balancing still flattens that legacy work.

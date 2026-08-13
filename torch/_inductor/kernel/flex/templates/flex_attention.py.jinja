@@ -45,7 +45,29 @@
 
     MATMUL_PRECISION = Q.dtype.element_ty
     G: tl.constexpr = GQA_SHARED_HEADS
-    {%- if PACK_GQA_HEADS %}
+    {%- if PACK_ALL_GQA_HEADS %}
+    HKV: tl.constexpr = HQ // G
+    tl.static_assert(BLOCK_M == G * QUERY_TILE_M)
+
+    if CAUSAL_LOAD_BALANCE:
+        flat_program = tl.program_id(0).to(INDEX_DTYPE)
+        off_hkv = flat_program % HKV
+        off_zq = (flat_program // HKV) % ZQ
+        q_program = flat_program // (HKV * ZQ)
+        q_start = tl.cdiv(Q_LEN, QUERY_TILE_M) - 1 - q_program
+    else:
+        q_start = tl.program_id(0).to(INDEX_DTYPE)
+        off_zq = tl.program_id(1).to(INDEX_DTYPE)
+        off_hkv = tl.program_id(2).to(INDEX_DTYPE)
+    first_q = q_start * QUERY_TILE_M
+    off_g = tl.arange(0, G)
+    offs_hq = tl.ravel(
+        tl.broadcast_to((off_hkv * G + off_g)[:, None], [G, QUERY_TILE_M])
+    )
+    off_m = first_q + tl.arange(0, QUERY_TILE_M)
+    offs_m = tl.ravel(tl.broadcast_to(off_m[None, :], [G, QUERY_TILE_M]))
+    sparse_q_idx = q_start // (SPARSE_Q_BLOCK_SIZE // QUERY_TILE_M)
+    {%- elif PACK_GQA_HEADS %}
     HKV: tl.constexpr = HQ // G
     tl.static_assert(BLOCK_M == G * QUERY_TILE_M)
 
@@ -130,7 +152,7 @@
     off_zkv = off_zq % ZKV
 
     q_offset = off_zq * stride_qz
-    {%- if not PACK_GQA_HEADS %}
+    {%- if not PACK_GQA_HEADS and not PACK_ALL_GQA_HEADS %}
     q_offset += off_hq * stride_qh
     {%- endif %}
     k_offset = off_zkv * stride_kz + off_hkv * stride_kh
@@ -171,7 +193,7 @@
     SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
 
     sparse_idx_z = off_zq % SPARSE_Z
-    {%- if PACK_GQA_HEADS %}
+    {%- if PACK_GQA_HEADS or PACK_ALL_GQA_HEADS %}
     sparse_idx_hq = off_hkv % SPARSE_HQ
     {%- else %}
     sparse_idx_hq = off_hq % SPARSE_HQ
@@ -209,7 +231,21 @@
     )
     {%- else %}
     offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
-    {%- if PACK_GQA_HEADS %}
+    {%- if PACK_ALL_GQA_HEADS %}
+    q_ptrs = Q + offs_hq[:, None] * stride_qh + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
+    if IS_DIVISIBLE_Q and SAFE_HEAD_DIM:
+        q = tl.load(q_ptrs)
+    elif IS_DIVISIBLE_Q and not SAFE_HEAD_DIM:
+        q = tl.load(q_ptrs, mask=offs_k[None, :] < QK_HEAD_DIM, other=0.0)
+    elif not IS_DIVISIBLE_Q and SAFE_HEAD_DIM:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < Q_LEN, other=0.0)
+    else:
+        q = tl.load(
+            q_ptrs,
+            mask=(offs_m[:, None] < Q_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+            other=0.0,
+        )
+    {%- elif PACK_GQA_HEADS %}
     if is_packed_tail:
         q_ptrs = Q + offs_hq[:, None] * stride_qh + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
         if IS_DIVISIBLE_Q and SAFE_HEAD_DIM:
@@ -257,7 +293,7 @@
         desc_k, desc_v, Q_LEN, KV_LEN,
         acc, l_i, m_i,
         off_zq,
-        {%- if PACK_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
+        {%- if PACK_GQA_HEADS or PACK_ALL_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
         {%- if PACK_GQA_HEADS %} score_offs_m[:, None], {%- else %} offs_m[:, None], {%- endif %}
         offs_n[None, :],
         kv_start,
@@ -288,7 +324,7 @@
             desc_k, desc_v, Q_LEN, KV_LEN,
             acc, l_i, m_i,
             off_zq,
-            {%- if PACK_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
+            {%- if PACK_GQA_HEADS or PACK_ALL_GQA_HEADS %} offs_hq[:, None], {%- else %} off_hq, {%- endif %}
             {%- if PACK_GQA_HEADS %} score_offs_m[:, None], {%- else %} offs_m[:, None], {%- endif %}
             offs_n[None, :],
             kv_start,
@@ -310,7 +346,7 @@
     acc = acc / l_i[:, None]
     tl.static_assert(acc.shape == [BLOCK_M, V_HEAD_DIM_ROUNDED])
     idx_zq = off_zq
-    {%- if PACK_GQA_HEADS %}
+    {%- if PACK_GQA_HEADS or PACK_ALL_GQA_HEADS %}
     idx_hq = offs_hq[:, None].to(INDEX_DTYPE)
     {%- else %}
     idx_hq = off_hq
@@ -333,6 +369,13 @@
             tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
         else:
             tl.store(l_ptrs, lse)
+        {%- elif PACK_ALL_GQA_HEADS %}
+        off_hz = off_zq * HQ + offs_hq
+        l_ptrs = LSE + off_hz * Q_LEN + offs_m
+        if IS_DIVISIBLE_Q:
+            tl.store(l_ptrs, lse)
+        else:
+            tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
         {%- else %}
         off_hz = off_zq * HQ + off_hq
         l_ptrs = LSE + off_hz * Q_LEN + offs_m
@@ -350,6 +393,13 @@
             tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
         else:
             tl.store(max_ptrs, m_i)
+        {%- elif PACK_ALL_GQA_HEADS %}
+        off_hz = off_zq * HQ + offs_hq
+        max_ptrs = MAX + off_hz * Q_LEN + offs_m
+        if IS_DIVISIBLE_Q:
+            tl.store(max_ptrs, m_i)
+        else:
+            tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
         {%- else %}
         off_hz = off_zq * HQ + off_hq
         max_ptrs = MAX + off_hz * Q_LEN + offs_m

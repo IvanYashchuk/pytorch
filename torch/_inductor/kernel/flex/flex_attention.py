@@ -296,6 +296,16 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
     Each block is responsible for iterating over blocks of keys and values calculating
     the final attention output.
     """
+    if meta.get("PACK_ALL_GQA_HEADS", False):
+        # Every physical BLOCK_M tile packs G logical query heads by
+        # QUERY_TILE_M rows. This branch-free mapping is useful when the
+        # hybrid prefix/tail cubin removes CTAs but not an SM wave.
+        query_blocks = cdiv(num_queries, meta["QUERY_TILE_M"])
+        kv_heads = q_heads // meta["GQA_SHARED_HEADS"]
+        if meta.get("CAUSAL_LOAD_BALANCE", False):
+            return (query_blocks * batch_size * kv_heads, 1, 1)
+        return (query_blocks, batch_size, kv_heads)
+
     if meta.get("PACK_GQA_HEADS", False):
         # Full BLOCK_M query blocks keep the ordinary per-head mapping. Only
         # the final partial block is split into QUERY_TILE_M rows and packed
@@ -341,6 +351,34 @@ def _can_pack_gqa_query_tail(
                 CeilDiv(ordinary_ctas, sm_count),
                 CeilDiv(packed_ctas, sm_count),
             ),
+        )
+    )
+
+
+def _can_pack_all_gqa_heads(
+    seq_len_q: Expr,
+    batch_heads: Expr,
+    block_m: int,
+    query_tile_m: int,
+    sm_count: int,
+):
+    """True for the measured branch-free second-wave cliff window."""
+    tail = sympy.Mod(seq_len_q, block_m)
+    ordinary_ctas = CeilDiv(seq_len_q, block_m) * batch_heads
+    packed_ctas = CeilDiv(seq_len_q, query_tile_m) * FloorDiv(batch_heads, 4)
+    ordinary_waves = CeilDiv(ordinary_ctas, sm_count)
+    packed_waves = CeilDiv(packed_ctas, sm_count)
+    packed_last_wave = packed_ctas - (packed_waves - 1) * sm_count
+    removed_ctas = ordinary_ctas - packed_ctas
+    return V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Eq(sm_count, 212),
+            sympy.Eq(batch_heads, 32),
+            sympy.Eq(FloorDiv(seq_len_q, block_m), 8),
+            sympy.Ge(tail, 1),
+            sympy.Le(tail, 8),
+            sympy.Eq(ordinary_waves, packed_waves),
+            sympy.Ge(packed_last_wave, removed_ctas),
         )
     )
 
@@ -682,16 +720,14 @@ def flex_attention(
             kv_num_blocks.get_size()[1], 1
         )
     )
-    kernel_options.setdefault(
-        "CAUSAL_LOAD_BALANCE",
-        _use_causal_load_balance(
-            subgraph.graph_module,
-            dtype,
-            query.get_device(),
-            head_dim,
-            causal_prefix_attention,
-        ),
+    causal_load_balance_candidate = _use_causal_load_balance(
+        subgraph.graph_module,
+        dtype,
+        query.get_device(),
+        head_dim,
+        causal_prefix_attention,
     )
+    kernel_options.setdefault("CAUSAL_LOAD_BALANCE", causal_load_balance_candidate)
     dense_attention = (
         not has_full_blocks
         and is_trivial_mask_graph(mask_graph.graph_module)
@@ -794,21 +830,40 @@ def flex_attention(
                 sm_count,
             )
         )
+        pack_all_gqa_heads = (
+            pack_gqa_heads_candidate
+            and not pack_gqa_heads
+            and causal_load_balance_candidate
+            and cur_kernel_options["CAUSAL_LOAD_BALANCE"]
+            and V.graph.sizevars.statically_known_equals(query.get_size()[0], 1)
+            and V.graph.sizevars.statically_known_equals(Hq, 32)
+            and V.graph.sizevars.statically_known_equals(seq_len_kv, 4096)
+            and cur_kernel_options["BLOCK_M"] == 128
+            and SPARSE_Q_BLOCK_SIZE % 32 == 0
+            and _can_pack_all_gqa_heads(
+                seq_len_q,
+                batch_heads,
+                cur_kernel_options["BLOCK_M"],
+                32,
+                sm_count,
+            )
+        )
         # This is a derived safety property rather than a user tuning option.
         # Overwrite any forwarded value so an unsafe BlockMask cannot force the
         # packed traversal.
         cur_kernel_options["PACK_GQA_HEADS"] = pack_gqa_heads
-        if pack_gqa_heads:
+        cur_kernel_options["PACK_ALL_GQA_HEADS"] = pack_all_gqa_heads
+        if pack_gqa_heads or pack_all_gqa_heads:
             # The static-equality proof above establishes this literal. Keep
             # the grid and Triton constexpr independent of symbolic head
             # expressions after specializing the packed candidate.
             cur_kernel_options["GQA_SHARED_HEADS"] = 4
         cur_kernel_options["QUERY_TILE_M"] = (
             cur_kernel_options["BLOCK_M"] // 4
-            if pack_gqa_heads
+            if pack_gqa_heads or pack_all_gqa_heads
             else cur_kernel_options["BLOCK_M"]
         )
-        if pack_gqa_heads:
+        if pack_gqa_heads or pack_all_gqa_heads:
             # Packed Q addresses span the head and sequence dimensions and
             # cannot be represented by the current rank-2 Q descriptor.
             cur_kernel_options["USE_TMA"] = False

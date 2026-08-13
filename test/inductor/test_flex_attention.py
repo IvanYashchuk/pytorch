@@ -3316,6 +3316,107 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
+    @skip_on_mps  # exercises Rubin branch-free full-head packing
+    def test_causal_gqa_full_head_packing_load_balanced_aux(self, device):
+        """Pack every forward CTA only inside the measured second-wave window."""
+
+        if (
+            torch.device(device).type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 7)
+        ):
+            self.skipTest("Requires Rubin GQA full-head packing")
+
+        query_len, kv_len = 1025, 4096
+        query_heads, kv_heads, head_dim = 32, 8, 256
+        dtype = torch.bfloat16
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        def softcap(score, b, h, q, kv):
+            return 20.0 * torch.tanh(score / 20.0)
+
+        query = torch.randn(
+            1, query_heads, query_len, head_dim, device=device, dtype=dtype
+        )
+        key = torch.randn(1, kv_heads, kv_len, head_dim, device=device, dtype=dtype)
+        value = torch.randn_like(key)
+
+        def run(block_mask):
+            return flex_attention(
+                query,
+                key,
+                value,
+                score_mod=softcap,
+                block_mask=block_mask,
+                enable_gqa=True,
+                return_aux=AuxRequest(lse=True, max_scores=True),
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 8,
+                },
+            )
+
+        packed_mask = create_block_mask(
+            causal_mask, 1, 1, query_len, kv_len, device=device
+        )
+        fallback_mask = create_block_mask(
+            causal_mask, 1, 2, query_len, kv_len, device=device
+        )
+        compiled_run = torch.compile(run, fullgraph=True)
+        (packed_out, packed_aux), code = run_and_get_code(compiled_run, packed_mask)
+        (fallback_out, fallback_aux), fallback_code = run_and_get_code(
+            compiled_run, fallback_mask
+        )
+        source = "\n".join(code)
+        fallback_source = "\n".join(fallback_code)
+        self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = True", source)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
+        self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
+        self.assertIn("USE_TMA : tl.constexpr = False", source)
+        self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", fallback_source)
+        self.assertTrue(torch.equal(packed_out, fallback_out))
+        self.assertTrue(torch.equal(packed_aux.lse, fallback_aux.lse))
+        self.assertTrue(torch.equal(packed_aux.max_scores, fallback_aux.max_scores))
+
+        # Profitability is established only for the measured KV4096 loop
+        # count. A shorter KV extent must retain the ordinary mapping.
+        short_key = key[:, :, :1025]
+        short_value = value[:, :, :1025]
+        short_mask = create_block_mask(
+            causal_mask, 1, 1, query_len, 1025, device=device
+        )
+
+        def run_short(block_mask):
+            return flex_attention(
+                query,
+                short_key,
+                short_value,
+                score_mod=softcap,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 8,
+                    "CAUSAL_LOAD_BALANCE": True,
+                },
+            )
+
+        _, short_code = run_and_get_code(
+            torch.compile(run_short, fullgraph=True), short_mask
+        )
+        self.assertIn(
+            "PACK_ALL_GQA_HEADS : tl.constexpr = False", "\n".join(short_code)
+        )
+
+    @supported_platform
+    @skip_on_cpu
     @skip_on_mps
     def test_legacy_divisibility_metadata_for_backend_choices(self, device):
         """Backend extension hooks retain the pre-split conservative flag."""

@@ -1213,6 +1213,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
         is_gqa: bool = False,
+        is_dense: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1441,6 +1442,7 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
         is_gqa: bool = False,
+        is_dense: bool = False,
     ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
@@ -1476,13 +1478,14 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     and is_causal
                     and head_dim in (64, 128, 256)
                     and V.graph.sizevars.statically_known_geq(seq_len, 128)
-                    and V.graph.sizevars.statically_known_lt(seq_len, 4096)
+                    and V.graph.sizevars.statically_known_leq(seq_len, 4096)
                 ):
                     # Prefix-causal GQA visits a triangular subset of KV blocks.
-                    # Smaller D64/D128 tiles preserve parallelism, while D256
-                    # benefits from a larger tile once the triangle is large.
+                    # Smaller D64/D128 tiles preserve parallelism. With Rubin
+                    # hardware tanh, D256's two-stage rectangular tile wins as
+                    # soon as the first exact-tanh cliff appears above Q384.
                     if head_dim == 256:
-                        if V.graph.sizevars.statically_known_lt(seq_len, 512):
+                        if V.graph.sizevars.statically_known_leq(seq_len, 384):
                             default_config = FlexConfig(64, 32, 3, 4)
                         else:
                             default_config = FlexConfig(128, 64, 2, 8)
@@ -1493,44 +1496,37 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                     and dtype in (torch.bfloat16, torch.float16)
                     and is_gqa
                     and has_tanh_score_mod
-                    and not is_causal
+                    and is_dense
                     and head_dim in (64, 128, 256)
                     and batch_heads is not None
                     and V.graph.sizevars.statically_known_geq(seq_len, 128)
                 ):
-                    # Dense GQA softcap is sensitive to the number of packed
-                    # query CTAs available per Rubin SM. Scale the measured
-                    # wave bands with the runtime SM count so that batch/head
-                    # parallelism and query length follow the same policy.
+                    # Hardware tanh changes the dense-softcap tile balance.
+                    # Scale the measured bands with runtime SM count so batch,
+                    # heads, and query length share one compact policy.
                     sm_count = torch.cuda.get_device_properties(
                         "cuda"
                     ).multi_processor_count
                     packed_query_rows = batch_heads * seq_len
                     small = FlexConfig(64, 64, 3, 4)
+                    wide = FlexConfig(64, 128, 3, 4)
+                    rectangular = FlexConfig(128, 64, 3, 8)
+                    rectangular_two_stage = FlexConfig(128, 64, 2, 8)
                     large_two_stage = FlexConfig(128, 128, 2, 8)
-                    large_one_stage = FlexConfig(128, 128, 1, 8)
                     wave_bands = {
                         64: (
-                            (40, small),
-                            (120, large_two_stage),
+                            (120, wide),
                             (160, small),
-                            (240, large_one_stage),
+                            (240, rectangular),
                             (320, small),
-                            (480, large_one_stage),
-                            (800, small),
                         ),
                         128: (
-                            (40, small),
+                            (40, wide),
                             (120, large_two_stage),
-                            (240, large_one_stage),
-                            (320, large_two_stage),
+                            (160, small),
                         ),
                         256: (
                             (40, small),
-                            (120, large_two_stage),
-                            (160, small),
-                            (240, large_one_stage),
-                            (320, small),
                         ),
                     }[head_dim]
                     for max_rows_per_sm, candidate in wave_bands:
@@ -1544,7 +1540,11 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                         if V.graph.sizevars.statically_known_gt(
                             packed_query_rows, sm_count * last_max_rows_per_sm
                         ):
-                            default_config = large_one_stage
+                            default_config = (
+                                large_two_stage
+                                if head_dim == 128
+                                else rectangular_two_stage
+                            )
                 elif (
                     capability == (10, 7)
                     and dtype in (torch.bfloat16, torch.float16)
@@ -2154,6 +2154,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
         is_gqa: bool = False,
+        is_dense: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -2335,6 +2336,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         batch_heads: sympy.Expr | None = None,
         is_causal: bool = False,
         is_gqa: bool = False,
+        is_dense: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
