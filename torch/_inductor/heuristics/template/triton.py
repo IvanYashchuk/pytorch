@@ -821,7 +821,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             FlexConfig(BLOCK_M, BLOCK_N, num_stages, num_warps)
             for BLOCK_M in [16, 32, 64, 128]
             for BLOCK_N in [32, 64, 128]
-            for num_stages in [1, 3, 4, 5]
+            for num_stages in [1, 2, 3, 4, 5]
             for num_warps in [2, 4, 8]
         ]
 
@@ -1205,7 +1205,14 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
     # Flex attn helpers
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1231,7 +1238,14 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1248,7 +1262,10 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -1416,7 +1433,14 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         ]
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
@@ -1425,6 +1449,10 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
             if config.max_autotune_flex_search_space == "EXHAUSTIVE":
                 return self.exhaustive_flex_attn_fwd_configs
             flex_attn_fwd_configs += self.flex_attn_fwd_autotune_configs
+            if capability == (10, 7):
+                # Rubin softcap/GQA sweeps found this stage-2 rectangular tile
+                # outside the inherited standard search space.
+                flex_attn_fwd_configs.append(FlexConfig(128, 64, 2, 8))
 
         if head_dim <= 256:
             if dtype == torch.float32:
@@ -1440,6 +1468,181 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 default_config = self.sm_100_default_flex_config.get(
                     (dtype, head_dim), default_config
                 )
+                if (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and has_tanh_score_mod
+                    and is_causal
+                    and head_dim in (64, 128, 256)
+                    and V.graph.sizevars.statically_known_geq(seq_len, 128)
+                    and V.graph.sizevars.statically_known_lt(seq_len, 4096)
+                ):
+                    # Prefix-causal GQA visits a triangular subset of KV blocks.
+                    # Smaller D64/D128 tiles preserve parallelism, while D256
+                    # benefits from a larger tile once the triangle is large.
+                    if head_dim == 256:
+                        if V.graph.sizevars.statically_known_lt(seq_len, 512):
+                            default_config = FlexConfig(64, 32, 3, 4)
+                        else:
+                            default_config = FlexConfig(128, 64, 2, 8)
+                    else:
+                        default_config = FlexConfig(64, 64, 3, 4)
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and has_tanh_score_mod
+                    and not is_causal
+                    and head_dim in (64, 128, 256)
+                    and batch_heads is not None
+                    and V.graph.sizevars.statically_known_geq(seq_len, 128)
+                ):
+                    # Dense GQA softcap is sensitive to the number of packed
+                    # query CTAs available per Rubin SM. Scale the measured
+                    # wave bands with the runtime SM count so that batch/head
+                    # parallelism and query length follow the same policy.
+                    sm_count = torch.cuda.get_device_properties(
+                        "cuda"
+                    ).multi_processor_count
+                    packed_query_rows = batch_heads * seq_len
+                    small = FlexConfig(64, 64, 3, 4)
+                    large_two_stage = FlexConfig(128, 128, 2, 8)
+                    large_one_stage = FlexConfig(128, 128, 1, 8)
+                    wave_bands = {
+                        64: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (160, small),
+                            (240, large_one_stage),
+                            (320, small),
+                            (480, large_one_stage),
+                            (800, small),
+                        ),
+                        128: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (240, large_one_stage),
+                            (320, large_two_stage),
+                        ),
+                        256: (
+                            (40, small),
+                            (120, large_two_stage),
+                            (160, small),
+                            (240, large_one_stage),
+                            (320, small),
+                        ),
+                    }[head_dim]
+                    for max_rows_per_sm, candidate in wave_bands:
+                        if V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * max_rows_per_sm
+                        ):
+                            default_config = candidate
+                            break
+                    else:
+                        last_max_rows_per_sm = wave_bands[-1][0]
+                        if V.graph.sizevars.statically_known_gt(
+                            packed_query_rows, sm_count * last_max_rows_per_sm
+                        ):
+                            default_config = large_one_stage
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and not has_tanh_score_mod
+                    and head_dim in (64, 256)
+                    and batch_heads is not None
+                ):
+                    # Packed GQA query rows predict the D64 occupancy regime
+                    # across batch/head and query-length changes. D256 uses the
+                    # same resource-matched tile throughout the measured range.
+                    if head_dim == 256:
+                        default_config = FlexConfig(64, 64, 3, 4)
+                    else:
+                        sm_count = torch.cuda.get_device_properties(
+                            "cuda"
+                        ).multi_processor_count
+                        packed_query_rows = batch_heads * seq_len
+                        # With BLOCK_M=64, these are 1.25, 5, 7.5, and
+                        # 10 packed-query CTA waves per SM.
+                        if V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 80
+                        ):
+                            default_config = FlexConfig(64, 128, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 320
+                        ):
+                            default_config = FlexConfig(64, 64, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 480
+                        ):
+                            default_config = FlexConfig(128, 64, 3, 4)
+                        elif V.graph.sizevars.statically_known_leq(
+                            packed_query_rows, sm_count * 640
+                        ):
+                            default_config = FlexConfig(64, 128, 3, 4)
+                        elif V.graph.sizevars.statically_known_gt(
+                            packed_query_rows, sm_count * 640
+                        ):
+                            default_config = FlexConfig(128, 64, 3, 4)
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and is_gqa
+                    and V.graph.sizevars.statically_known_lt(seq_len, 128)
+                ):
+                    # Once AUTO rejects an over-packed decode kernel, short
+                    # Rubin GQA should use the max-autotune-winning general
+                    # attention tiles instead of inherited SM100 defaults.
+                    if has_tanh_score_mod:
+                        default_config = {
+                            64: FlexConfig(64, 64, 3, 4),
+                            128: FlexConfig(64, 64, 3, 4),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
+                    else:
+                        default_config = {
+                            64: FlexConfig(64, 128, 3, 4),
+                            128: FlexConfig(64, 128, 3, 4),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
+                elif (
+                    capability == (10, 7)
+                    and dtype in (torch.bfloat16, torch.float16)
+                    and V.graph.sizevars.statically_known_geq(seq_len, 4096)
+                ):
+                    # Long Rubin kernels have different tile resource limits
+                    # from the inherited SM100 policy. Tanh additionally needs
+                    # the causal workload and batch/head parallelism to avoid
+                    # selecting the one-stage tile for short effective grids.
+                    if has_tanh_score_mod:
+                        large_batch_heads = (
+                            batch_heads is not None
+                            and V.graph.sizevars.statically_known_geq(batch_heads, 64)
+                        )
+                        medium_batch_heads = (
+                            batch_heads is not None
+                            and V.graph.sizevars.statically_known_geq(batch_heads, 32)
+                        )
+                        if (not is_causal and large_batch_heads) or (
+                            head_dim == 256 and medium_batch_heads
+                        ):
+                            default_config = FlexConfig(128, 128, 1, 8)
+                        else:
+                            tanh_configs = {
+                                64: FlexConfig(64, 64, 3, 4),
+                                128: FlexConfig(128, 128, 2, 8),
+                                256: FlexConfig(64, 64, 3, 4),
+                            }
+                            if is_causal:
+                                tanh_configs[128] = FlexConfig(64, 64, 3, 4)
+                            default_config = tanh_configs.get(head_dim, default_config)
+                    else:
+                        default_config = {
+                            64: FlexConfig(64, 128, 3, 4),
+                            128: FlexConfig(128, 128, 2, 8),
+                            256: FlexConfig(64, 64, 3, 4),
+                        }.get(head_dim, default_config)
             elif capability == (9, 0):
                 default_config = self.h100_default_flex_config.get(
                     (dtype, head_dim), default_config
@@ -1460,7 +1663,14 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexBwDConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
@@ -1529,13 +1739,67 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         else:
             default_config = FlexBwDConfig(16, 16, 16, 16, 1, 4)
 
+        if (
+            capability == (10, 7)
+            and has_transcendental_score_mod
+            and 64 <= head_dim <= 256
+            and dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Transcendental score modifiers (tanh, sigmoid, or exp) make the
+            # larger backward tiles register-pressure sensitive on Rubin. This
+            # tile is the stable max-autotune winner across head dimensions
+            # 64, 128, and 256.
+            default_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+
+        if (
+            capability == (10, 7)
+            and is_gqa
+            and dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Rubin GQA changes the backward work balance: low-parallelism D64
+            # favors symmetric tiles except for long tanh/softcap, while D256
+            # and higher-parallelism cases need smaller dQ/dK tiles to match
+            # max-autotune.
+            small_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+            symmetric_config = FlexBwDConfig(64, 64, 64, 64, 3, 4)
+            if head_dim == 256:
+                default_config = small_config
+            elif head_dim == 128 and seq_len_q is not None:
+                if (
+                    V.graph.sizevars.statically_known_leq(seq_len_q, 128)
+                    and batch_heads is not None
+                    and V.graph.sizevars.statically_known_lt(batch_heads, 64)
+                ):
+                    default_config = symmetric_config
+                elif V.graph.sizevars.statically_known_lt(seq_len_q, 256):
+                    default_config = small_config
+            elif head_dim == 64 and seq_len_q is not None:
+                if V.graph.sizevars.statically_known_leq(seq_len_q, 128):
+                    if batch_heads is not None and V.graph.sizevars.statically_known_lt(
+                        batch_heads, 256
+                    ):
+                        default_config = symmetric_config
+                    else:
+                        default_config = small_config
+                elif has_tanh_score_mod:
+                    default_config = small_config
+                elif batch_heads is not None and V.graph.sizevars.statically_known_lt(
+                    batch_heads, 128
+                ):
+                    default_config = symmetric_config
+                else:
+                    default_config = small_config
+
         if default_config not in flex_attn_bwd_configs:
             flex_attn_bwd_configs.append(default_config)
 
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         capability = torch.cuda.get_device_capability()
 
@@ -1548,15 +1812,18 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 return self.exhaustive_flex_decode_configs
             flex_decode_configs += self.flex_decode_autotune_configs
 
-        if capability in [(9, 0), (10, 0), (10, 3)]:  # sm_90, sm_100, sm_103
-            if head_dim > 128 and dtype == torch.float32:
-                default_config = FlexDecodeConfig(64, 1, 2)
-            else:
-                default_config = FlexDecodeConfig(64, 3, 2)
-        if capability == (11, 0):
+        if capability == (10, 7) and dtype in (torch.bfloat16, torch.float16):
+            # The one-stage decode default is register/latency limited on
+            # Rubin. A 128-wide tile wins for small packed queries, while a
+            # 64-wide tile avoids excess work as the packed query grows.
+            use_wide_tile = packed_query_width is not None and (
+                V.graph.sizevars.statically_known_lt(packed_query_width, 32)
+            )
+            default_config = FlexDecodeConfig(
+                128 if head_dim <= 128 and use_wide_tile else 64, 3, 2
+            )
+        elif capability == (11, 0):
             default_config = FlexDecodeConfig(16, 1, 2)
-        else:
-            default_config = FlexDecodeConfig(64, 1, 2)
 
         if default_config not in flex_decode_configs:
             flex_decode_configs.append(default_config)
@@ -1879,7 +2146,14 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
                 yield self.triton_config(**kwargs)
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1930,7 +2204,14 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1968,7 +2249,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -2043,7 +2327,14 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
             ]
 
     def get_flex_attn_fwd_configs(
-        self, head_dim: int, seq_len: sympy.Expr, dtype: Any
+        self,
+        head_dim: int,
+        seq_len: sympy.Expr,
+        dtype: Any,
+        has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -2072,7 +2363,14 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -2099,7 +2397,10 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 

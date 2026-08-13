@@ -521,6 +521,39 @@ class TestTritonHeuristics(TestCase):
             )
             self.assertEqual(len(configs), expected_count)
 
+    def test_rubin_flex_decode_default_configs(self):
+        from torch._inductor.heuristics.template.triton import (
+            CUDAConfigHeuristic,
+            FlexDecodeConfig,
+        )
+
+        with (
+            config.patch({"max_autotune": False}),
+            patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+        ):
+            heuristic = CUDAConfigHeuristic()
+            for dtype in (torch.bfloat16, torch.float16):
+                self.assertEqual(
+                    heuristic.get_flex_decode_configs(64, dtype, 4),
+                    [FlexDecodeConfig(128, 3, 2)],
+                )
+                self.assertEqual(
+                    heuristic.get_flex_decode_configs(128, dtype, 16),
+                    [FlexDecodeConfig(128, 3, 2)],
+                )
+                self.assertEqual(
+                    heuristic.get_flex_decode_configs(256, dtype, 16),
+                    [FlexDecodeConfig(64, 3, 2)],
+                )
+                self.assertEqual(
+                    heuristic.get_flex_decode_configs(128, dtype, 32),
+                    [FlexDecodeConfig(64, 3, 2)],
+                )
+            self.assertEqual(
+                heuristic.get_flex_decode_configs(128, torch.float32),
+                [FlexDecodeConfig(64, 1, 2)],
+            )
+
     @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     def test_compile_time_autotune_not_repeated_at_runtime(self):
         def fn(x):

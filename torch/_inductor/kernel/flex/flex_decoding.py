@@ -132,6 +132,35 @@ def _use_flex_decoding(query, kv_indices, value, kernel_options, enable_gqa) -> 
     return out
 
 
+def _prefer_flex_decoding(query, value, enable_gqa) -> bool:
+    """Apply device-specific profitability checks after decode eligibility."""
+    if (
+        not enable_gqa
+        or torch.xpu.is_available()
+        or torch.cuda.get_device_capability() != (10, 7)
+    ):
+        return True
+
+    ratio = FloorDiv(query.get_size()[1], value.get_size()[1])
+    packed_query_width = query.get_size()[-2] * ratio
+    # Flex decode packs all query heads sharing a KV head into BLOCK_M. On
+    # Rubin, the profitable packed width shrinks at larger head dimensions and
+    # when there are too few independent batch/head rows to hide decode work.
+    large_head_dim = V.graph.sizevars.guard_or_false(
+        sympy.Ge(query.get_size()[-1], 128)
+    )
+    low_batch_head_parallelism = V.graph.sizevars.guard_or_false(
+        sympy.Le(query.get_size()[0] * query.get_size()[1], 128)
+    )
+    if low_batch_head_parallelism:
+        packed_query_limit = 64 if large_head_dim else 128
+    else:
+        packed_query_limit = 128 if large_head_dim else 256
+    return V.graph.sizevars.guard_or_false(
+        sympy.Lt(packed_query_width, packed_query_limit)
+    )
+
+
 @SymbolicGridFn
 def flex_decoding_grid(batch_size, kv_heads, gqa_group_size, seq_len_q, d_model, meta):
     """How is this kernel parallelized?
@@ -275,7 +304,10 @@ def create_flex_decoding_kernel(*args, **kwargs):
     dtype = key.get_dtype()
     head_dim = V.graph.sizevars.guard_int(key.get_size()[-1])
     configs = V.choices.get_flex_decode_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        packed_query_width=seq_len_q * gqa_shared_heads,
     )
 
     # TODO: fix autotuning.

@@ -164,21 +164,55 @@ class InductorChoices:
         seq_len: sympy.Expr,
         dtype: torch.dtype,
         device_type: str | None = "cuda",
+        has_tanh_score_mod: bool = False,
+        batch_heads: sympy.Expr | None = None,
+        is_causal: bool = False,
+        is_gqa: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_attn_fwd_configs(head_dim, seq_len, dtype)
+        return flex_heuristics.get_flex_attn_fwd_configs(
+            head_dim,
+            seq_len,
+            dtype,
+            has_tanh_score_mod,
+            batch_heads,
+            is_causal,
+            is_gqa,
+        )
 
     def get_flex_attention_bwd_configs(
-        self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+        has_transcendental_score_mod: bool = False,
+        seq_len_q: sympy.Expr | None = None,
+        batch_heads: sympy.Expr | None = None,
+        is_gqa: bool = False,
+        has_tanh_score_mod: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype)
+        return flex_heuristics.get_flex_attn_bwd_configs(
+            head_dim,
+            dtype,
+            has_transcendental_score_mod,
+            seq_len_q,
+            batch_heads,
+            is_gqa,
+            has_tanh_score_mod,
+        )
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+        packed_query_width: sympy.Expr | None = None,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
+        return flex_heuristics.get_flex_decode_configs(
+            head_dim, dtype, packed_query_width
+        )
 
     def append_flex_attention_choices(
         self,

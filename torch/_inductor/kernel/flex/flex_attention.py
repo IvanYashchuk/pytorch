@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast, TYPE_CHECKING
@@ -30,6 +31,8 @@ from .common import (
     _flex_kernel_tuning_options,
     build_subgraph_buffer,
     can_skip_boundary_checks,
+    create_causal_indices_fake_generator,
+    create_causal_num_blocks_fake_generator,
     create_indices_fake,
     create_num_blocks_fake_generator,
     create_placeholder,
@@ -44,7 +47,11 @@ from .common import (
     SubgraphResults,
 )
 from .flex_cpu import lower_cpu
-from .flex_decoding import _use_flex_decoding, create_flex_decoding_kernel
+from .flex_decoding import (
+    _prefer_flex_decoding,
+    _use_flex_decoding,
+    create_flex_decoding_kernel,
+)
 from .flex_flash_attention import (
     _use_flex_flash_attention,
     _use_flex_flash_attention_backward,
@@ -64,6 +71,134 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
 Expr = sympy.Expr
+
+
+def _score_graph_has_tanh(graph_module) -> bool:
+    tanh_targets = {
+        torch.tanh,
+        torch.ops.aten.tanh.default,
+        torch.ops.prims.tanh.default,
+    }
+    return any(
+        node.op == "call_function" and node.target in tanh_targets
+        for node in graph_module.graph.nodes
+    )
+
+
+def _score_graph_is_softcap(graph_module) -> bool:
+    """Match ``cap * tanh(score / cap)`` with a positive scalar cap."""
+    nodes = list(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    outputs = [node for node in nodes if node.op == "output"]
+    if not placeholders or len(outputs) != 1:
+        return False
+
+    output = outputs[0].args[0]
+    if (
+        not isinstance(output, torch.fx.Node)
+        or output.op != "call_function"
+        or output.target not in (operator.mul, torch.mul, torch.ops.aten.mul.Tensor)
+        or len(output.args) != 2
+    ):
+        return False
+
+    tanh_node = None
+    cap = None
+    for maybe_tanh, maybe_cap in (output.args, reversed(output.args)):
+        if (
+            isinstance(maybe_tanh, torch.fx.Node)
+            and maybe_tanh.op == "call_function"
+            and maybe_tanh.target
+            in (torch.tanh, torch.ops.aten.tanh.default, torch.ops.prims.tanh.default)
+            and isinstance(maybe_cap, (int, float))
+            and not isinstance(maybe_cap, bool)
+            and math.isfinite(maybe_cap)
+            and maybe_cap > 0
+        ):
+            tanh_node = maybe_tanh
+            cap = maybe_cap
+            break
+    if tanh_node is None:
+        return False
+
+    tanh_input = tanh_node.args[0]
+    return (
+        isinstance(tanh_input, torch.fx.Node)
+        and tanh_input.op == "call_function"
+        and tanh_input.target
+        in (operator.truediv, torch.div, torch.ops.aten.div.Tensor)
+        and len(tanh_input.args) == 2
+        and tanh_input.args[0] is placeholders[0]
+        and tanh_input.args[1] == cap
+    )
+
+
+def _use_fast_tanh_for_softcap(
+    graph_module,
+    dtype,
+    device,
+    head_dim: int,
+    seq_len_q: Expr,
+    batch_heads: Expr,
+    min_rows_per_sm: int,
+) -> bool:
+    if (
+        device.type != "cuda"
+        or dtype not in (torch.float16, torch.bfloat16)
+        or torch.cuda.get_device_capability(device) != (10, 7)
+        or not _score_graph_is_softcap(graph_module)
+    ):
+        return False
+
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    return V.graph.sizevars.statically_known_geq(
+        batch_heads * seq_len_q, sm_count * min_rows_per_sm
+    )
+
+
+def _score_graph_has_transcendental(graph_module) -> bool:
+    transcendental_targets = {
+        torch.tanh,
+        torch.ops.aten.tanh.default,
+        torch.ops.prims.tanh.default,
+        torch.sigmoid,
+        torch.ops.aten.sigmoid.default,
+        torch.exp,
+        torch.ops.aten.exp.default,
+        torch.ops.prims.exp.default,
+    }
+    return any(
+        node.op == "call_function" and node.target in transcendental_targets
+        for node in graph_module.graph.nodes
+    )
+
+
+def _mask_graph_is_causal(graph_module) -> bool:
+    nodes = list(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    outputs = [node for node in nodes if node.op == "output"]
+    if len(placeholders) != 4 or len(outputs) != 1:
+        return False
+    output = outputs[0].args[0]
+    return (
+        output.op == "call_function"
+        and output.target in (operator.ge, torch.ops.aten.ge.Tensor)
+        and output.args == (placeholders[2], placeholders[3])
+    )
+
+
+def _can_use_causal_fwd_autotune_inputs(
+    mask_graph,
+    seq_len_q: Expr,
+    seq_len_kv: Expr,
+    sparse_q_block_size: int,
+    sparse_kv_block_size: int,
+) -> bool:
+    return (
+        _mask_graph_is_causal(mask_graph)
+        and V.graph.sizevars.statically_known_leq(seq_len_q, seq_len_kv)
+        and sparse_q_block_size == sparse_kv_block_size
+    )
 
 
 def _sanitize_kernel_options_for_triton(
@@ -281,7 +416,11 @@ def flex_attention(
     can_use_decode = _use_flex_decoding(
         query, kv_indices, value, kernel_options, enable_gqa
     )
-    use_decode = (backend == "TRITON_DECODE") or (backend == "AUTO" and can_use_decode)
+    use_decode = (backend == "TRITON_DECODE") or (
+        backend == "AUTO"
+        and can_use_decode
+        and _prefer_flex_decoding(query, value, enable_gqa)
+    )
 
     if backend == "TRITON_DECODE" and not can_use_decode:
         raise RuntimeError(
@@ -433,8 +572,33 @@ def flex_attention(
 
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    batch_heads = query.get_size()[0] * query.get_size()[1]
+    causal_prefix_attention = _can_use_causal_fwd_autotune_inputs(
+        mask_graph.graph_module,
+        seq_len_q,
+        seq_len_kv,
+        SPARSE_Q_BLOCK_SIZE,
+        SPARSE_KV_BLOCK_SIZE,
+    )
+    if _use_fast_tanh_for_softcap(
+        subgraph.graph_module,
+        dtype,
+        query.get_device(),
+        head_dim,
+        seq_len_q,
+        batch_heads,
+        96 if head_dim >= 256 else 128,
+    ):
+        kernel_options.setdefault("USE_FAST_TANH", True)
     configs: list[FlexConfig] = V.choices.get_flex_attention_fwd_configs(
-        head_dim, seq_len_q, dtype, query.get_device().type
+        head_dim,
+        seq_len_q,
+        dtype,
+        query.get_device().type,
+        has_tanh_score_mod=_score_graph_has_tanh(subgraph.graph_module),
+        batch_heads=batch_heads,
+        is_causal=causal_prefix_attention,
+        is_gqa=V.graph.sizevars.statically_known_gt(gqa_shared_heads, 1),
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
@@ -586,12 +750,20 @@ def flex_attention(
         + list(score_mod_other_buffers)
         + list(mask_mod_other_buffers)
     )
-    input_gen_fns = {
-        5: create_num_blocks_fake_generator(kv_indices),
-        6: create_indices_fake,
-        7: create_num_blocks_fake_generator(full_kv_indices),
-        8: create_indices_fake,
-    }
+    if causal_prefix_attention:
+        input_gen_fns = {
+            5: create_causal_num_blocks_fake_generator(full=False),
+            6: create_causal_indices_fake_generator(partial_block=True),
+            7: create_causal_num_blocks_fake_generator(full=True),
+            8: create_causal_indices_fake_generator(partial_block=False),
+        }
+    else:
+        input_gen_fns = {
+            5: create_num_blocks_fake_generator(kv_indices),
+            6: create_indices_fake,
+            7: create_num_blocks_fake_generator(full_kv_indices),
+            8: create_indices_fake,
+        }
 
     out, _ = autotune_select_algorithm(
         "flex_attention",
@@ -1009,8 +1181,30 @@ def flex_attention_backward(*args, **kwargs):
 
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    batch_heads = query.get_size()[0] * query.get_size()[1]
+    if _use_fast_tanh_for_softcap(
+        fw_graph.graph_module,
+        dtype,
+        device,
+        head_dim,
+        seq_len_q,
+        batch_heads,
+        64,
+    ):
+        # Backward has enough independent dQ/dK/dV work to benefit at a
+        # lower packed-row threshold than the forward kernel.
+        kernel_options.setdefault("USE_FAST_TANH", True)
     configs: list[FlexBwDConfig] = V.choices.get_flex_attention_bwd_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        has_transcendental_score_mod=_score_graph_has_transcendental(
+            fw_graph.graph_module
+        ),
+        seq_len_q=seq_len_q,
+        batch_heads=batch_heads,
+        is_gqa=V.graph.sizevars.statically_known_gt(gqa_shared_heads, 1),
+        has_tanh_score_mod=_score_graph_has_tanh(fw_graph.graph_module),
     )
 
     # Default config for warp specialization
@@ -1172,16 +1366,35 @@ def flex_attention_backward(*args, **kwargs):
         + list(mask_mod_other_buffers)
         + joint_outputs.mutated_grads
     )
-    input_gen_fns = {
-        8: create_num_blocks_fake_generator(kv_indices),  # kv_num_blocks
-        9: create_indices_fake,
-        10: create_num_blocks_fake_generator(q_indices),  # q_num_blocks
-        11: create_indices_fake,
-        12: create_num_blocks_fake_generator(full_kv_indices),  # full_kv_num_blocks
-        13: create_indices_fake,
-        14: create_num_blocks_fake_generator(full_q_indices),  # full_q_num_blocks
-        15: create_indices_fake,
-    }
+    causal_self_attention = (
+        _mask_graph_is_causal(mask_graph.graph_module)
+        and V.graph.sizevars.statically_known_equals(seq_len_q, seq_len_kv)
+        and (SPARSE_Q_BLOCK_SIZE == SPARSE_KV_BLOCK_SIZE)
+    )
+    if causal_self_attention:
+        input_gen_fns = {
+            8: create_causal_num_blocks_fake_generator(full=False),
+            9: create_causal_indices_fake_generator(partial_block=True),
+            10: create_causal_num_blocks_fake_generator(full=False),
+            11: create_causal_indices_fake_generator(partial_block=True),
+            12: create_causal_num_blocks_fake_generator(full=True),
+            13: create_causal_indices_fake_generator(partial_block=False),
+            14: create_causal_num_blocks_fake_generator(full=True, transposed=True),
+            15: create_causal_indices_fake_generator(
+                partial_block=False, transposed=True
+            ),
+        }
+    else:
+        input_gen_fns = {
+            8: create_num_blocks_fake_generator(kv_indices),  # kv_num_blocks
+            9: create_indices_fake,
+            10: create_num_blocks_fake_generator(q_indices),  # q_num_blocks
+            11: create_indices_fake,
+            12: create_num_blocks_fake_generator(full_kv_indices),  # full_kv_num_blocks
+            13: create_indices_fake,
+            14: create_num_blocks_fake_generator(full_q_indices),  # full_q_num_blocks
+            15: create_indices_fake,
+        }
 
     broadcasted_grad_key, _ = autotune_select_algorithm(
         "flex_attention_backward",

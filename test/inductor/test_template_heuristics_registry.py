@@ -1,5 +1,8 @@
 # Owner(s): ["module: inductor"]
+from unittest import mock
+
 import torch
+from torch._inductor import config as inductor_config
 from torch._inductor.heuristics.registry import (
     _TEMPLATE_HEURISTIC_REGISTRY,
     clear_registry,
@@ -10,9 +13,21 @@ from torch._inductor.heuristics.template.base import TemplateConfigHeuristics
 from torch._inductor.heuristics.template.triton import (
     BlackwellGPUGemmConfig,
     CUDAConfigHeuristic,
+    FlexBwDConfig,
     FlexConfig,
 )
+from torch._inductor.kernel.flex.common import (
+    create_causal_indices_fake_generator,
+    create_causal_num_blocks_fake_generator,
+)
+from torch._inductor.kernel.flex.flex_attention import (
+    _can_use_causal_fwd_autotune_inputs,
+    _mask_graph_is_causal,
+    _score_graph_is_softcap,
+    _use_fast_tanh_for_softcap,
+)
 from torch._inductor.test_case import run_tests, TestCase
+from torch._inductor.virtualized import V
 
 
 class TestBlackwellGPUGemmConfig(TestCase):
@@ -236,6 +251,695 @@ class TestA100DefaultFlexConfig(TestCase):
         h = CUDAConfigHeuristic()
         self.assertEqual(h.a100_default_flex_config[(torch.bfloat16, 192)], expected)
         self.assertEqual(h.a100_default_flex_config[(torch.float16, 192)], expected)
+
+
+class TestRubinDefaultFlexConfig(TestCase):
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_rubin_max_autotune_includes_stage2_rectangular_tile(
+        self, _mock_capability
+    ):
+        heuristic = CUDAConfigHeuristic()
+        candidate = FlexConfig(128, 64, 2, 8)
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
+        with (
+            V.set_graph_handler(mock.Mock(sizevars=sizevars)),
+            inductor_config.patch(max_autotune=True),
+        ):
+            self.assertIn(
+                candidate,
+                heuristic.get_flex_attn_fwd_configs(
+                    256,
+                    1024,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=32,
+                    is_causal=True,
+                    is_gqa=True,
+                ),
+            )
+
+        with inductor_config.patch(
+            max_autotune=True, max_autotune_flex_search_space="EXHAUSTIVE"
+        ):
+            self.assertIn(
+                candidate,
+                heuristic.get_flex_attn_fwd_configs(256, 1024, torch.bfloat16),
+            )
+
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_long_tanh_score_mod(self, _mock_capability):
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_gt.side_effect = lambda value, limit: value > limit
+        sizevars.statically_known_leq.side_effect = lambda value, limit: value <= limit
+        sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            heuristic = CUDAConfigHeuristic()
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128,
+                    4096,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=64,
+                ),
+                [FlexConfig(128, 128, 1, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 2048, torch.bfloat16, has_tanh_score_mod=True
+                ),
+                [FlexConfig(128, 128, 2, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 4096, torch.bfloat16, has_tanh_score_mod=False
+                ),
+                [FlexConfig(128, 128, 2, 8)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    32, 4096, torch.bfloat16, has_tanh_score_mod=True
+                ),
+                [FlexConfig(64, 64, 3, 4)],
+            )
+
+    @mock.patch("torch.cuda.get_device_properties")
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_long_forward_configs(self, _mock_capability, mock_properties):
+        mock_properties.return_value.multi_processor_count = 212
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            heuristic = CUDAConfigHeuristic()
+            expected = {
+                64: FlexConfig(64, 128, 3, 4),
+                128: FlexConfig(128, 128, 2, 8),
+                256: FlexConfig(64, 64, 3, 4),
+            }
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, config in expected.items():
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim, 4096, dtype, batch_heads=1
+                        ),
+                        [config],
+                    )
+
+            tanh_cases = (
+                (64, 32, False, FlexConfig(64, 64, 3, 4)),
+                (64, 64, False, FlexConfig(128, 128, 1, 8)),
+                (128, 32, False, FlexConfig(128, 128, 2, 8)),
+                (128, 64, False, FlexConfig(128, 128, 1, 8)),
+                (128, 64, True, FlexConfig(64, 64, 3, 4)),
+                (256, 8, False, FlexConfig(64, 64, 3, 4)),
+                (256, 32, True, FlexConfig(128, 128, 1, 8)),
+            )
+            for head_dim, batch_heads, is_causal, config in tanh_cases:
+                self.assertEqual(
+                    heuristic.get_flex_attn_fwd_configs(
+                        head_dim,
+                        4096,
+                        torch.bfloat16,
+                        has_tanh_score_mod=True,
+                        batch_heads=batch_heads,
+                        is_causal=is_causal,
+                    ),
+                    [config],
+                )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128, 2048, torch.bfloat16, batch_heads=64
+                ),
+                [FlexConfig(128, 64, 3, 8)],
+            )
+
+    @mock.patch("torch.cuda.get_device_properties")
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_gqa_forward_configs(self, _mock_capability, mock_properties):
+        mock_properties.return_value.multi_processor_count = 212
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        sizevars.statically_known_lt.side_effect = lambda value, limit: value < limit
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            heuristic = CUDAConfigHeuristic()
+            for dtype in (torch.bfloat16, torch.float16):
+                for seq_len, expected in (
+                    (128, FlexConfig(64, 32, 3, 4)),
+                    (384, FlexConfig(64, 32, 3, 4)),
+                    (512, FlexConfig(128, 64, 2, 8)),
+                    (2048, FlexConfig(128, 64, 2, 8)),
+                ):
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            256,
+                            seq_len,
+                            dtype,
+                            has_tanh_score_mod=True,
+                            batch_heads=8,
+                            is_causal=True,
+                            is_gqa=True,
+                        ),
+                        [expected],
+                    )
+                for head_dim in (64, 128):
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            2048,
+                            dtype,
+                            has_tanh_score_mod=True,
+                            batch_heads=8,
+                            is_causal=True,
+                            is_gqa=True,
+                        ),
+                        [FlexConfig(64, 64, 3, 4)],
+                    )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    256,
+                    4096,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=8,
+                    is_causal=True,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 64, 3, 4)],
+            )
+
+            short_gqa_configs = {
+                (False, 64): FlexConfig(64, 128, 3, 4),
+                (False, 128): FlexConfig(64, 128, 3, 4),
+                (False, 256): FlexConfig(64, 64, 3, 4),
+                (True, 64): FlexConfig(64, 64, 3, 4),
+                (True, 128): FlexConfig(64, 64, 3, 4),
+                (True, 256): FlexConfig(64, 64, 3, 4),
+            }
+            for dtype in (torch.bfloat16, torch.float16):
+                for (has_tanh, head_dim), config in short_gqa_configs.items():
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            64,
+                            dtype,
+                            has_tanh_score_mod=has_tanh,
+                            batch_heads=32,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    127,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 128, 3, 4)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    128,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 128, 3, 4)],
+            )
+
+            packed_gqa_configs = (
+                (64, 128, 128, FlexConfig(64, 128, 3, 4)),
+                (64, 266, 64, FlexConfig(64, 64, 3, 4)),
+                (64, 1060, 64, FlexConfig(64, 64, 3, 4)),
+                (64, 1061, 64, FlexConfig(128, 64, 3, 4)),
+                (64, 1590, 64, FlexConfig(128, 64, 3, 4)),
+                (64, 1591, 64, FlexConfig(64, 128, 3, 4)),
+                (64, 2120, 64, FlexConfig(64, 128, 3, 4)),
+                (64, 2121, 64, FlexConfig(128, 64, 3, 4)),
+                (256, 128, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 2048, 128, FlexConfig(64, 64, 3, 4)),
+            )
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, seq_len, batch_heads, config in packed_gqa_configs:
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            seq_len,
+                            dtype,
+                            batch_heads=batch_heads,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            # D128 retains its existing independent non-tanh policy.
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128,
+                    512,
+                    torch.bfloat16,
+                    batch_heads=32,
+                    is_gqa=True,
+                ),
+                [FlexConfig(128, 64, 3, 8)],
+            )
+
+            softcap_gqa_configs = (
+                (64, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 512, 32, FlexConfig(128, 128, 2, 8)),
+                (64, 1024, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (64, 2048, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 3072, 32, FlexConfig(128, 128, 1, 8)),
+                (64, 4096, 32, FlexConfig(64, 64, 3, 4)),
+                (64, 8192, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (128, 768, 32, FlexConfig(128, 128, 2, 8)),
+                (128, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (128, 2048, 32, FlexConfig(128, 128, 2, 8)),
+                (128, 4096, 32, FlexConfig(128, 128, 1, 8)),
+                (256, 256, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 768, 32, FlexConfig(128, 128, 2, 8)),
+                (256, 1024, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 1536, 32, FlexConfig(128, 128, 1, 8)),
+                (256, 2048, 32, FlexConfig(64, 64, 3, 4)),
+                (256, 4096, 32, FlexConfig(128, 128, 1, 8)),
+            )
+            for dtype in (torch.bfloat16, torch.float16):
+                for head_dim, seq_len, batch_heads, config in softcap_gqa_configs:
+                    self.assertEqual(
+                        heuristic.get_flex_attn_fwd_configs(
+                            head_dim,
+                            seq_len,
+                            dtype,
+                            has_tanh_score_mod=True,
+                            batch_heads=batch_heads,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+            # Packed rows, not batch size alone, select the wave band.
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    768,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=64,
+                    is_gqa=True,
+                ),
+                [FlexConfig(128, 128, 1, 8)],
+            )
+
+            # Causal softcap retains its separately tuned policy.
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    128,
+                    4096,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=32,
+                    is_causal=True,
+                    is_gqa=True,
+                ),
+                [FlexConfig(64, 64, 3, 4)],
+            )
+
+            self.assertEqual(
+                heuristic.get_flex_attn_fwd_configs(
+                    64,
+                    64,
+                    torch.bfloat16,
+                    has_tanh_score_mod=True,
+                    batch_heads=32,
+                ),
+                [FlexConfig(128, 128, 3, 4)],
+            )
+
+    @mock.patch("torch.cuda.get_device_capability", return_value=(10, 7))
+    def test_rubin_backward_configs(self, _mock_capability):
+        heuristic = CUDAConfigHeuristic()
+        transcendental_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        for dtype in (torch.bfloat16, torch.float16):
+            for head_dim in (64, 128, 256):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        head_dim, dtype, has_transcendental_score_mod=True
+                    ),
+                    [transcendental_config],
+                )
+
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128, torch.bfloat16, has_transcendental_score_mod=False
+            ),
+            [FlexBwDConfig(64, 128, 128, 64, 3, 4)],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                32, torch.bfloat16, has_transcendental_score_mod=True
+            ),
+            [FlexBwDConfig(32, 64, 64, 32, 3, 4)],
+        )
+
+        small_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        symmetric_config = FlexBwDConfig(64, 64, 64, 64, 3, 4)
+        for dtype in (torch.bfloat16, torch.float16):
+            for has_transcendental in (False, True):
+                for head_dim, config in (
+                    (64, symmetric_config),
+                    (128, symmetric_config),
+                    (256, small_config),
+                ):
+                    self.assertEqual(
+                        heuristic.get_flex_attn_bwd_configs(
+                            head_dim,
+                            dtype,
+                            has_transcendental_score_mod=has_transcendental,
+                            seq_len_q=128,
+                            batch_heads=32,
+                            is_gqa=True,
+                        ),
+                        [config],
+                    )
+
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=129,
+                batch_heads=32,
+                is_gqa=True,
+            ),
+            [small_config],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=256,
+                batch_heads=32,
+                is_gqa=True,
+            ),
+            [FlexBwDConfig(64, 128, 128, 64, 3, 4)],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len_q=64,
+                batch_heads=64,
+                is_gqa=True,
+            ),
+            [small_config],
+        )
+        self.assertEqual(
+            heuristic.get_flex_attn_bwd_configs(
+                64,
+                torch.bfloat16,
+                seq_len_q=64,
+                batch_heads=256,
+                is_gqa=True,
+            ),
+            [small_config],
+        )
+
+        # Long GQA D64 uses symmetric tiles below 128 packed query heads, but
+        # tanh/softcap and higher-parallelism workloads retain the small tile.
+        for dtype in (torch.bfloat16, torch.float16):
+            for has_transcendental, has_tanh in (
+                (False, False),
+                (True, False),
+            ):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        64,
+                        dtype,
+                        has_transcendental_score_mod=has_transcendental,
+                        seq_len_q=4096,
+                        batch_heads=32,
+                        is_gqa=True,
+                        has_tanh_score_mod=has_tanh,
+                    ),
+                    [symmetric_config],
+                )
+            for seq_len_q, batch_heads, has_tanh in (
+                (129, 32, True),
+                (4096, 32, True),
+                (4096, 128, False),
+            ):
+                self.assertEqual(
+                    heuristic.get_flex_attn_bwd_configs(
+                        64,
+                        dtype,
+                        has_transcendental_score_mod=has_tanh,
+                        seq_len_q=seq_len_q,
+                        batch_heads=batch_heads,
+                        is_gqa=True,
+                        has_tanh_score_mod=has_tanh,
+                    ),
+                    [small_config],
+                )
+
+
+class TestFlexAttentionAutotuneInputs(TestCase):
+    def test_causal_block_mask_generators(self):
+        sizevars = mock.Mock()
+        sizevars.optimization_hints.side_effect = lambda value: value
+        num_blocks = mock.Mock()
+        num_blocks.get_size.return_value = [1, 1, 4]
+        num_blocks.get_dtype.return_value = torch.int32
+        num_blocks.get_device.return_value = torch.device("cpu")
+        indices = mock.Mock()
+        indices.get_size.return_value = [1, 1, 4, 4]
+        indices.get_dtype.return_value = torch.int32
+        indices.get_device.return_value = torch.device("cpu")
+
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            partial_counts = create_causal_num_blocks_fake_generator(full=False)(
+                num_blocks
+            )
+            full_kv_counts = create_causal_num_blocks_fake_generator(full=True)(
+                num_blocks
+            )
+            full_q_counts = create_causal_num_blocks_fake_generator(
+                full=True, transposed=True
+            )(num_blocks)
+            partial_indices = create_causal_indices_fake_generator(partial_block=True)(
+                indices
+            )
+            full_q_indices = create_causal_indices_fake_generator(
+                partial_block=False, transposed=True
+            )(indices)
+
+        self.assertEqual(partial_counts.tolist(), [[[1, 1, 1, 1]]])
+        self.assertEqual(full_kv_counts.tolist(), [[[0, 1, 2, 3]]])
+        self.assertEqual(full_q_counts.tolist(), [[[3, 2, 1, 0]]])
+        self.assertEqual(
+            partial_indices.tolist(),
+            [[[[0, 1, 2, 3], [1, 0, 2, 3], [2, 0, 1, 3], [3, 0, 1, 2]]]],
+        )
+        self.assertEqual(
+            full_q_indices.tolist(),
+            [[[[1, 2, 3, 0], [2, 3, 0, 1], [3, 0, 1, 2], [0, 1, 2, 3]]]],
+        )
+
+    def test_rectangular_causal_block_mask_generators(self):
+        sizevars = mock.Mock()
+        sizevars.optimization_hints.side_effect = lambda value: value
+        num_blocks = mock.Mock()
+        num_blocks.get_size.return_value = [1, 1, 4]
+        num_blocks.get_dtype.return_value = torch.int32
+        num_blocks.get_device.return_value = torch.device("cpu")
+        indices = mock.Mock()
+        indices.get_size.return_value = [1, 1, 4, 32]
+        indices.get_dtype.return_value = torch.int32
+        indices.get_device.return_value = torch.device("cpu")
+
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            full_counts = create_causal_num_blocks_fake_generator(full=True)(num_blocks)
+            partial_indices = create_causal_indices_fake_generator(partial_block=True)(
+                indices
+            )
+
+        self.assertEqual(full_counts.tolist(), [[[0, 1, 2, 3]]])
+        self.assertEqual(
+            partial_indices[0, 0, :, 0].tolist(),
+            [0, 1, 2, 3],
+        )
+
+    def test_causal_mask_graph_detection(self):
+        graph = torch.fx.Graph()
+        placeholders = [graph.placeholder(f"arg{index}") for index in range(4)]
+        graph.output(
+            graph.call_function(
+                torch.ops.aten.ge.Tensor,
+                (placeholders[2], placeholders[3]),
+            )
+        )
+
+        causal_graph = torch.fx.GraphModule({}, graph)
+        self.assertTrue(_mask_graph_is_causal(causal_graph))
+
+        sizevars = mock.Mock()
+        sizevars.statically_known_leq.side_effect = lambda lhs, rhs: lhs <= rhs
+        with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
+            self.assertTrue(
+                _can_use_causal_fwd_autotune_inputs(causal_graph, 512, 4096, 128, 128)
+            )
+            self.assertFalse(
+                _can_use_causal_fwd_autotune_inputs(causal_graph, 8192, 4096, 128, 128)
+            )
+            self.assertFalse(
+                _can_use_causal_fwd_autotune_inputs(causal_graph, 512, 4096, 64, 128)
+            )
+
+    def test_softcap_score_graph_detection(self):
+        graph = torch.fx.Graph()
+        placeholders = [graph.placeholder(f"arg{index}") for index in range(5)]
+        divided = graph.call_function(
+            torch.ops.aten.div.Tensor, (placeholders[0], 50.0)
+        )
+        tanh = graph.call_function(torch.ops.aten.tanh.default, (divided,))
+        graph.output(graph.call_function(torch.ops.aten.mul.Tensor, (tanh, 50.0)))
+        softcap_graph = torch.fx.GraphModule({}, graph)
+
+        self.assertTrue(_score_graph_is_softcap(softcap_graph))
+        sizevars = mock.Mock()
+        sizevars.statically_known_geq.side_effect = lambda value, limit: value >= limit
+        properties = mock.Mock(multi_processor_count=216)
+        with (
+            V.set_graph_handler(mock.Mock(sizevars=sizevars)),
+            mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=(10, 7)
+            ),
+            mock.patch.object(
+                torch.cuda, "get_device_properties", return_value=properties
+            ),
+        ):
+            self.assertTrue(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    1024,
+                    32,
+                    128,
+                )
+            )
+            self.assertFalse(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    256,
+                    512,
+                    32,
+                    96,
+                )
+            )
+            self.assertTrue(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    512,
+                    32,
+                    64,
+                )
+            )
+            self.assertFalse(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    256,
+                    32,
+                    64,
+                )
+            )
+            self.assertFalse(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    512,
+                    32,
+                    128,
+                )
+            )
+            self.assertTrue(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    256,
+                    768,
+                    32,
+                    96,
+                )
+            )
+            self.assertFalse(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.float32,
+                    torch.device("cuda"),
+                    128,
+                    1024,
+                    32,
+                    128,
+                )
+            )
+        with mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(10, 3)
+        ):
+            self.assertFalse(
+                _use_fast_tanh_for_softcap(
+                    softcap_graph,
+                    torch.bfloat16,
+                    torch.device("cuda"),
+                    128,
+                    1024,
+                    32,
+                    128,
+                )
+            )
+
+        graph = torch.fx.Graph()
+        score = graph.placeholder("score")
+        for index in range(4):
+            graph.placeholder(f"unused{index}")
+        graph.output(
+            graph.call_function(
+                torch.ops.aten.tanh.default,
+                (graph.call_function(torch.ops.aten.add.Tensor, (score, 1.0)),),
+            )
+        )
+        arbitrary_tanh_graph = torch.fx.GraphModule({}, graph)
+        self.assertFalse(_score_graph_is_softcap(arbitrary_tanh_graph))
+
+        graph = torch.fx.Graph()
+        score = graph.placeholder("score")
+        for index in range(4):
+            graph.placeholder(f"unused{index}")
+        divided = graph.call_function(torch.ops.aten.div.Tensor, (score, 50.0))
+        tanh = graph.call_function(torch.ops.aten.tanh.default, (divided,))
+        graph.output(graph.call_function(torch.ops.aten.mul.Tensor, (tanh, 20.0)))
+        mismatched_cap_graph = torch.fx.GraphModule({}, graph)
+        self.assertFalse(_score_graph_is_softcap(mismatched_cap_graph))
 
 
 if __name__ == "__main__":

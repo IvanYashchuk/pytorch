@@ -2218,8 +2218,17 @@ class TritonOverrides(OpOverrides):
             dtype = cse_var.dtype
         else:
             dtype = None
-        if (
-            config.use_fast_math
+        kernel_meta = getattr(V.kernel, "meta", {})
+        use_fast_tanh = config.use_fast_math or (
+            isinstance(kernel_meta, dict) and kernel_meta.get("USE_FAST_TANH", False)
+        )
+        if use_fast_tanh and not torch.version.hip and dtype == torch.float32:
+            return (
+                "tl.inline_asm_elementwise('tanh.approx.f32 $0, $1;', '=f,f', "
+                f"[{x}], dtype=tl.float32, is_pure=True, pack=1)"
+            )
+        elif (
+            use_fast_tanh
             and torch.version.hip
             and get_triton_version() > (3, 5)
             and dtype != torch.float64
