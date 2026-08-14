@@ -4917,28 +4917,39 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @skip_on_mps
     @skip_on_xpu
     def test_flex_decode_full_and_partial_index_widths(self, device):
-        """Full-block split offsets must use the full-block index width."""
+        """Full/partial lists use their own widths and runtime split workload."""
         dtype = torch.float16
         head_dim = 64
-        page_size = 64
+        sparse_block_size = 128
         q = torch.randn((2, 4, 1, head_dim), device=device, dtype=dtype)
-        k = torch.randn((1, 1, 12 * page_size, head_dim), device=device, dtype=dtype)
+        k = torch.randn(
+            (1, 1, 12 * sparse_block_size, head_dim), device=device, dtype=dtype
+        )
         v = torch.randn_like(k)
         full_indices = torch.tensor(
-            [[1, 2, 3, 4, 5, 6], [1, 7, 8, 9, 10, 11]],
+            [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 6]],
             device=device,
             dtype=torch.int32,
         ).view(2, 1, 1, 6)
 
+        partial_indices = torch.tensor(
+            [[0, 0, 0, 0, 0], [0, 1, 2, 3, 4]],
+            device=device,
+            dtype=torch.int32,
+        ).view(2, 1, 1, 5)
+        partial_counts = torch.tensor(
+            [1, 5], device=device, dtype=torch.int32
+        ).view(2, 1, 1)
+        full_counts = torch.tensor([6, 2], device=device, dtype=torch.int32).view(
+            2, 1, 1
+        )
         block_mask = BlockMask.from_kv_blocks(
-            kv_num_blocks=torch.zeros((2, 1, 1), device=device, dtype=torch.int32),
-            kv_indices=torch.zeros((2, 1, 1, 1), device=device, dtype=torch.int32),
-            full_kv_num_blocks=torch.full(
-                (2, 1, 1), 6, device=device, dtype=torch.int32
-            ),
+            kv_num_blocks=partial_counts,
+            kv_indices=partial_indices,
+            full_kv_num_blocks=full_counts,
             full_kv_indices=full_indices,
-            BLOCK_SIZE=(16, page_size),
-            seq_lengths=(1, 12 * page_size),
+            BLOCK_SIZE=(16, sparse_block_size),
+            seq_lengths=(1, 12 * sparse_block_size),
             compute_q_blocks=False,
         )
 
@@ -4952,13 +4963,31 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 kernel_options={"BACKEND": "TRITON_DECODE", "SPLIT_KV": 4},
             )
 
-        result = torch.compile(attention, fullgraph=True)(q, k, v, block_mask)
-        token_offsets = torch.arange(page_size, device=device)
+        result, code = run_and_get_code(
+            torch.compile(attention, fullgraph=True), q, k, v, block_mask
+        )
+        generated = "\n".join(code)
+        self.assertIn(
+            "max_kv_num_blocks = tl.maximum(kv_num_blocks, full_kv_num_blocks)",
+            generated,
+        )
+        self.assertIn(
+            "max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV", generated
+        )
+        self.assertNotIn("tl.cdiv(KV_LEN, SPLIT_KV)", generated)
+        token_offsets = torch.arange(sparse_block_size, device=device)
         references = []
         for batch in range(2):
+            partial_count = 1 if batch == 0 else 5
+            full_count = 6 if batch == 0 else 2
+            block_indices = torch.cat(
+                (
+                    partial_indices[batch, 0, 0, :partial_count],
+                    full_indices[batch, 0, 0, :full_count],
+                )
+            )
             token_indices = (
-                full_indices[batch, 0, 0, :, None].long() * page_size
-                + token_offsets
+                block_indices.long()[:, None] * sparse_block_size + token_offsets
             ).flatten()
             selected_k = k[0, 0, token_indices].float()
             selected_v = v[0, 0, token_indices].float()

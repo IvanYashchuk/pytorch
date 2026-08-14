@@ -125,10 +125,13 @@
 
     # Make sure each split is a multiple of BLOCK_N
     if HAS_FULL_BLOCKS:
-        # TODO do the optimization as partial blocks once vllm is
-        # able to pass in full blocks:
-        # https://github.com/vllm-project/vllm/blob/61249b177de1566027fc74e9b51b45a4c973eb47/vllm/v1/attention/backends/flex_attention.py#L615-L616
-        TILE_KV_OG = tl.cdiv(KV_LEN, SPLIT_KV)
+        full_kv_num_blocks = tl.load(
+            FULL_KV_NUM_BLKS + sparse_full_block_zhm_offset
+        )
+        max_kv_num_blocks = tl.maximum(kv_num_blocks, full_kv_num_blocks)
+        TILE_KV_OG = tl.cdiv(
+            max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV
+        )
     else:
         TILE_KV_OG = tl.cdiv(kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV)
     TILE_KV = tl.cdiv(TILE_KV_OG, BLOCK_N) * BLOCK_N
@@ -189,9 +192,7 @@
     # apply mask_mod to them - only score_mod
     if HAS_FULL_BLOCKS:
         kv_indices = FULL_KV_IDX + sparse_full_idx_zhm_offset
-        kv_num_blocks = tl.load(
-            FULL_KV_NUM_BLKS + sparse_full_block_zhm_offset
-        )
+        kv_num_blocks = full_kv_num_blocks
         MAX_FULL_KV_IDX = {{size("FULL_KV_IDX", -1)}}
         # Assign full block in a reverse order for off_t. Prioritize the last CTA.
         block_n_start = (SPLIT_KV - off_t - 1) * TILE_KV_MULTIPLE
