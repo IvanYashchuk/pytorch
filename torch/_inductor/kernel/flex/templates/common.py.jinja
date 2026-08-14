@@ -15,6 +15,7 @@ def forward_block_mn(
     MATMUL_PRECISION, RCP_LN2,
     # Strides for K and V
     stride_kk, stride_kn, stride_vn, stride_vk,
+    BLOCK_M_INNER: tl.constexpr,
     IS_FULL_BLOCKS, CHECK_Q_BOUNDARY=False, CHECK_KV_BOUNDARY=False,
 
 ):
@@ -60,8 +61,8 @@ def forward_block_mn(
         n="n",
         out="qk",
         input_shapes={
-            "score": ("BLOCK_M", "BLOCK_N"),
-            "m": ("BLOCK_M", "1"),
+            "score": ("BLOCK_M_INNER", "BLOCK_N"),
+            "m": ("BLOCK_M_INNER", "1"),
             "n": ("1", "BLOCK_N"),
         },
         input_dtypes={
@@ -86,8 +87,8 @@ def forward_block_mn(
             m="m",
             n="n",
             input_shapes={
-                "score": ("BLOCK_M", "BLOCK_N"),
-                "m": ("BLOCK_M", "1"),
+                "score": ("BLOCK_M_INNER", "BLOCK_N"),
+                "m": ("BLOCK_M_INNER", "1"),
                 "n": ("1", "BLOCK_N"),
             },
             input_dtypes={
@@ -160,6 +161,7 @@ def forward_inner(
     MATMUL_PRECISION,
     # Strides for K and V
     stride_kk, stride_kn, stride_vn, stride_vk,
+    BLOCK_M_INNER: tl.constexpr,
     IS_FULL_BLOCKS, CHECK_Q_BOUNDARY: tl.constexpr,
 ):
     # Redefines all kernel parameters (BLOCK_M, etc.) so we don't need to plumb them all through
@@ -192,6 +194,7 @@ def forward_inner(
             MATMUL_PRECISION, RCP_LN2,
             # Strides for K and V
             stride_kk, stride_kn, stride_vn, stride_vk,
+            BLOCK_M_INNER,
             IS_FULL_BLOCKS,
             CHECK_Q_BOUNDARY=CHECK_Q_BOUNDARY,
             CHECK_KV_BOUNDARY=not IS_DIVISIBLE_KV,

@@ -792,7 +792,7 @@ class TritonTemplateKernel(TritonKernel):
     def _make_independent_subgraph(self, subgraph_name, numel, **extra_fields):
         """Create a subgraph with fresh independent range trees.
 
-        Used by external template backends for epilogue/prologue hooks
+        Used by template stores and external-backend epilogue/prologue hooks
         that need their own range tree state.
         """
         groups = {"x": V.graph.sizevars.simplify(numel), "r0_": sympy.S.One}
@@ -1472,6 +1472,7 @@ class TritonTemplateKernel(TritonKernel):
         indent_width: int = 4,
         val_shape: tuple[str] | None = None,
         block_indexing: bool = False,
+        xindex_name: str = "xindex",
     ):
         """Stores the final output and appends any epilogue fusions if the buffer hasn't been optimized away.
 
@@ -1485,10 +1486,20 @@ class TritonTemplateKernel(TritonKernel):
                 store_output is indented in the kernel definition.
             block_indexing (bool): Are the input indices presented as offsets for creating the block (e.g.
                 inputs to TMA) or are they tensors that should be passed in directly.
+            xindex_name (str): Temporary name for the flattened output index.
+                Use a distinct name when one template emits stores with
+                incompatible tensor shapes in separate control-flow paths.
         """
         subgraph_idx = next(self.store_output_ctr)
         subgraph_name = self._get_store_output_subgraph_name(subgraph_idx)
-        with self.create_subgraph_body(subgraph_name, clear_cse=True):
+        if xindex_name == "xindex":
+            subgraph_context = self.create_subgraph_body(subgraph_name, clear_cse=True)
+        else:
+            self._make_independent_subgraph(
+                subgraph_name, sympy_product(self.output_node.get_size())
+            )
+            subgraph_context = self.set_subgraph_body(subgraph_name)
+        with subgraph_context:
             if not isinstance(indices, (list, tuple)):
                 raise AssertionError(
                     f"expected indices to be list or tuple, got {type(indices)}"
@@ -1631,14 +1642,18 @@ class TritonTemplateKernel(TritonKernel):
                 if self.tma_store:
                     raise AssertionError("TMA store requires block indexing")
                 contiguous_index = self._setup_contiguous_index_state(
-                    indices, index_symbols, lengths, mask
+                    indices,
+                    index_symbols,
+                    lengths,
+                    mask,
+                    xindex_name=xindex_name,
                 )
                 output_index = self.output_node.get_layout().make_indexer()(
                     index_symbols
                 )
                 output_index = self.rename_indexing(output_index)
                 if output_index == contiguous_index:
-                    output_index = sympy.Symbol("xindex", integer=True)
+                    output_index = sympy.Symbol(xindex_name, integer=True)
 
             self.template_out_shape = val_shape if val_shape else val
             acc_dtype = (

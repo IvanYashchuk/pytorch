@@ -174,6 +174,7 @@
         block_n_start, block_n_end if block_n_end <= block_n_last_valid else block_n_last_valid,
         MATMUL_PRECISION,
         stride_kk, stride_kn, stride_vn, stride_vk,
+        BLOCK_M,
         IS_FULL_BLOCKS=False,
         CHECK_Q_BOUNDARY=not SAFE_M_BOUNDARY,
     )
@@ -210,6 +211,7 @@
             block_n_start, block_n_end if block_n_end <= block_n_last_valid else block_n_last_valid,
             MATMUL_PRECISION,
             stride_kk, stride_kn, stride_vn, stride_vk,
+            BLOCK_M,
             IS_FULL_BLOCKS=True,
             CHECK_Q_BOUNDARY=not SAFE_M_BOUNDARY,
         )

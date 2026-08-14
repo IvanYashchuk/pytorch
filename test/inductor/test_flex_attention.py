@@ -3323,8 +3323,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         if (
             torch.device(device).type != "cuda"
             or torch.cuda.get_device_capability(device) != (10, 7)
+            or torch.cuda.get_device_properties(device).multi_processor_count != 212
         ):
-            self.skipTest("Requires Rubin GQA full-head packing")
+            self.skipTest("Requires the measured 212-SM Rubin configuration")
 
         query_len, kv_len = 1025, 4096
         query_heads, kv_heads, head_dim = 32, 8, 256
@@ -3374,12 +3375,17 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         source = "\n".join(code)
         fallback_source = "\n".join(fallback_code)
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = True", source)
+        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = True", source)
         self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
         self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
         self.assertIn("USE_TMA : tl.constexpr = False", source)
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", fallback_source)
+        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False", fallback_source)
         self.assertTrue(torch.equal(packed_out, fallback_out))
-        self.assertTrue(torch.equal(packed_aux.lse, fallback_aux.lse))
+        # A true-M16 tail changes the order of the FP32 softmax reduction.
+        # The measured difference is at most one FP32 ulp while output and
+        # max-score remain bitwise identical.
+        self.assertEqual(packed_aux.lse, fallback_aux.lse, atol=1e-6, rtol=0)
         self.assertTrue(torch.equal(packed_aux.max_scores, fallback_aux.max_scores))
 
         # Profitability is established only for the measured KV4096 loop
@@ -3414,6 +3420,65 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         self.assertIn(
             "PACK_ALL_GQA_HEADS : tl.constexpr = False", "\n".join(short_code)
         )
+        self.assertIn(
+            "PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False",
+            "\n".join(short_code),
+        )
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    def test_causal_gqa_small_tail_fused_epilogue(self, device):
+        if (
+            torch.device(device).type != "cuda"
+            or torch.cuda.get_device_capability(device) != (10, 7)
+            or torch.cuda.get_device_properties(device).multi_processor_count != 212
+        ):
+            self.skipTest("Requires the measured 212-SM Rubin configuration")
+
+        query_len, kv_len = 1025, 4096
+        query = torch.randn(1, 32, query_len, 256, device=device, dtype=torch.bfloat16)
+        key = torch.randn(1, 8, kv_len, 256, device=device, dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        def softcap(score, b, h, q, kv):
+            return 20.0 * torch.tanh(score / 20.0)
+
+        block_mask = create_block_mask(
+            causal_mask, 1, 1, query_len, kv_len, device=device
+        )
+
+        def run(query, key, value):
+            out = flex_attention(
+                query,
+                key,
+                value,
+                score_mod=softcap,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 8,
+                },
+            )
+            return torch.sin(out) + 0.125
+
+        expected = run(query, key, value)
+        actual, code = run_and_get_code(
+            torch.compile(run, fullgraph=True), query, key, value
+        )
+        source = "\n".join(code)
+        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = True", source)
+        self.assertIn("tail_xindex =", source)
+        self.assertIn("\n        xindex =", source)
+        self.assertEqual(source.count("tl_math.sin"), 2)
+        self.assertEqual(actual, expected, atol=2e-2, rtol=2e-2)
 
     @supported_platform
     @skip_on_cpu

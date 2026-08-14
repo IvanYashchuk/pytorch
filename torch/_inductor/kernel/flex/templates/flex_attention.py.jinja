@@ -67,6 +67,12 @@
     off_m = first_q + tl.arange(0, QUERY_TILE_M)
     offs_m = tl.ravel(tl.broadcast_to(off_m[None, :], [G, QUERY_TILE_M]))
     sparse_q_idx = q_start // (SPARSE_Q_BLOCK_SIZE // QUERY_TILE_M)
+    {%- if PACK_ALL_GQA_SMALL_TAIL %}
+    # Q_LEN is static for this fail-closed product candidate, but q_start is
+    # intentionally a runtime program-id mapping. Only the final logical tile
+    # takes the true-M=16 path in this one cubin.
+    is_small_packed_tail = q_start == Q_LEN // QUERY_TILE_M
+    {%- endif %}
     {%- elif PACK_GQA_HEADS %}
     HKV: tl.constexpr = HQ // G
     tl.static_assert(BLOCK_M == G * QUERY_TILE_M)
@@ -210,6 +216,7 @@
     stride_full_kv_idx_m = {{stride("FULL_KV_IDX", 2)}}
     {%- endif %}
 
+{% set main_body -%}
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -301,6 +308,7 @@
         0, block_n_end,
         MATMUL_PRECISION,
         stride_kk, stride_kn, stride_vn, stride_vk,
+        BLOCK_M,
         IS_FULL_BLOCKS=False,
         CHECK_Q_BOUNDARY=
         {%- if PACK_GQA_HEADS %} False, {%- else %} not IS_DIVISIBLE_Q, {%- endif %}
@@ -332,6 +340,7 @@
             0, block_n_end,
             MATMUL_PRECISION,
             stride_kk, stride_kn, stride_vn, stride_vk,
+            BLOCK_M,
             IS_FULL_BLOCKS=True,
             CHECK_Q_BOUNDARY=
             {%- if PACK_GQA_HEADS %} False, {%- else %} not IS_DIVISIBLE_Q, {%- endif %}
@@ -358,7 +367,13 @@
     {%- else %}
     mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
     {%- endif %}
-    {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"))}}
+    {{store_output(
+        ("idx_zq", "idx_hq", "idx_m", "idx_d"),
+        "acc",
+        "mask",
+        indent_width=8 if PACK_ALL_GQA_SMALL_TAIL else 0,
+        val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"),
+    )}}
 
     if OUTPUT_LOGSUMEXP:
         lse = m_i + tl.math.log2(l_i)
@@ -408,3 +423,156 @@
         else:
             tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
         {%- endif %}
+{%- endset %}
+
+{% set small_tail_body -%}
+TAIL_QUERY_TILE_M: tl.constexpr = 4
+TAIL_BLOCK_M: tl.constexpr = G * TAIL_QUERY_TILE_M
+tl.static_assert(TAIL_BLOCK_M == 16)
+
+tail_off_g = tl.arange(0, G)
+tail_offs_hq = tl.ravel(
+    tl.broadcast_to(
+        (off_hkv * G + tail_off_g)[:, None], [G, TAIL_QUERY_TILE_M]
+    )
+)
+tail_off_m = q_start * QUERY_TILE_M + tl.arange(0, TAIL_QUERY_TILE_M)
+tail_offs_m = tl.ravel(
+    tl.broadcast_to(tail_off_m[None, :], [G, TAIL_QUERY_TILE_M])
+)
+
+tail_m_i = tl.zeros([TAIL_BLOCK_M], dtype=tl.float32) - float("inf")
+tail_l_i = tl.zeros([TAIL_BLOCK_M], dtype=tl.float32)
+tail_acc = tl.zeros([TAIL_BLOCK_M, V_HEAD_DIM_ROUNDED], dtype=tl.float32)
+
+tail_sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
+tail_sparse_kv_num_blks_offset = (
+    tail_sparse_hz_offset * stride_kv_num_blks_h + sparse_q_idx
+)
+tail_sparse_kv_idx_offset = (
+    tail_sparse_hz_offset * stride_kv_idx_h
+    + sparse_q_idx * stride_kv_idx_m
+)
+{%- if HAS_FULL_BLOCKS %}
+tail_sparse_full_kv_num_blks_offset = (
+    tail_sparse_hz_offset * stride_full_kv_num_blks_h + sparse_q_idx
+)
+tail_sparse_full_kv_idx_offset = (
+    tail_sparse_hz_offset * stride_full_kv_idx_h
+    + sparse_q_idx * stride_full_kv_idx_m
+)
+{%- endif %}
+
+tail_offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
+tail_q_ptrs = (
+    Q
+    + tail_offs_hq[:, None] * stride_qh
+    + tail_offs_m[:, None] * stride_qm
+    + tail_offs_k[None, :] * stride_qk
+)
+tail_q = tl.load(
+    tail_q_ptrs,
+    mask=(tail_offs_m[:, None] < Q_LEN)
+    & (tail_offs_k[None, :] < QK_HEAD_DIM),
+    other=0.0,
+)
+
+# Partially masked KV blocks.
+tail_kv_indices = KV_IDX + tail_sparse_kv_idx_offset
+tail_kv_start = tl.load(tail_kv_indices) * SPARSE_KV_BLOCK_SIZE
+tail_kv_num_blocks = tl.load(
+    KV_NUM_BLKS + tail_sparse_kv_num_blks_offset
+)
+tail_block_n_end = tl.minimum(
+    tail_kv_num_blocks * SPARSE_KV_MULTIPLE,
+    tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1),
+)
+tail_offs_n = tail_kv_start + tl.arange(0, BLOCK_N)
+
+tail_acc, tail_l_i, tail_m_i = forward_inner(
+    {{gen_argdefs()}},
+    tail_q, K, V,
+    desc_k, desc_v, Q_LEN, KV_LEN,
+    tail_acc, tail_l_i, tail_m_i,
+    off_zq, tail_offs_hq[:, None], tail_offs_m[:, None],
+    tail_offs_n[None, :],
+    tail_kv_start,
+    tail_kv_indices, tail_kv_num_blocks,
+    0, tail_block_n_end,
+    MATMUL_PRECISION,
+    stride_kk, stride_kn, stride_vn, stride_vk,
+    TAIL_BLOCK_M,
+    IS_FULL_BLOCKS=False,
+    CHECK_Q_BOUNDARY=True,
+)
+
+{%- if HAS_FULL_BLOCKS %}
+# Fully unmasked KV blocks.
+tail_kv_indices = FULL_KV_IDX + tail_sparse_full_kv_idx_offset
+tail_kv_start = tl.load(tail_kv_indices) * SPARSE_KV_BLOCK_SIZE
+tail_kv_num_blocks = tl.load(
+    FULL_KV_NUM_BLKS + tail_sparse_full_kv_num_blks_offset
+)
+tail_block_n_end = tl.minimum(
+    tail_kv_num_blocks * SPARSE_KV_MULTIPLE,
+    tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1),
+)
+tail_offs_n = tail_kv_start + tl.arange(0, BLOCK_N)
+
+tail_acc, tail_l_i, tail_m_i = forward_inner(
+    {{gen_argdefs()}},
+    tail_q, K, V,
+    desc_k, desc_v, Q_LEN, KV_LEN,
+    tail_acc, tail_l_i, tail_m_i,
+    off_zq, tail_offs_hq[:, None], tail_offs_m[:, None],
+    tail_offs_n[None, :],
+    tail_kv_start,
+    tail_kv_indices, tail_kv_num_blocks,
+    0, tail_block_n_end,
+    MATMUL_PRECISION,
+    stride_kk, stride_kn, stride_vn, stride_vk,
+    TAIL_BLOCK_M,
+    IS_FULL_BLOCKS=True,
+    CHECK_Q_BOUNDARY=True,
+)
+{%- endif %}
+
+tail_l_i = tl.where(tail_l_i == 0.0, 1, tail_l_i)
+tail_acc = tail_acc / tail_l_i[:, None]
+tl.static_assert(
+    tail_acc.shape == [TAIL_BLOCK_M, V_HEAD_DIM_ROUNDED]
+)
+tail_idx_zq = off_zq
+tail_idx_hq = tail_offs_hq[:, None].to(INDEX_DTYPE)
+tail_idx_m = tail_offs_m[:, None].to(INDEX_DTYPE)
+tail_idx_d = tl.arange(0, V_HEAD_DIM_ROUNDED)[None, :].to(INDEX_DTYPE)
+tail_mask = (tail_idx_m < Q_LEN) & (tail_idx_d < V_HEAD_DIM)
+{{store_output(
+    ("tail_idx_zq", "tail_idx_hq", "tail_idx_m", "tail_idx_d"),
+    "tail_acc",
+    "tail_mask",
+    indent_width=8,
+    val_shape=("TAIL_BLOCK_M", "V_HEAD_DIM_ROUNDED"),
+    xindex_name="tail_xindex",
+)}}
+
+if OUTPUT_LOGSUMEXP:
+    tail_lse = tail_m_i + tl.math.log2(tail_l_i)
+    tail_off_hz = off_zq * HQ + tail_offs_hq
+    tail_l_ptrs = LSE + tail_off_hz * Q_LEN + tail_offs_m
+    tl.store(tail_l_ptrs, tail_lse, mask=tail_offs_m < Q_LEN)
+
+if OUTPUT_MAX:
+    tail_off_hz = off_zq * HQ + tail_offs_hq
+    tail_max_ptrs = MAX + tail_off_hz * Q_LEN + tail_offs_m
+    tl.store(tail_max_ptrs, tail_m_i, mask=tail_offs_m < Q_LEN)
+{%- endset %}
+
+    {%- if PACK_ALL_GQA_SMALL_TAIL %}
+    if is_small_packed_tail:
+        {{small_tail_body | indent_except_first(2)}}
+    else:
+    {{main_body | indent_except_first(1)}}
+    {%- else %}
+{{main_body}}
+    {%- endif %}

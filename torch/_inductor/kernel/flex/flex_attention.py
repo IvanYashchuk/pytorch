@@ -853,6 +853,15 @@ def flex_attention(
         # packed traversal.
         cur_kernel_options["PACK_GQA_HEADS"] = pack_gqa_heads
         cur_kernel_options["PACK_ALL_GQA_HEADS"] = pack_all_gqa_heads
+        cur_kernel_options["PACK_ALL_GQA_SMALL_TAIL"] = (
+            pack_all_gqa_heads
+            and V.graph.sizevars.statically_known_true(
+                sympy.And(
+                    sympy.Ge(sympy.Mod(seq_len_q, 128), 1),
+                    sympy.Le(sympy.Mod(seq_len_q, 128), 4),
+                )
+            )
+        )
         if pack_gqa_heads or pack_all_gqa_heads:
             # The static-equality proof above establishes this literal. Keep
             # the grid and Triton constexpr independent of symbolic head
