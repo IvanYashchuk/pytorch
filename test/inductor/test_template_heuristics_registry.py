@@ -752,9 +752,9 @@ class TestFlexAttentionAutotuneInputs(TestCase):
         sizevars = mock.Mock()
         sizevars.statically_known_true.side_effect = lambda expr: expr is sympy.true
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
-            for q_len in (1025, 1028, 1032):
+            for q_len in range(1025, 1057):
                 self.assertTrue(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
-            for q_len in (1024, 1033, 1040, 1056, 1057, 1088, 897, 1665):
+            for q_len in (1024, 1057, 1088, 1152, 1153, 897, 1665):
                 self.assertFalse(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
             self.assertFalse(_can_pack_all_gqa_heads(1025, 64, 128, 32, 212))
             self.assertFalse(_can_pack_all_gqa_heads(1025, 32, 128, 32, 216))
@@ -801,6 +801,52 @@ class TestFlexAttentionAutotuneInputs(TestCase):
                 _can_pack_gqa_query_tail(769, dynamic_heads, 128, 32, 212)
             )
 
+    def test_causal_gqa_tail_program_mapping(self):
+        for q_len, tail_query_tile_m in (
+            (1025, 4),
+            (1048, 4),
+            (1049, 16),
+            (1056, 16),
+        ):
+            last_q_start = (q_len - 1) // 32
+            logical_tail_rows = (q_len - 1) % 32 + 1
+            tail_programs = (
+                logical_tail_rows + tail_query_tile_m - 1
+            ) // tail_query_tile_m
+            programs = last_q_start + tail_programs
+
+            causal_mapping = []
+            for q_program in range(programs):
+                is_tail = q_program < tail_programs
+                causal_mapping.append(
+                    (
+                        last_q_start
+                        if is_tail
+                        else last_q_start - (q_program - tail_programs + 1),
+                        tail_programs - 1 - q_program if is_tail else None,
+                    )
+                )
+            noncausal_mapping = []
+            for q_program in range(programs):
+                is_tail = q_program >= last_q_start
+                noncausal_mapping.append(
+                    (
+                        min(q_program, last_q_start),
+                        q_program - last_q_start if is_tail else None,
+                    )
+                )
+
+            expected_prefix = {(q_start, None) for q_start in range(last_q_start)}
+            expected_tail = {
+                (last_q_start, tail_part)
+                for tail_part in range(tail_programs)
+            }
+            expected = expected_prefix | expected_tail
+            self.assertEqual(set(causal_mapping), expected)
+            self.assertEqual(set(noncausal_mapping), expected)
+            self.assertEqual(len(causal_mapping), len(expected))
+            self.assertEqual(len(noncausal_mapping), len(expected))
+
     def test_causal_mask_classifier_rejects_constant_output(self):
         graph = torch.fx.Graph()
         for name in ("b", "h", "q", "kv"):
@@ -845,19 +891,43 @@ class TestFlexAttentionAutotuneInputs(TestCase):
             "PACK_ALL_GQA_HEADS": True,
             "GQA_SHARED_HEADS": 4,
         }
-        self.assertEqual(
-            flex_attention_grid(1, 32, 1025, 256, full_meta), (33, 1, 8)
-        )
-        self.assertEqual(
-            flex_attention_grid(
-                1,
-                32,
-                1025,
-                256,
-                {**full_meta, "CAUSAL_LOAD_BALANCE": True},
-            ),
-            (264, 1, 1),
-        )
+        for q_len, tail_programs, programs in (
+            (1025, 1, 264),
+            (1028, 1, 264),
+            (1029, 2, 272),
+            (1032, 2, 272),
+            (1033, 3, 280),
+            (1036, 3, 280),
+            (1037, 4, 288),
+            (1040, 4, 288),
+            (1041, 5, 296),
+            (1044, 5, 296),
+            (1045, 6, 304),
+            (1048, 6, 304),
+            (1049, 2, 272),
+            (1052, 2, 272),
+            (1053, 2, 272),
+            (1055, 2, 272),
+            (1056, 2, 272),
+        ):
+            meta = {
+                **full_meta,
+                "PACK_ALL_GQA_TAIL_PROGRAMS": tail_programs,
+            }
+            self.assertEqual(
+                flex_attention_grid(1, 32, q_len, 256, meta),
+                (programs // 8, 1, 8),
+            )
+            self.assertEqual(
+                flex_attention_grid(
+                    1,
+                    32,
+                    q_len,
+                    256,
+                    {**meta, "CAUSAL_LOAD_BALANCE": True},
+                ),
+                (programs, 1, 1),
+            )
 
         # Shapes outside the static 1..32 tail gate retain the exact ordinary
         # grid. Causal load balancing still flattens that legacy work.

@@ -3317,11 +3317,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     @skip_on_mps  # exercises Rubin branch-free full-head packing
-    @common_utils.parametrize("query_len", [1025, 1028, 1029, 1030, 1031, 1032])
+    @common_utils.parametrize(
+        "query_len", [1025, 1032, 1033, 1040, 1041, 1048, 1049, 1056, 1057]
+    )
     def test_causal_gqa_full_head_packing_load_balanced_aux(
         self, device, query_len
     ):
-        """Pack every forward CTA only inside the measured second-wave window."""
+        """Pack every forward CTA only inside the specialized cliff window."""
 
         if (
             torch.device(device).type != "cuda"
@@ -3377,36 +3379,51 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
         source = "\n".join(code)
         fallback_source = "\n".join(fallback_code)
+        if query_len == 1057:
+            self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", source)
+            self.assertIn(
+                "PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = 0", source
+            )
+            self.assertIn(", 288, 1, 1, stream=", source)
+            self.assertTrue(torch.equal(packed_out, fallback_out))
+            self.assertTrue(torch.equal(packed_aux.lse, fallback_aux.lse))
+            self.assertTrue(
+                torch.equal(packed_aux.max_scores, fallback_aux.max_scores)
+            )
+            return
+        tail_query_tile_m = 16 if query_len % 128 >= 25 else 4
+        logical_tail_rows = (query_len - 1) % 32 + 1
+        tail_programs = (
+            logical_tail_rows + tail_query_tile_m - 1
+        ) // tail_query_tile_m
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = True", source)
         self.assertIn(
-            f"PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = {query_len <= 1028}", source
-        )
-        self.assertIn(
-            f"PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = {query_len >= 1029}",
+            f"PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = {tail_programs}",
             source,
         )
         self.assertIn(
-            f", {272 if query_len >= 1029 else 264}, 1, 1, stream=", source
+            f"PACK_ALL_GQA_TAIL_QUERY_TILE_M : tl.constexpr = {tail_query_tile_m}",
+            source,
         )
+        self.assertIn(f", {256 + 8 * tail_programs}, 1, 1, stream=", source)
         self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
         self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
         self.assertIn("USE_TMA : tl.constexpr = False", source)
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", fallback_source)
-        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False", fallback_source)
         self.assertIn(
-            "PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = False", fallback_source
+            "PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = 0", fallback_source
         )
-        self.assertTrue(torch.equal(packed_out, fallback_out))
-        # A true-M16 tail changes the order of the FP32 softmax reduction.
-        # The measured difference is at most one FP32 ulp while output and
-        # max-score remain bitwise identical.
+        # A true-M16/M64 tail changes the order of the FP32 softmax reduction.
+        # The measured difference is at most one FP32 ulp in LSE and one
+        # BF16/FP16 ulp in rare output elements; max-score remains exact.
+        self.assertEqual(packed_out, fallback_out, atol=2.5e-4, rtol=0)
         self.assertEqual(packed_aux.lse, fallback_aux.lse, atol=1e-6, rtol=0)
         self.assertTrue(torch.equal(packed_aux.max_scores, fallback_aux.max_scores))
 
         # One representative verifies that profitability remains restricted
         # to the measured KV4096 loop count. A shorter KV extent must retain
         # the ordinary mapping.
-        if query_len != 1029:
+        if query_len != 1033:
             return
         short_key = key[:, :, :1025]
         short_value = value[:, :, :1025]
@@ -3439,18 +3456,14 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             "PACK_ALL_GQA_HEADS : tl.constexpr = False", "\n".join(short_code)
         )
         self.assertIn(
-            "PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False",
-            "\n".join(short_code),
-        )
-        self.assertIn(
-            "PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = False",
+            "PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = 0",
             "\n".join(short_code),
         )
 
     @supported_platform
     @skip_on_cpu
     @skip_on_mps
-    @common_utils.parametrize("query_len", [1025, 1032])
+    @common_utils.parametrize("query_len", [1025, 1040, 1049, 1056])
     def test_causal_gqa_edge_tail_fused_epilogue(self, device, query_len):
         if (
             torch.device(device).type != "cuda"
@@ -3497,11 +3510,16 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             torch.compile(run, fullgraph=True), query, key, value
         )
         source = "\n".join(code)
+        tail_query_tile_m = 16 if query_len % 128 >= 25 else 4
+        logical_tail_rows = (query_len - 1) % 32 + 1
+        tail_programs = (
+            logical_tail_rows + tail_query_tile_m - 1
+        ) // tail_query_tile_m
         self.assertIn(
-            f"PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = {query_len == 1025}", source
+            f"PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = {tail_programs}", source
         )
         self.assertIn(
-            f"PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = {query_len == 1032}",
+            f"PACK_ALL_GQA_TAIL_QUERY_TILE_M : tl.constexpr = {tail_query_tile_m}",
             source,
         )
         self.assertIn("tail_xindex =", source)

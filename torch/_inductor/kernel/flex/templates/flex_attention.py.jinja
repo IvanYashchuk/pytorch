@@ -54,22 +54,25 @@
         off_hkv = flat_program % HKV
         off_zq = (flat_program // HKV) % ZQ
         q_program = flat_program // (HKV * ZQ)
-        {%- if PACK_ALL_GQA_SPLIT_M16_TAIL %}
-        is_packed_tail = q_program < 2
-        # Preserve descending causal query order across the two edge halves.
-        tail_part = 1 - q_program
+        {%- if PACK_ALL_GQA_TAIL_PROGRAMS %}
+        tail_programs: tl.constexpr = PACK_ALL_GQA_TAIL_PROGRAMS
+        is_packed_tail = q_program < tail_programs
+        # Preserve descending causal query order across the edge parts.
+        tail_part = tail_programs - 1 - q_program
+        last_q_start = tl.cdiv(Q_LEN, QUERY_TILE_M) - 1
         q_start = tl.where(
             is_packed_tail,
-            tl.cdiv(Q_LEN, QUERY_TILE_M) - 1,
-            tl.cdiv(Q_LEN, QUERY_TILE_M) - q_program,
+            last_q_start,
+            last_q_start - (q_program - tail_programs + 1),
         )
         {%- else %}
         q_start = tl.cdiv(Q_LEN, QUERY_TILE_M) - 1 - q_program
         {%- endif %}
     else:
-        {%- if PACK_ALL_GQA_SPLIT_M16_TAIL %}
+        {%- if PACK_ALL_GQA_TAIL_PROGRAMS %}
+        tail_programs: tl.constexpr = PACK_ALL_GQA_TAIL_PROGRAMS
         q_program = tl.program_id(0).to(INDEX_DTYPE)
-        final_q_program = Q_LEN // QUERY_TILE_M
+        final_q_program = (Q_LEN - 1) // QUERY_TILE_M
         is_packed_tail = q_program >= final_q_program
         tail_part = q_program - final_q_program
         q_start = tl.minimum(q_program, final_q_program)
@@ -86,11 +89,13 @@
     off_m = first_q + tl.arange(0, QUERY_TILE_M)
     offs_m = tl.ravel(tl.broadcast_to(off_m[None, :], [G, QUERY_TILE_M]))
     sparse_q_idx = q_start // (SPARSE_Q_BLOCK_SIZE // QUERY_TILE_M)
-    {%- if PACK_ALL_GQA_SMALL_TAIL %}
+    {%- if PACK_ALL_GQA_TAIL_PROGRAMS %}
     # Q_LEN is static for this fail-closed product candidate, but q_start is
     # intentionally a runtime program-id mapping. Only the final logical tile
-    # takes the true-M=16 path in this one cubin.
-    is_packed_tail = q_start == Q_LEN // QUERY_TILE_M
+    # takes the true-M=16/M=64 path in this one cubin.
+    {%- if not CAUSAL_LOAD_BALANCE %}
+    is_packed_tail = q_start == (Q_LEN - 1) // QUERY_TILE_M
+    {%- endif %}
     {%- endif %}
     {%- elif PACK_GQA_HEADS %}
     HKV: tl.constexpr = HQ // G
@@ -390,7 +395,7 @@
         ("idx_zq", "idx_hq", "idx_m", "idx_d"),
         "acc",
         "mask",
-        indent_width=8 if PACK_ALL_GQA_SMALL_TAIL or PACK_ALL_GQA_SPLIT_M16_TAIL else 0,
+        indent_width=8 if PACK_ALL_GQA_TAIL_PROGRAMS else 0,
         val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"),
     )}}
 
@@ -445,9 +450,9 @@
 {%- endset %}
 
 {% set edge_tail_body -%}
-TAIL_QUERY_TILE_M: tl.constexpr = 4
+TAIL_QUERY_TILE_M: tl.constexpr = PACK_ALL_GQA_TAIL_QUERY_TILE_M
 TAIL_BLOCK_M: tl.constexpr = G * TAIL_QUERY_TILE_M
-tl.static_assert(TAIL_BLOCK_M == 16)
+tl.static_assert((TAIL_QUERY_TILE_M - 4) * (TAIL_QUERY_TILE_M - 16) == 0)
 
 tail_off_g = tl.arange(0, G)
 tail_offs_hq = tl.ravel(
@@ -456,7 +461,7 @@ tail_offs_hq = tl.ravel(
     )
 )
 tail_off_m = q_start * QUERY_TILE_M
-{%- if PACK_ALL_GQA_SPLIT_M16_TAIL %}
+{%- if PACK_ALL_GQA_TAIL_PROGRAMS %}
 tail_off_m += tail_part * TAIL_QUERY_TILE_M
 {%- endif %}
 tail_off_m += tl.arange(0, TAIL_QUERY_TILE_M)
@@ -591,7 +596,7 @@ if OUTPUT_MAX:
     tl.store(tail_max_ptrs, tail_m_i, mask=tail_offs_m < Q_LEN)
 {%- endset %}
 
-    {%- if PACK_ALL_GQA_SMALL_TAIL or PACK_ALL_GQA_SPLIT_M16_TAIL %}
+    {%- if PACK_ALL_GQA_TAIL_PROGRAMS %}
     if is_packed_tail:
         {{edge_tail_body | indent_except_first(2)}}
     else:

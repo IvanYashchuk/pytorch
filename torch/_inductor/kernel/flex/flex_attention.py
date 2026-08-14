@@ -298,14 +298,13 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
     """
     if meta.get("PACK_ALL_GQA_HEADS", False):
         # Every physical BLOCK_M tile packs G logical query heads by
-        # QUERY_TILE_M rows. This branch-free mapping is useful when the
-        # hybrid prefix/tail cubin removes CTAs but not an SM wave.
+        # QUERY_TILE_M rows. The hybrid cubin reshapes the final SM wave with
+        # M16/M64 edge programs while keeping the main path branch-free.
         query_blocks = cdiv(num_queries, meta["QUERY_TILE_M"])
-        if meta.get("PACK_ALL_GQA_SPLIT_M16_TAIL", False):
-            # Cover a 5--8 row/head edge with two physical M16 programs. The
-            # logical query tile remains 32 rows/head, so only the physical
-            # launch count grows by one program per batch/KV-head group.
-            query_blocks += 1
+        tail_programs = meta["PACK_ALL_GQA_TAIL_PROGRAMS"]
+        if tail_programs:
+            # The logical edge tile becomes physical M16 or M64 programs.
+            query_blocks += tail_programs - 1
         kv_heads = q_heads // meta["GQA_SHARED_HEADS"]
         if meta.get("CAUSAL_LOAD_BALANCE", False):
             return (query_blocks * batch_size * kv_heads, 1, 1)
@@ -367,21 +366,36 @@ def _can_pack_all_gqa_heads(
     query_tile_m: int,
     sm_count: int,
 ):
-    """True for the measured branch-free second-wave cliff window."""
+    """True for the specialized branch-free second-wave tail window."""
     tail = sympy.Mod(seq_len_q, block_m)
+    if not V.graph.sizevars.statically_known_true(
+        sympy.And(
+            sympy.Eq(sm_count, 212),
+            sympy.Eq(batch_heads, 32),
+            sympy.Eq(FloorDiv(seq_len_q, block_m), 8),
+            sympy.Ge(tail, 1),
+            sympy.Le(tail, 32),
+        )
+    ):
+        return False
+
     ordinary_ctas = CeilDiv(seq_len_q, block_m) * batch_heads
-    packed_ctas = CeilDiv(seq_len_q, query_tile_m) * FloorDiv(batch_heads, 4)
+    logical_tail_rows = sympy.Mod(seq_len_q - 1, query_tile_m) + 1
+    tail_query_tile_m = (
+        16
+        if V.graph.sizevars.statically_known_true(sympy.Ge(tail, 25))
+        else 4
+    )
+    tail_programs = CeilDiv(logical_tail_rows, tail_query_tile_m)
+    packed_ctas = (CeilDiv(seq_len_q, query_tile_m) + tail_programs - 1) * FloorDiv(
+        batch_heads, 4
+    )
     ordinary_waves = CeilDiv(ordinary_ctas, sm_count)
     packed_waves = CeilDiv(packed_ctas, sm_count)
     packed_last_wave = packed_ctas - (packed_waves - 1) * sm_count
     removed_ctas = ordinary_ctas - packed_ctas
     return V.graph.sizevars.statically_known_true(
         sympy.And(
-            sympy.Eq(sm_count, 212),
-            sympy.Eq(batch_heads, 32),
-            sympy.Eq(FloorDiv(seq_len_q, block_m), 8),
-            sympy.Ge(tail, 1),
-            sympy.Le(tail, 8),
             sympy.Eq(ordinary_waves, packed_waves),
             sympy.Ge(packed_last_wave, removed_ctas),
         )
@@ -858,23 +872,21 @@ def flex_attention(
         # packed traversal.
         cur_kernel_options["PACK_GQA_HEADS"] = pack_gqa_heads
         cur_kernel_options["PACK_ALL_GQA_HEADS"] = pack_all_gqa_heads
-        cur_kernel_options["PACK_ALL_GQA_SMALL_TAIL"] = (
-            pack_all_gqa_heads
+        tail_query_tile_m = (
+            16
+            if pack_all_gqa_heads
             and V.graph.sizevars.statically_known_true(
-                sympy.And(
-                    sympy.Ge(sympy.Mod(seq_len_q, 128), 1),
-                    sympy.Le(sympy.Mod(seq_len_q, 128), 4),
-                )
+                sympy.Ge(sympy.Mod(seq_len_q, 128), 25)
             )
+            else 4
         )
-        cur_kernel_options["PACK_ALL_GQA_SPLIT_M16_TAIL"] = (
-            pack_all_gqa_heads
-            and V.graph.sizevars.statically_known_true(
-                sympy.And(
-                    sympy.Ge(sympy.Mod(seq_len_q, 128), 5),
-                    sympy.Le(sympy.Mod(seq_len_q, 128), 8),
-                )
+        cur_kernel_options["PACK_ALL_GQA_TAIL_QUERY_TILE_M"] = tail_query_tile_m
+        cur_kernel_options["PACK_ALL_GQA_TAIL_PROGRAMS"] = (
+            V.graph.sizevars.guard_int(
+                CeilDiv(sympy.Mod(seq_len_q - 1, 32) + 1, tail_query_tile_m)
             )
+            if pack_all_gqa_heads
+            else 0
         )
         if pack_gqa_heads or pack_all_gqa_heads:
             # The static-equality proof above establishes this literal. Keep
