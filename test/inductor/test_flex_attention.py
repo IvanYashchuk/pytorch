@@ -8992,6 +8992,52 @@ class TestPagedAttention(InductorTestCase):
         self.assertIsNotNone(backward_mask.q_indices)
 
     @supported_platform
+    def test_convert_logical_block_mask_batch_idx(self, device):
+        paged_cache = PagedAttention(
+            n_pages=8, page_size=4, max_batch_size=2, device=device
+        )
+        page_tables = torch.tensor(
+            [[1, 3], [6, 2]], dtype=torch.int64, device=device
+        )
+        paged_cache.page_table[:, :2] = page_tables
+        logical_pages = torch.arange(2, device=device)
+        for batch in range(2):
+            paged_cache.physical_to_logical[batch, page_tables[batch]] = logical_pages
+
+        logical_mask = BlockMask.from_kv_blocks(
+            torch.ones((1, 1, 1), dtype=torch.int32, device=device),
+            torch.ones((1, 1, 1, 1), dtype=torch.int32, device=device),
+            torch.ones((1, 1, 1), dtype=torch.int32, device=device),
+            torch.zeros((1, 1, 1, 1), dtype=torch.int32, device=device),
+            BLOCK_SIZE=(1, 4),
+            seq_lengths=(1, 8),
+            compute_q_blocks=False,
+        )
+        converted = paged_cache.convert_logical_block_mask(
+            logical_mask,
+            batch_idx=torch.tensor([1], dtype=torch.int32, device=device),
+            kv_len=torch.tensor([6], dtype=torch.int64, device=device),
+            compute_q_blocks=False,
+        )
+
+        self.assertEqual(
+            converted.kv_indices,
+            torch.tensor([2], dtype=torch.int32, device=device).view(1, 1, 1, 1),
+        )
+        self.assertEqual(
+            converted.full_kv_indices,
+            torch.tensor([6], dtype=torch.int32, device=device).view(1, 1, 1, 1),
+        )
+        physical_tokens = torch.tensor([9, 10], dtype=torch.int32, device=device)
+        scalar_index = torch.zeros((), dtype=torch.int32, device=device)
+        self.assertEqual(
+            converted.mask_mod(
+                scalar_index, scalar_index, scalar_index, physical_tokens
+            ),
+            torch.tensor([True, False], device=device),
+        )
+
+    @supported_platform
     def test_convert_mask_mod(self, device):
         n_pages, page_size, max_batch_size = 8, 128, 2
         paged_cache = PagedAttention(n_pages, page_size, max_batch_size, device=device)

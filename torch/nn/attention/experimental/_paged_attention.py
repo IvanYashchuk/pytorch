@@ -229,10 +229,10 @@ class PagedAttention:
         # that dense transpose and can retain each compact logical mask width.
 
         device = block_mask.kv_num_blocks.device
-
         if batch_idx is None:
-            batch_idx = torch.arange(B, device=device)
-        page_table = self.page_table[batch_idx]
+            page_table = self.page_table[:B]
+        else:
+            page_table = self.page_table[batch_idx]
 
         new_kv_num_blocks = block_mask.kv_num_blocks.clone()
         converted_kv_indices = (
@@ -277,7 +277,7 @@ class PagedAttention:
             else:
                 new_full_kv_indices = converted_full_kv_indices
 
-        new_mask_mod = self.get_mask_mod(block_mask.mask_mod, kv_len)
+        new_mask_mod = self.get_mask_mod(block_mask.mask_mod, kv_len, batch_idx)
 
         seq_lengths = (block_mask.seq_lengths[0], self.n_pages * self.page_size)
         return BlockMask.from_kv_blocks(
@@ -295,6 +295,7 @@ class PagedAttention:
         self,
         mask_mod: _mask_mod_signature | None,
         kv_len: torch.Tensor | None = None,
+        batch_idx: torch.Tensor | None = None,
     ) -> _mask_mod_signature:
         """
         Converts a mask_mod based on mapping from the physical block index to the logical
@@ -303,6 +304,7 @@ class PagedAttention:
         Args:
             mask_mod (_mask_mod_signature): mask_mod based on the logical block index.
             kv_len (Optional[torch.Tensor]): actual KV sequence length for upper bound check.
+            batch_idx (Optional[Tensor]): page-table row for each mask batch.
         """
         if mask_mod is None:
             mask_mod = noop_mask
@@ -315,7 +317,10 @@ class PagedAttention:
         ):
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
-            logical_block_idx = self.physical_to_logical[b, physical_kv_block]
+            page_table_batch = batch_idx[b] if batch_idx is not None else b
+            logical_block_idx = self.physical_to_logical[
+                page_table_batch, physical_kv_block
+            ]
             logical_kv_idx = logical_block_idx * self.page_size + physical_kv_offset
             live_block = logical_block_idx >= 0
             within_upper_bound = (
