@@ -301,6 +301,11 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
         # QUERY_TILE_M rows. This branch-free mapping is useful when the
         # hybrid prefix/tail cubin removes CTAs but not an SM wave.
         query_blocks = cdiv(num_queries, meta["QUERY_TILE_M"])
+        if meta.get("PACK_ALL_GQA_SPLIT_M16_TAIL", False):
+            # Cover a 5--8 row/head edge with two physical M16 programs. The
+            # logical query tile remains 32 rows/head, so only the physical
+            # launch count grows by one program per batch/KV-head group.
+            query_blocks += 1
         kv_heads = q_heads // meta["GQA_SHARED_HEADS"]
         if meta.get("CAUSAL_LOAD_BALANCE", False):
             return (query_blocks * batch_size * kv_heads, 1, 1)
@@ -859,6 +864,15 @@ def flex_attention(
                 sympy.And(
                     sympy.Ge(sympy.Mod(seq_len_q, 128), 1),
                     sympy.Le(sympy.Mod(seq_len_q, 128), 4),
+                )
+            )
+        )
+        cur_kernel_options["PACK_ALL_GQA_SPLIT_M16_TAIL"] = (
+            pack_all_gqa_heads
+            and V.graph.sizevars.statically_known_true(
+                sympy.And(
+                    sympy.Ge(sympy.Mod(seq_len_q, 128), 5),
+                    sympy.Le(sympy.Mod(seq_len_q, 128), 8),
                 )
             )
         )

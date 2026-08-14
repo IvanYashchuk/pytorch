@@ -3317,7 +3317,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     @skip_on_mps  # exercises Rubin branch-free full-head packing
-    def test_causal_gqa_full_head_packing_load_balanced_aux(self, device):
+    @common_utils.parametrize("query_len", [1025, 1028, 1029, 1030, 1031, 1032])
+    def test_causal_gqa_full_head_packing_load_balanced_aux(
+        self, device, query_len
+    ):
         """Pack every forward CTA only inside the measured second-wave window."""
 
         if (
@@ -3327,7 +3330,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ):
             self.skipTest("Requires the measured 212-SM Rubin configuration")
 
-        query_len, kv_len = 1025, 4096
+        kv_len = 4096
         query_heads, kv_heads, head_dim = 32, 8, 256
         dtype = torch.bfloat16
 
@@ -3375,12 +3378,24 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         source = "\n".join(code)
         fallback_source = "\n".join(fallback_code)
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = True", source)
-        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = True", source)
+        self.assertIn(
+            f"PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = {query_len <= 1028}", source
+        )
+        self.assertIn(
+            f"PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = {query_len >= 1029}",
+            source,
+        )
+        self.assertIn(
+            f", {272 if query_len >= 1029 else 264}, 1, 1, stream=", source
+        )
         self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
         self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
         self.assertIn("USE_TMA : tl.constexpr = False", source)
         self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", fallback_source)
         self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False", fallback_source)
+        self.assertIn(
+            "PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = False", fallback_source
+        )
         self.assertTrue(torch.equal(packed_out, fallback_out))
         # A true-M16 tail changes the order of the FP32 softmax reduction.
         # The measured difference is at most one FP32 ulp while output and
@@ -3388,8 +3403,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         self.assertEqual(packed_aux.lse, fallback_aux.lse, atol=1e-6, rtol=0)
         self.assertTrue(torch.equal(packed_aux.max_scores, fallback_aux.max_scores))
 
-        # Profitability is established only for the measured KV4096 loop
-        # count. A shorter KV extent must retain the ordinary mapping.
+        # One representative verifies that profitability remains restricted
+        # to the measured KV4096 loop count. A shorter KV extent must retain
+        # the ordinary mapping.
+        if query_len != 1029:
+            return
         short_key = key[:, :, :1025]
         short_value = value[:, :, :1025]
         short_mask = create_block_mask(
@@ -3424,11 +3442,16 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             "PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = False",
             "\n".join(short_code),
         )
+        self.assertIn(
+            "PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = False",
+            "\n".join(short_code),
+        )
 
     @supported_platform
     @skip_on_cpu
     @skip_on_mps
-    def test_causal_gqa_small_tail_fused_epilogue(self, device):
+    @common_utils.parametrize("query_len", [1025, 1032])
+    def test_causal_gqa_edge_tail_fused_epilogue(self, device, query_len):
         if (
             torch.device(device).type != "cuda"
             or torch.cuda.get_device_capability(device) != (10, 7)
@@ -3436,7 +3459,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ):
             self.skipTest("Requires the measured 212-SM Rubin configuration")
 
-        query_len, kv_len = 1025, 4096
+        kv_len = 4096
         query = torch.randn(1, 32, query_len, 256, device=device, dtype=torch.bfloat16)
         key = torch.randn(1, 8, kv_len, 256, device=device, dtype=torch.bfloat16)
         value = torch.randn_like(key)
@@ -3474,7 +3497,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             torch.compile(run, fullgraph=True), query, key, value
         )
         source = "\n".join(code)
-        self.assertIn("PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = True", source)
+        self.assertIn(
+            f"PACK_ALL_GQA_SMALL_TAIL : tl.constexpr = {query_len == 1025}", source
+        )
+        self.assertIn(
+            f"PACK_ALL_GQA_SPLIT_M16_TAIL : tl.constexpr = {query_len == 1032}",
+            source,
+        )
         self.assertIn("tail_xindex =", source)
         self.assertIn("\n        xindex =", source)
         self.assertEqual(source.count("tl_math.sin"), 2)
