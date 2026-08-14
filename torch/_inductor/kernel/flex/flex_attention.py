@@ -366,24 +366,34 @@ def _can_pack_all_gqa_heads(
     query_tile_m: int,
     sm_count: int,
 ):
-    """True for the specialized branch-free second-wave tail window."""
+    """True for a measured branch-free second-wave tail window."""
     tail = sympy.Mod(seq_len_q, block_m)
+    full_query_blocks = FloorDiv(seq_len_q, block_m)
     if not V.graph.sizevars.statically_known_true(
         sympy.And(
             sympy.Eq(sm_count, 212),
             sympy.Eq(batch_heads, 32),
-            sympy.Eq(FloorDiv(seq_len_q, block_m), 8),
+            sympy.Or(
+                sympy.Eq(full_query_blocks, 7),
+                sympy.Eq(full_query_blocks, 8),
+            ),
             sympy.Ge(tail, 1),
             sympy.Le(tail, 32),
         )
     ):
         return False
 
+    # The earlier seven-full-block boundary has a different CTA balance from
+    # the eight-full-block interval below. A complete paired Q897..928 Rubin
+    # sweep establishes this exact window directly.
+    if V.graph.sizevars.statically_known_equals(full_query_blocks, 7):
+        return True
+
     ordinary_ctas = CeilDiv(seq_len_q, block_m) * batch_heads
     logical_tail_rows = sympy.Mod(seq_len_q - 1, query_tile_m) + 1
     tail_query_tile_m = (
         16
-        if V.graph.sizevars.statically_known_true(sympy.Ge(tail, 25))
+        if V.graph.sizevars.statically_known_true(sympy.Ge(logical_tail_rows, 25))
         else 4
     )
     tail_programs = CeilDiv(logical_tail_rows, tail_query_tile_m)
@@ -747,6 +757,25 @@ def flex_attention(
         causal_prefix_attention,
     )
     kernel_options.setdefault("CAUSAL_LOAD_BALANCE", causal_load_balance_candidate)
+    sm_count = (
+        torch.cuda.get_device_properties(query.get_device()).multi_processor_count
+        if pack_gqa_heads_candidate
+        else 0
+    )
+    # Profitability has only been established for this exact Rubin product
+    # surface. In particular, V can legally have a different head dimension
+    # from Q/K, but the packed PV path has not been measured for that case.
+    pack_gqa_heads_candidate = (
+        pack_gqa_heads_candidate
+        and causal_load_balance_candidate
+        and sm_count == 212
+        and V.graph.sizevars.statically_known_equals(Bq, 1)
+        and V.graph.sizevars.statically_known_equals(Hq, 32)
+        and V.graph.sizevars.statically_known_equals(Hkv, 8)
+        and V.graph.sizevars.statically_known_equals(seq_len_kv, 4096)
+        and V.graph.sizevars.statically_known_equals(qk_head_dim, 256)
+        and V.graph.sizevars.statically_known_equals(v_head_dim, 256)
+    )
     dense_attention = (
         not has_full_blocks
         and is_trivial_mask_graph(mask_graph.graph_module)
@@ -832,13 +861,9 @@ def flex_attention(
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
-        sm_count = (
-            torch.cuda.get_device_properties(query.get_device()).multi_processor_count
-            if pack_gqa_heads_candidate
-            else 0
-        )
         pack_gqa_heads = (
             pack_gqa_heads_candidate
+            and cur_kernel_options["CAUSAL_LOAD_BALANCE"]
             and cur_kernel_options["BLOCK_M"] == 128
             and SPARSE_Q_BLOCK_SIZE % cur_kernel_options["BLOCK_M"] == 0
             and _can_pack_gqa_query_tail(
@@ -876,7 +901,7 @@ def flex_attention(
             16
             if pack_all_gqa_heads
             and V.graph.sizevars.statically_known_true(
-                sympy.Ge(sympy.Mod(seq_len_q, 128), 25)
+                sympy.Ge(sympy.Mod(seq_len_q - 1, 32) + 1, 25)
             )
             else 4
         )

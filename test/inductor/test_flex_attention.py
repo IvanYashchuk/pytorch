@@ -3041,8 +3041,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     @skip_on_mps  # asserts Triton packing constexprs in generated code
-    def test_causal_gqa_head_packing_static_aux(self, device):
-        """Pack four causal GQA heads while preserving per-head score indices."""
+    def test_causal_gqa_head_packing_unmeasured_static_fallback(self, device):
+        """An unmeasured GQA shape retains the ordinary per-head mapping."""
 
         if (
             torch.device(device).type != "cuda"
@@ -3080,7 +3080,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                     "BLOCK_N": 64,
                     "num_stages": 2,
                     "num_warps": 4,
-                    # The packed Q mapping must override this request.
+                    # Keep an explicit TMA request in the unmeasured fallback.
                     "USE_TMA": True,
                 },
             )
@@ -3120,13 +3120,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             compiled_attention, query, key, value, block_mask
         )
         source = "\n".join(code)
-        self.assertIn("PACK_GQA_HEADS : tl.constexpr = True", source)
-        self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
+        self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", source)
+        self.assertIn("QUERY_TILE_M : tl.constexpr = 128", source)
         self.assertIn("BLOCK_M : tl.constexpr = 128", source)
-        self.assertIn("USE_TMA : tl.constexpr = False", source)
 
-        # Identical causal metadata materialized with SPARSE_HQ=2 forces the
-        # ordinary head grid, providing an exact kernel-to-kernel oracle.
+        # Identical causal metadata materialized with SPARSE_HQ=2 provides an
+        # independent ordinary-grid correctness oracle.
         fallback_block_mask = create_block_mask(
             causal_mask,
             B=batch_q,
@@ -3255,7 +3255,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ):
             self.skipTest("Requires Rubin GQA head packing")
 
-        query_len, kv_len = 769, 769
+        query_len, kv_len = 769, 4096
         query_heads, kv_heads, head_dim = 32, 8, 256
         dtype = torch.bfloat16
 
@@ -3318,7 +3318,23 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @skip_on_cpu
     @skip_on_mps  # exercises Rubin branch-free full-head packing
     @common_utils.parametrize(
-        "query_len", [1025, 1032, 1033, 1040, 1041, 1048, 1049, 1056, 1057]
+        "query_len",
+        [
+            897,
+            920,
+            921,
+            928,
+            929,
+            1025,
+            1032,
+            1033,
+            1040,
+            1041,
+            1048,
+            1049,
+            1056,
+            1057,
+        ],
     )
     def test_causal_gqa_full_head_packing_load_balanced_aux(
         self, device, query_len
@@ -3379,20 +3395,21 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
         source = "\n".join(code)
         fallback_source = "\n".join(fallback_code)
-        if query_len == 1057:
+        if query_len in (929, 1057):
             self.assertIn("PACK_ALL_GQA_HEADS : tl.constexpr = False", source)
             self.assertIn(
                 "PACK_ALL_GQA_TAIL_PROGRAMS : tl.constexpr = 0", source
             )
-            self.assertIn(", 288, 1, 1, stream=", source)
+            ordinary_ctas = ((query_len + 127) // 128) * query_heads
+            self.assertIn(f", {ordinary_ctas}, 1, 1, stream=", source)
             self.assertTrue(torch.equal(packed_out, fallback_out))
             self.assertTrue(torch.equal(packed_aux.lse, fallback_aux.lse))
             self.assertTrue(
                 torch.equal(packed_aux.max_scores, fallback_aux.max_scores)
             )
             return
-        tail_query_tile_m = 16 if query_len % 128 >= 25 else 4
         logical_tail_rows = (query_len - 1) % 32 + 1
+        tail_query_tile_m = 16 if logical_tail_rows >= 25 else 4
         tail_programs = (
             logical_tail_rows + tail_query_tile_m - 1
         ) // tail_query_tile_m
@@ -3405,7 +3422,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             f"PACK_ALL_GQA_TAIL_QUERY_TILE_M : tl.constexpr = {tail_query_tile_m}",
             source,
         )
-        self.assertIn(f", {256 + 8 * tail_programs}, 1, 1, stream=", source)
+        full_query_ctas = (query_len // 128) * query_heads
+        self.assertIn(
+            f", {full_query_ctas + 8 * tail_programs}, 1, 1, stream=", source
+        )
         self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", source)
         self.assertIn("QUERY_TILE_M : tl.constexpr = 32", source)
         self.assertIn("USE_TMA : tl.constexpr = False", source)
@@ -3460,10 +3480,41 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             "\n".join(short_code),
         )
 
+        # Q/K and V head dimensions are independent FlexAttention axes. The
+        # packed PV mapping is only profitable on the measured Ev256 surface,
+        # so a narrower value head must fail closed.
+        short_value_dim = value[..., :128]
+
+        def run_short_value_dim(block_mask):
+            return flex_attention(
+                query,
+                key,
+                short_value_dim,
+                score_mod=softcap,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON",
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 64,
+                    "num_stages": 2,
+                    "num_warps": 8,
+                },
+            )
+
+        _, short_value_code = run_and_get_code(
+            torch.compile(run_short_value_dim, fullgraph=True), packed_mask
+        )
+        short_value_source = "\n".join(short_value_code)
+        self.assertIn("PACK_GQA_HEADS : tl.constexpr = False", short_value_source)
+        self.assertIn(
+            "PACK_ALL_GQA_HEADS : tl.constexpr = False", short_value_source
+        )
+
     @supported_platform
     @skip_on_cpu
     @skip_on_mps
-    @common_utils.parametrize("query_len", [1025, 1040, 1049, 1056])
+    @common_utils.parametrize("query_len", [928, 1025, 1040, 1049, 1056])
     def test_causal_gqa_edge_tail_fused_epilogue(self, device, query_len):
         if (
             torch.device(device).type != "cuda"
@@ -3510,8 +3561,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             torch.compile(run, fullgraph=True), query, key, value
         )
         source = "\n".join(code)
-        tail_query_tile_m = 16 if query_len % 128 >= 25 else 4
         logical_tail_rows = (query_len - 1) % 32 + 1
+        tail_query_tile_m = 16 if logical_tail_rows >= 25 else 4
         tail_programs = (
             logical_tail_rows + tail_query_tile_m - 1
         ) // tail_query_tile_m

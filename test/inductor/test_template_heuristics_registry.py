@@ -752,9 +752,9 @@ class TestFlexAttentionAutotuneInputs(TestCase):
         sizevars = mock.Mock()
         sizevars.statically_known_true.side_effect = lambda expr: expr is sympy.true
         with V.set_graph_handler(mock.Mock(sizevars=sizevars)):
-            for q_len in range(1025, 1057):
+            for q_len in (*range(897, 929), *range(1025, 1057)):
                 self.assertTrue(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
-            for q_len in (1024, 1057, 1088, 1152, 1153, 897, 1665):
+            for q_len in (896, 929, 1024, 1057, 1088, 1152, 1153, 1665):
                 self.assertFalse(_can_pack_all_gqa_heads(q_len, 32, 128, 32, 212))
             self.assertFalse(_can_pack_all_gqa_heads(1025, 64, 128, 32, 212))
             self.assertFalse(_can_pack_all_gqa_heads(1025, 32, 128, 32, 216))
