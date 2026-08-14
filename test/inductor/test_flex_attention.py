@@ -4912,6 +4912,63 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         self.assertEqual(decode_out.shape, (1, 2, 64, 64))
         torch.testing.assert_close(default_out, decode_out, atol=3e-3, rtol=3e-3)
 
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_flex_decode_full_and_partial_index_widths(self, device):
+        """Full-block split offsets must use the full-block index width."""
+        dtype = torch.float16
+        head_dim = 64
+        page_size = 64
+        q = torch.randn((2, 4, 1, head_dim), device=device, dtype=dtype)
+        k = torch.randn((1, 1, 12 * page_size, head_dim), device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        full_indices = torch.tensor(
+            [[1, 2, 3, 4, 5, 6], [1, 7, 8, 9, 10, 11]],
+            device=device,
+            dtype=torch.int32,
+        ).view(2, 1, 1, 6)
+
+        block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks=torch.zeros((2, 1, 1), device=device, dtype=torch.int32),
+            kv_indices=torch.zeros((2, 1, 1, 1), device=device, dtype=torch.int32),
+            full_kv_num_blocks=torch.full(
+                (2, 1, 1), 6, device=device, dtype=torch.int32
+            ),
+            full_kv_indices=full_indices,
+            BLOCK_SIZE=(16, page_size),
+            seq_lengths=(1, 12 * page_size),
+            compute_q_blocks=False,
+        )
+
+        def attention(q, k, v, block_mask):
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={"BACKEND": "TRITON_DECODE", "SPLIT_KV": 4},
+            )
+
+        result = torch.compile(attention, fullgraph=True)(q, k, v, block_mask)
+        token_offsets = torch.arange(page_size, device=device)
+        references = []
+        for batch in range(2):
+            token_indices = (
+                full_indices[batch, 0, 0, :, None].long() * page_size
+                + token_offsets
+            ).flatten()
+            selected_k = k[0, 0, token_indices].float()
+            selected_v = v[0, 0, token_indices].float()
+            scores = (
+                q[batch].float() @ selected_k.transpose(-2, -1)
+            ) / math.sqrt(head_dim)
+            references.append(scores.softmax(dim=-1) @ selected_v)
+        reference = torch.stack(references).to(dtype)
+        torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
+
     def test_unbacked_flex_decoding_eligibility_falls_back(self, device):
         from torch._inductor.kernel.flex.flex_decoding import _use_flex_decoding
         from torch._inductor.sizevars import SizeVarAllocator
