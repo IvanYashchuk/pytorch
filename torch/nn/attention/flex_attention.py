@@ -1458,8 +1458,9 @@ class BlockMask:
 
     def to_dense(self) -> Tensor:
         """Returns a dense block that is equivalent to the block mask."""
+        num_cols = _cdiv(self.seq_lengths[1], self.BLOCK_SIZE[1])
         partial_dense = _ordered_to_dense(
-            self.kv_num_blocks, self.kv_indices, self.kv_indices.shape[-1]
+            self.kv_num_blocks, self.kv_indices, num_cols
         )
         if self.full_kv_num_blocks is not None:
             if self.full_kv_indices is None:
@@ -1468,7 +1469,7 @@ class BlockMask:
             return partial_dense | _ordered_to_dense(
                 self.full_kv_num_blocks,
                 self.full_kv_indices,
-                self.full_kv_indices.shape[-1],
+                num_cols,
             )
         return partial_dense
 

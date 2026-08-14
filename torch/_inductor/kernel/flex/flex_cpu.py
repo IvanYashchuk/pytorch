@@ -69,8 +69,8 @@ def lower_cpu(
 ):
     """CPP based template for flex attention for x86 CPUs"""
     (
-        _,  # q_length
-        _,  # kv_length
+        block_mask_q_length,
+        block_mask_kv_length,
         kv_num_blocks,
         kv_indices,
         full_kv_num_blocks,
@@ -317,13 +317,13 @@ def lower_cpu(
     # In flash decoding, the partition size of doing the parallelism on KV length dim
     PARTITION_SIZE = kernel_options.get("PARTITION_SIZE", 128)
     if not V.graph.sizevars.evaluate_expr(
-        sympy.Le(seq_len_q, sympy.Mul(kv_indices.get_size()[-2], SPARSE_Q_BLOCK_SIZE))
+        sympy.Le(seq_len_q, block_mask_q_length)
     ):
         raise AssertionError(
             "Q seqlen must be smaller than the block_mask size in the Q dimension, considering pass a larger block_mask."
         )
     if not V.graph.sizevars.evaluate_expr(
-        sympy.Le(seq_len_kv, sympy.Mul(kv_indices.get_size()[-1], SPARSE_KV_BLOCK_SIZE))
+        sympy.Le(seq_len_kv, block_mask_kv_length)
     ):
         raise AssertionError(
             "KV seqlen must be smaller than the block_mask size in the KV dimension, considering pass a larger block_mask."

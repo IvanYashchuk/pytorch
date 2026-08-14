@@ -8906,6 +8906,92 @@ class TestPagedAttention(InductorTestCase):
         self.assertEqual(new_block_mask.full_kv_indices, expected_full_kv_indices)
 
     @supported_platform
+    def test_convert_logical_block_mask_forward_only_unequal_widths(self, device):
+        paged_cache = PagedAttention(
+            n_pages=8, page_size=128, max_batch_size=1, device=device
+        )
+        page_table = torch.tensor([3, 1, 6, 2], device=device)
+        paged_cache.page_table[0, :4] = page_table
+        paged_cache.physical_to_logical[0, page_table] = torch.arange(
+            4, device=device
+        )
+
+        kv_num_blocks = torch.tensor([[[1]]], dtype=torch.int32, device=device)
+        kv_indices = torch.tensor([[[[3]]]], dtype=torch.int32, device=device)
+        full_kv_num_blocks = torch.tensor(
+            [[[3]]], dtype=torch.int32, device=device
+        )
+        full_kv_indices = torch.tensor(
+            [[[[0, 1, 2]]]], dtype=torch.int32, device=device
+        )
+        logical_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+            BLOCK_SIZE=(128, 128),
+            seq_lengths=(128, 512),
+            compute_q_blocks=False,
+        )
+
+        converted = paged_cache.convert_logical_block_mask(
+            logical_mask, compute_q_blocks=False
+        )
+
+        self.assertEqual(converted.kv_indices.shape[-1], 1)
+        self.assertEqual(converted.full_kv_indices.shape[-1], 3)
+        self.assertEqual(
+            converted.kv_indices,
+            page_table[3].to(torch.int32).reshape(1, 1, 1, 1),
+        )
+        self.assertEqual(
+            converted.full_kv_indices,
+            page_table[:3].to(torch.int32).reshape(1, 1, 1, 3),
+        )
+        self.assertIsNone(converted.q_num_blocks)
+        self.assertIsNone(converted.q_indices)
+        self.assertIsNone(converted.full_q_num_blocks)
+        self.assertIsNone(converted.full_q_indices)
+        self.assertEqual(converted.seq_lengths, (128, 1024))
+        expected_dense = torch.zeros(
+            (1, 1, 1, 8), dtype=torch.int32, device=device
+        )
+        expected_dense[..., [1, 2, 3, 6]] = 1
+        self.assertEqual(converted.to_dense(), expected_dense)
+
+        direct_physical_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks,
+            page_table[3].to(torch.int32).reshape(1, 1, 1, 1),
+            full_kv_num_blocks,
+            page_table[:3].to(torch.int32).reshape(1, 1, 1, 3),
+            BLOCK_SIZE=(128, 128),
+            seq_lengths=(128, 1024),
+            compute_q_blocks=False,
+        )
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        query = torch.randn((1, 1, 128, 64), dtype=dtype, device=device)
+        key = torch.randn((1, 1, 1024, 64), dtype=dtype, device=device)
+        value = torch.randn_like(key)
+
+        def run(q, k, v, block_mask):
+            return flex_attention(q, k, v, block_mask=block_mask)
+
+        compiled = torch.compile(run, fullgraph=True)
+        expected = compiled(query, key, value, direct_physical_mask)
+        actual = compiled(query, key, value, converted)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        # The backward-capable path pads both metadata families independently
+        # before computing the transposed Q metadata.
+        backward_mask = paged_cache.convert_logical_block_mask(logical_mask)
+        self.assertEqual(backward_mask.kv_indices.shape[-1], paged_cache.n_pages)
+        self.assertEqual(
+            backward_mask.full_kv_indices.shape[-1], paged_cache.n_pages
+        )
+        self.assertIsNotNone(backward_mask.q_num_blocks)
+        self.assertIsNotNone(backward_mask.q_indices)
+
+    @supported_platform
     def test_convert_mask_mod(self, device):
         n_pages, page_size, max_batch_size = 8, 128, 2
         paged_cache = PagedAttention(n_pages, page_size, max_batch_size, device=device)

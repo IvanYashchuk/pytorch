@@ -196,6 +196,7 @@ class PagedAttention:
         block_mask: BlockMask,
         batch_idx: torch.Tensor | None = None,
         kv_len: torch.Tensor | None = None,
+        compute_q_blocks: bool = True,
     ) -> BlockMask:
         """
         Converts a logical block mask by mapping its logical kv indices to the corresponding
@@ -210,6 +211,9 @@ class PagedAttention:
                 shape :math:`(B)`.
             kv_len (Optional[Tensor]): actual KV sequence length for upper bound check;
                 shape :math:`(B,)` to handle multiple batches.
+            compute_q_blocks (bool): whether to generate transposed query block
+                metadata for backward. Forward-only inference can disable this
+                to retain the compact logical mask widths.
         """
         B, H, ROWS, MAX_BLOCKS_IN_COL = block_mask.kv_indices.shape
 
@@ -219,11 +223,10 @@ class PagedAttention:
                 f"but got size={block_mask.BLOCK_SIZE[1]} and size={self.page_size}"
             )
 
-        # Increase the num columns of converted block mask from logical block mask's
-        # num columns to n_pages, since a) the converted block mask
-        # may have larger indices values; and b) `_ordered_to_dense` realizes
-        # a dense tensor with these converted indices. There would be an IndexError
-        # if using the logical block mask's num columns.
+        # When generating transposed Q metadata, increase the number of columns
+        # to n_pages because `_ordered_to_dense` indexes a dense tensor with the
+        # converted physical page indices. Forward-only inference does not need
+        # that dense transpose and can retain each compact logical mask width.
 
         device = block_mask.kv_num_blocks.device
 
@@ -232,29 +235,30 @@ class PagedAttention:
         page_table = self.page_table[batch_idx]
 
         new_kv_num_blocks = block_mask.kv_num_blocks.clone()
-
-        new_kv_indices = torch.zeros(
-            (B, H, ROWS, self.n_pages), dtype=torch.int32, device=device
-        )
-        new_kv_indices[:, :, :, :MAX_BLOCKS_IN_COL] = (
+        converted_kv_indices = (
             torch.gather(
                 page_table, 1, block_mask.kv_indices.view(B, -1).to(torch.int64)
             )
             .view(block_mask.kv_indices.shape)
             .to(torch.int32)
         )
+        if compute_q_blocks:
+            new_kv_indices = torch.zeros(
+                (B, H, ROWS, self.n_pages), dtype=torch.int32, device=device
+            )
+            new_kv_indices[:, :, :, :MAX_BLOCKS_IN_COL] = converted_kv_indices
+        else:
+            new_kv_indices = converted_kv_indices
 
         new_full_kv_indices, new_full_kv_num_blocks = None, None
         if block_mask.full_kv_num_blocks is not None:
             if block_mask.full_kv_indices is None:
                 raise AssertionError(
                     "block_mask.full_kv_indices must not be None when full_kv_num_blocks is not None"
-                )
-            new_full_kv_num_blocks = block_mask.full_kv_num_blocks.clone()
-            new_full_kv_indices = torch.zeros(
-                (B, H, ROWS, self.n_pages), dtype=torch.int32, device=device
             )
-            new_full_kv_indices[:, :, :, :MAX_BLOCKS_IN_COL] = (
+            new_full_kv_num_blocks = block_mask.full_kv_num_blocks.clone()
+            full_kv_width = block_mask.full_kv_indices.shape[-1]
+            converted_full_kv_indices = (
                 torch.gather(
                     page_table,
                     1,
@@ -263,6 +267,15 @@ class PagedAttention:
                 .view(block_mask.full_kv_indices.shape)
                 .to(torch.int32)
             )
+            if compute_q_blocks:
+                new_full_kv_indices = torch.zeros(
+                    (B, H, ROWS, self.n_pages), dtype=torch.int32, device=device
+                )
+                new_full_kv_indices[:, :, :, :full_kv_width] = (
+                    converted_full_kv_indices
+                )
+            else:
+                new_full_kv_indices = converted_full_kv_indices
 
         new_mask_mod = self.get_mask_mod(block_mask.mask_mod, kv_len)
 
@@ -275,6 +288,7 @@ class PagedAttention:
             block_mask.BLOCK_SIZE,
             new_mask_mod,
             seq_lengths=seq_lengths,
+            compute_q_blocks=compute_q_blocks,
         )
 
     def get_mask_mod(
