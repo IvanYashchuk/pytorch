@@ -566,6 +566,61 @@ class TestBenchmarker(TestCase):
         self.assertEqual(cuda_graph_calls, 1)
         self.assertEqual(callable_calls, [])
 
+    def test_inductor_benchmarker_defaults_to_median(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        class FakeBuffer:
+            def zero_(self):
+                pass
+
+        class FakeDeviceInterface:
+            def synchronize(self):
+                pass
+
+        class FakeEvent:
+            def __init__(self, elapsed=0.0):
+                self.elapsed = elapsed
+
+            def record(self):
+                pass
+
+            def elapsed_time(self, other):
+                return other.elapsed
+
+        class FakeInductorBenchmarker(InductorBenchmarker):
+            def __init__(self):
+                super().__init__()
+                self.event_pair_calls = 0
+
+            def get_device_cache_size(self, device_type=None):
+                return 4
+
+            def get_event_pairs(self, iters, device_type=None):
+                self.event_pair_calls += 1
+                timings = [1.0] if self.event_pair_calls == 1 else [4.0, 2.0, 3.0]
+                if iters != len(timings):
+                    raise AssertionError(f"expected {len(timings)} events, got {iters}")
+                return [(FakeEvent(), FakeEvent(value)) for value in timings]
+
+        benchmarker = FakeInductorBenchmarker()
+        with (
+            patch.object(
+                _bench,
+                "get_interface_for_device",
+                return_value=FakeDeviceInterface(),
+            ),
+            patch.object(_bench.torch, "empty", return_value=FakeBuffer()),
+        ):
+            result = benchmarker.benchmark_gpu(
+                lambda: None,
+                estimation_iters=1,
+                memory_warmup_iters=1,
+                benchmark_iters=3,
+                is_vetted_benchmarking=True,
+                device_type="cuda",
+            )
+        self.assertEqual(result, 3.0)
+
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     @parametrize(
         "hip_value, expected_buffer_size_bytes",
