@@ -3110,6 +3110,131 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_backward_independent_divisibility_guards(self, device):
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        kernel_options = {
+            "BACKEND": "TRITON",
+            "fwd_BLOCK_M": 32,
+            "fwd_BLOCK_N": 32,
+            "fwd_num_stages": 1,
+            "fwd_num_warps": 4,
+            "bwd_BLOCK_M1": 32,
+            "bwd_BLOCK_N1": 64,
+            "bwd_BLOCK_M2": 64,
+            "bwd_BLOCK_N2": 32,
+            "bwd_num_stages": 1,
+            "bwd_num_warps": 4,
+        }
+
+        def check_shape(q_len, kv_len, expected, block_size=(128, 128)):
+            options = {
+                **kernel_options,
+                **{f"bwd_{name}": not value for name, value in expected.items()},
+            }
+            block_mask = create_block_mask(
+                causal_mask,
+                1,
+                1,
+                q_len,
+                kv_len,
+                device=device,
+                BLOCK_SIZE=block_size,
+            )
+            q = torch.randn(
+                1, 2, q_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            k = torch.randn(
+                1, 2, kv_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            v = torch.randn_like(k, requires_grad=True)
+
+            def attention(q, k, v):
+                return flex_attention(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    kernel_options=options,
+                )
+
+            eager_out = attention(q, k, v)
+            compiled_out, _ = run_and_get_code(
+                torch.compile(attention, fullgraph=True), q, k, v
+            )
+            grad = torch.randn_like(eager_out)
+            eager_grads = torch.autograd.grad(eager_out, (q, k, v), grad)
+            compiled_grads, backward_codes = run_and_get_code(
+                lambda: torch.autograd.grad(compiled_out, (q, k, v), grad)
+            )
+
+            self.assertEqual(eager_out, compiled_out, atol=1e-2, rtol=1e-2)
+            for eager_grad, compiled_grad in zip(eager_grads, compiled_grads):
+                self.assertEqual(eager_grad, compiled_grad, atol=1e-2, rtol=1e-2)
+
+            backward_code = "\n".join(backward_codes)
+            for name, value in expected.items():
+                self.assertIn(
+                    f"{name} : tl.constexpr = {value}",
+                    backward_code,
+                )
+
+        check_shape(
+            128,
+            128,
+            {
+                "IS_DIVISIBLE_Q1": True,
+                "IS_DIVISIBLE_KV1": True,
+                "IS_DIVISIBLE_Q2": True,
+                "IS_DIVISIBLE_KV2": True,
+            },
+        )
+        check_shape(
+            192,
+            128,
+            {
+                "IS_DIVISIBLE_Q1": False,
+                "IS_DIVISIBLE_KV1": True,
+                "IS_DIVISIBLE_Q2": True,
+                "IS_DIVISIBLE_KV2": True,
+            },
+        )
+        check_shape(
+            96,
+            128,
+            {
+                "IS_DIVISIBLE_Q1": True,
+                "IS_DIVISIBLE_KV1": True,
+                "IS_DIVISIBLE_Q2": False,
+                "IS_DIVISIBLE_KV2": True,
+            },
+        )
+        check_shape(
+            128,
+            96,
+            {
+                "IS_DIVISIBLE_Q1": True,
+                "IS_DIVISIBLE_KV1": False,
+                "IS_DIVISIBLE_Q2": True,
+                "IS_DIVISIBLE_KV2": True,
+            },
+        )
+        check_shape(
+            128,
+            192,
+            {
+                "IS_DIVISIBLE_Q1": True,
+                "IS_DIVISIBLE_KV1": True,
+                "IS_DIVISIBLE_Q2": True,
+                "IS_DIVISIBLE_KV2": False,
+            },
+        )
+
+    @supported_platform
+    @skip_on_cpu
     def test_mask_mod_handles_symint_addition(self, device):
         dtype = torch.float16
 

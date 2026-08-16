@@ -30,6 +30,7 @@ from .common import (
     _flex_kernel_tuning_options,
     build_subgraph_buffer,
     can_skip_boundary_checks,
+    can_skip_tile_boundary_checks,
     create_indices_fake,
     create_num_blocks_fake_generator,
     create_placeholder,
@@ -1068,6 +1069,18 @@ def flex_attention_backward(*args, **kwargs):
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
+        cur_kernel_options["IS_DIVISIBLE_Q1"] = can_skip_boundary_checks(
+            seq_len_q, SPARSE_Q_BLOCK_SIZE, cur_kernel_options["BLOCK_M1"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_KV1"] = can_skip_tile_boundary_checks(
+            seq_len_kv, cur_kernel_options["BLOCK_N1"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_Q2"] = can_skip_tile_boundary_checks(
+            seq_len_q, cur_kernel_options["BLOCK_M2"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_KV2"] = can_skip_boundary_checks(
+            seq_len_kv, SPARSE_KV_BLOCK_SIZE, cur_kernel_options["BLOCK_N2"]
+        )
 
         if (
             cur_kernel_options["SPARSE_KV_BLOCK_SIZE"] % cur_kernel_options["BLOCK_N1"]
