@@ -878,8 +878,13 @@ def bwd_dkdv_block_mn(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     dsT = grad_scores
     if not IS_FULL_BLOCKS:
-        # (grads) apply mask for partially unmasked block
-        dsT = tl.where(mask_mod_output, dsT, 0.0)
+        if AUTOTUNE_CAUSAL_BLOCK_MASK:
+            if q_start + offset < start_n1 + BLOCK_N1 - 1:
+                causal_mask = offs_m1[None, :] >= offs_n1[:, None]
+                dsT = tl.where(causal_mask, dsT, 0.0)
+        else:
+            # (grads) apply mask for partially unmasked block
+            dsT = tl.where(mask_mod_output, dsT, 0.0)
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     dk += tl.dot(dsT.to(MATMUL_PRECISION), tl.trans(qT), input_precision=FLOAT32_PRECISION)
 
