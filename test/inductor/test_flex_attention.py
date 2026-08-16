@@ -20,15 +20,29 @@ from typing import TypeVar
 from unittest import expectedFailure, mock, skip, skipUnless
 from unittest.mock import patch
 
+import sympy
 import torch
 import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch._inductor import config, metrics
+from torch._inductor.choices import InductorChoices
 from torch._inductor.exc import InductorError
+from torch._inductor.kernel.flex.flex_attention import (
+    _BWD_MASK_MODE_LEGACY_GLOBAL,
+    _BWD_MASK_MODE_TRAVERSAL_SCOPED,
+    _can_use_exact_causal_autotune_inputs,
+    _is_causal_mask_graph,
+    _select_flex_attention_bwd_mask_options,
+)
+from torch._inductor.kernel.flex.common import (
+    _create_causal_block_mask_fake_metadata,
+)
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.nn.attention import SDPBackend
 from torch.nn.attention.experimental._paged_attention import PagedAttention
 from torch.nn.attention.flex_attention import (
@@ -587,6 +601,215 @@ def batch_reserve(paged_attention: PagedAttention, target_seq_len: Tensor):
         paged_attention.reserve(
             torch.tensor(b),
             target_seq_len[b],
+        )
+
+
+class TestFlexAttentionBwdMaskOptions(InductorTestCase):
+    @staticmethod
+    def _options(marker, is_divisible, exact):
+        return {
+            "marker": marker,
+            "IS_DIVISIBLE": is_divisible,
+            "IS_DIVISIBLE_Q1": exact[0],
+            "IS_DIVISIBLE_KV1": exact[1],
+            "IS_DIVISIBLE_Q2": exact[2],
+            "IS_DIVISIBLE_KV2": exact[3],
+        }
+
+    def test_max_autotune_mask_mode_order_and_dedup(self):
+        self.assertIn(
+            "BWD_MASK_MODE", AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS
+        )
+        options = [
+            self._options("a", False, (True, False, True, False)),
+            self._options("b", True, (True, True, True, True)),
+            self._options("c", False, (False, False, False, True)),
+        ]
+        selected = _select_flex_attention_bwd_mask_options(
+            options,
+            max_autotune=True,
+            default_use_traversal_scoped=False,
+        )
+        self.assertEqual(
+            [(option["marker"], option["BWD_MASK_MODE"]) for option in selected],
+            [
+                ("a", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("b", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("c", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("a", _BWD_MASK_MODE_TRAVERSAL_SCOPED),
+                ("c", _BWD_MASK_MODE_TRAVERSAL_SCOPED),
+            ],
+        )
+        self.assertEqual(
+            tuple(
+                selected[0][key]
+                for key in (
+                    "IS_DIVISIBLE_Q1",
+                    "IS_DIVISIBLE_KV1",
+                    "IS_DIVISIBLE_Q2",
+                    "IS_DIVISIBLE_KV2",
+                )
+            ),
+            (False, False, False, False),
+        )
+
+    def test_max_autotune_retains_traversal_mask_mode(self):
+        options = [self._options("a", False, (True, False, True, False))]
+        selected = _select_flex_attention_bwd_mask_options(
+            options,
+            max_autotune=True,
+            default_use_traversal_scoped=True,
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0]["BWD_MASK_MODE"], _BWD_MASK_MODE_LEGACY_GLOBAL)
+        self.assertEqual(selected[1]["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
+
+    def test_default_mask_mode_uses_overridable_choice(self):
+        class TraversalScopedChoices(InductorChoices):
+            def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
+                return True
+
+            def uuid(self):
+                return "test_flex_attention_bwd_traversal_scoped_masks"
+
+        self.assertFalse(
+            InductorChoices().use_flex_attention_bwd_traversal_scoped_masks(
+                torch.device("cpu"),
+                torch.bfloat16,
+                is_causal=True,
+                user_pinned_config=False,
+            )
+        )
+        use_traversal = (
+            TraversalScopedChoices().use_flex_attention_bwd_traversal_scoped_masks(
+                torch.device("cpu"),
+                torch.float32,
+                user_pinned_config=True,
+            )
+        )
+        selected = _select_flex_attention_bwd_mask_options(
+            [self._options("a", False, (True, False, True, False))],
+            max_autotune=False,
+            default_use_traversal_scoped=use_traversal,
+        )
+        self.assertEqual(selected[0]["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
+
+    def test_default_mask_mode_profitability_gate(self):
+        rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        choices = InductorChoices()
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=rubin
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.float16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=True,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=False,
+                    user_pinned_config=False,
+                )
+            )
+
+    def test_causal_mask_graph_match(self):
+        def mask_graph(target, args):
+            graph = torch.fx.Graph()
+            placeholders = [graph.placeholder(name) for name in ("b", "h", "q", "kv")]
+            graph.output(
+                graph.call_function(target, tuple(placeholders[i] for i in args))
+            )
+            return torch.fx.GraphModule({}, graph)
+
+        self.assertTrue(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.ge.Tensor, (2, 3)))
+        )
+        self.assertFalse(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.ge.Tensor, (3, 2)))
+        )
+        self.assertFalse(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.gt.Tensor, (2, 3)))
+        )
+
+    def test_exact_causal_autotune_inputs_fail_closed(self):
+        class MetadataNode:
+            def __init__(self, *size):
+                self.size = size
+
+            def get_size(self):
+                return self.size
+
+        def mask_graph(target, args):
+            graph = torch.fx.Graph()
+            placeholders = [graph.placeholder(name) for name in ("b", "h", "q", "kv")]
+            graph.output(
+                graph.call_function(target, tuple(placeholders[i] for i in args))
+            )
+            return torch.fx.GraphModule({}, graph)
+
+        causal_graph = mask_graph(torch.ops.aten.ge.Tensor, (2, 3))
+        common = {
+            "mask_graph": causal_graph,
+            "kernel_options": {"AUTOTUNE_CAUSAL_BLOCK_MASK": True},
+            "q_len": 191,
+            "kv_len": 4096,
+            "q_block_size": 128,
+            "kv_block_size": 128,
+            "kv_num_blocks": MetadataNode(1, 1, 2),
+            "kv_indices": MetadataNode(1, 1, 2, 32),
+            "full_kv_num_blocks": MetadataNode(1, 1, 2),
+            "full_kv_indices": MetadataNode(1, 1, 2, 32),
+            "has_full_blocks": True,
+        }
+        self.assertTrue(_can_use_exact_causal_autotune_inputs(**common))
+        self.assertTrue(
+            _can_use_exact_causal_autotune_inputs(
+                **common,
+                q_num_blocks=MetadataNode(1, 1, 32),
+                q_indices=MetadataNode(1, 1, 32, 2),
+                full_q_num_blocks=MetadataNode(1, 1, 32),
+                full_q_indices=MetadataNode(1, 1, 32, 2),
+            )
+        )
+
+        for override in (
+            {"kernel_options": {"AUTOTUNE_CAUSAL_BLOCK_MASK": False}},
+            {"mask_graph": mask_graph(torch.ops.aten.gt.Tensor, (2, 3))},
+            {"q_len": sympy.Symbol("q")},
+            {"kv_indices": MetadataNode(1, 1, 2, 31)},
+        ):
+            self.assertFalse(
+                _can_use_exact_causal_autotune_inputs(**(common | override))
+            )
+        self.assertFalse(
+            _can_use_exact_causal_autotune_inputs(
+                **common,
+                q_num_blocks=MetadataNode(1, 1, 32),
+                q_indices=MetadataNode(1, 1, 31, 2),
+                full_q_num_blocks=MetadataNode(1, 1, 32),
+                full_q_indices=MetadataNode(1, 1, 32, 2),
+            )
         )
 
 
@@ -3107,6 +3330,151 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         # Test divisible and non-divisible shapes
         test_shapes = [256, 255, 383, 384]
         _ = [test_shape(S, backend) for S in test_shapes]
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_backward_independent_divisibility_guards(self, device):
+        class TraversalScopedChoices(InductorChoices):
+            def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
+                return True
+
+            def uuid(self):
+                return "test_flex_attention_bwd_traversal_scoped_masks"
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        kernel_options = {
+            "BACKEND": "TRITON",
+            "fwd_BLOCK_M": 32,
+            "fwd_BLOCK_N": 32,
+            "fwd_num_stages": 1,
+            "fwd_num_warps": 4,
+            "bwd_BLOCK_M1": 32,
+            "bwd_BLOCK_N1": 64,
+            "bwd_BLOCK_M2": 64,
+            "bwd_BLOCK_N2": 32,
+            "bwd_num_stages": 1,
+            "bwd_num_warps": 4,
+        }
+
+        def check_shape(q_len, kv_len, expected, block_size=(128, 128)):
+            options = {
+                **kernel_options,
+                **{f"bwd_{name}": not value for name, value in expected.items()},
+            }
+            block_mask = create_block_mask(
+                causal_mask,
+                1,
+                1,
+                q_len,
+                kv_len,
+                device=device,
+                BLOCK_SIZE=block_size,
+            )
+            q = torch.randn(
+                1, 2, q_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            k = torch.randn(
+                1, 2, kv_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            v = torch.randn_like(k, requires_grad=True)
+
+            def attention(q, k, v):
+                return flex_attention(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    kernel_options=options,
+                )
+
+            eager_out = attention(q, k, v)
+            compiled_out, _ = run_and_get_code(
+                torch.compile(attention, fullgraph=True), q, k, v
+            )
+            grad = torch.randn_like(eager_out)
+            eager_grads = torch.autograd.grad(eager_out, (q, k, v), grad)
+            compiled_grads, backward_codes = run_and_get_code(
+                lambda: torch.autograd.grad(compiled_out, (q, k, v), grad)
+            )
+
+            self.assertEqual(eager_out, compiled_out, atol=1e-2, rtol=1e-2)
+            for eager_grad, compiled_grad in zip(eager_grads, compiled_grads):
+                self.assertEqual(eager_grad, compiled_grad, atol=1e-2, rtol=1e-2)
+
+            backward_code = "\n".join(backward_codes)
+            expected_mode = (
+                _BWD_MASK_MODE_LEGACY_GLOBAL
+                if len(set(expected.values())) == 1
+                else _BWD_MASK_MODE_TRAVERSAL_SCOPED
+            )
+            self.assertIn(
+                f"BWD_MASK_MODE : tl.constexpr = {expected_mode}",
+                backward_code,
+            )
+            for name, value in expected.items():
+                self.assertIn(
+                    f"{name} : tl.constexpr = {value}",
+                    backward_code,
+                )
+
+        with (
+            config.patch(inductor_choices_class=TraversalScopedChoices),
+            V.set_choices_handler(TraversalScopedChoices()),
+        ):
+            check_shape(
+                128,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                192,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": False,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                96,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": False,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                128,
+                96,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": False,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                128,
+                192,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": False,
+                },
+            )
 
     @supported_platform
     @skip_on_cpu
@@ -7376,6 +7744,104 @@ class GraphModule(torch.nn.Module):
 class TestBlockMask(InductorTestCase):
     def setUp(self):
         super().setUp()
+
+    @supported_platform
+    @common_utils.parametrize(
+        "shape_and_blocks",
+        [
+            (191, 191, 128, 128),
+            (256, 256, 128, 128),
+            (191, 4096, 128, 128),
+            (191, 257, 64, 128),
+            (257, 191, 128, 64),
+        ],
+    )
+    @common_utils.parametrize("separate_full_blocks", [False, True])
+    def test_causal_autotune_fake_metadata_matches_block_mask(
+        self, device, shape_and_blocks, separate_full_blocks
+    ):
+        q_len, kv_len, q_block_size, kv_block_size = shape_and_blocks
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        block_mask = create_block_mask(
+            causal_mask,
+            1,
+            1,
+            q_len,
+            kv_len,
+            device=device,
+            BLOCK_SIZE=(q_block_size, kv_block_size),
+            separate_full_blocks=separate_full_blocks,
+        )
+        metadata = _create_causal_block_mask_fake_metadata(
+            q_len,
+            kv_len,
+            q_block_size,
+            kv_block_size,
+            separate_full_blocks=separate_full_blocks,
+            dtype=torch.int32,
+            device=torch.device(device),
+        )
+        names = ["kv_num_blocks", "kv_indices", "q_num_blocks", "q_indices"]
+        if separate_full_blocks:
+            names.extend(
+                [
+                    "full_kv_num_blocks",
+                    "full_kv_indices",
+                    "full_q_num_blocks",
+                    "full_q_indices",
+                ]
+            )
+        for name in names:
+            self.assertEqual(metadata[name], getattr(block_mask, name)[0, 0])
+
+        if shape_and_blocks == (191, 191, 128, 128) and separate_full_blocks:
+            self.assertEqual(
+                metadata["kv_num_blocks"],
+                torch.tensor([1, 2], dtype=torch.int32, device=device),
+            )
+            self.assertEqual(
+                metadata["q_num_blocks"],
+                torch.tensor([2, 1], dtype=torch.int32, device=device),
+            )
+            self.assertEqual(
+                metadata["full_kv_num_blocks"],
+                torch.zeros(2, dtype=torch.int32, device=device),
+            )
+            self.assertEqual(
+                metadata["full_q_num_blocks"],
+                torch.zeros(2, dtype=torch.int32, device=device),
+            )
+
+    @supported_platform
+    def test_block_mask_autotune_metadata_provenance(self, device):
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        block_mask = create_block_mask(
+            causal_mask, 1, 1, 191, 191, device=device, BLOCK_SIZE=128
+        )
+        self.assertTrue(block_mask._metadata_matches_mask_mod)
+        self.assertTrue(block_mask.to(device)._metadata_matches_mask_mod)
+
+        leaves, spec = torch.utils._pytree.tree_flatten(block_mask)
+        reconstructed = torch.utils._pytree.tree_unflatten(leaves, spec)
+        self.assertTrue(reconstructed._metadata_matches_mask_mod)
+
+        manual = BlockMask.from_kv_blocks(
+            block_mask.kv_num_blocks,
+            block_mask.kv_indices,
+            block_mask.full_kv_num_blocks,
+            block_mask.full_kv_indices,
+            BLOCK_SIZE=128,
+            mask_mod=causal_mask,
+            seq_lengths=(191, 191),
+        )
+        self.assertFalse(manual._metadata_matches_mask_mod)
+        self.assertFalse(block_mask[:, :, :1]._metadata_matches_mask_mod)
+        self.assertFalse(block_mask._adjust(191, 191)._metadata_matches_mask_mod)
 
     @supported_platform
     def test_block_mask_attributes(self, device):

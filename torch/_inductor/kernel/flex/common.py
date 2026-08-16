@@ -2,7 +2,7 @@
 """Common utilities and functions for flex attention kernels"""
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -50,21 +50,27 @@ from ...utils import load_template
 SubgraphResults = list[ComputedBuffer | None] | ComputedBuffer | None
 
 
-def can_skip_boundary_checks(seq_len, sparse_block_size) -> bool:
+def can_skip_boundary_checks(seq_len, sparse_block_size, tile_size=128) -> bool:
     """True when per-tile bounds masking can be skipped along this dim.
 
-    This is decided before a config is chosen, so divisibility is checked
-    against 128, the max (and LCM) of all candidate pow2 tile sizes for
-    inner block_m/n.
+    ``tile_size`` defaults to 128 for call sites which decide before selecting
+    a kernel config.
     """
     return V.graph.sizevars.statically_known_true(
         sympy.And(
-            sympy.Eq(Mod(seq_len, 128), 0),
+            sympy.Eq(Mod(seq_len, tile_size), 0),
             sympy.Or(
                 sympy.Eq(Mod(seq_len, sparse_block_size), 0),
                 sympy.Ge(sparse_block_size, seq_len),
             ),
         )
+    )
+
+
+def can_skip_tile_boundary_checks(seq_len, tile_size) -> bool:
+    """True when a directly launched tile is always in bounds."""
+    return V.graph.sizevars.statically_known_true(
+        sympy.Eq(Mod(seq_len, tile_size), 0)
     )
 
 
@@ -445,6 +451,119 @@ def create_num_blocks_fake_generator(sparse_indices):
         )
 
     return create_num_blocks_fake
+
+
+def _create_causal_block_mask_fake_metadata(
+    q_len: int,
+    kv_len: int,
+    q_block_size: int,
+    kv_block_size: int,
+    *,
+    separate_full_blocks: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Create exact metadata for a canonical top-left causal BlockMask.
+
+    ``create_block_mask`` pads tail tiles with masked values before deciding
+    whether a tile is full. Match that behavior so partial and full lists are
+    disjoint and their union describes the real causal traversal.
+    """
+    if min(q_len, kv_len, q_block_size, kv_block_size) <= 0:
+        raise AssertionError("causal autotune metadata dimensions must be positive")
+
+    q_blocks = math.ceil(q_len / q_block_size)
+    kv_blocks = math.ceil(kv_len / kv_block_size)
+    q_start = torch.arange(q_blocks, device=device) * q_block_size
+    kv_start = torch.arange(kv_blocks, device=device) * kv_block_size
+    q_end = torch.minimum(q_start + q_block_size, q_start.new_tensor(q_len))
+    kv_end = torch.minimum(kv_start + kv_block_size, kv_start.new_tensor(kv_len))
+
+    active = q_end[:, None] - 1 >= kv_start[None, :]
+    full = (
+        (q_end - q_start == q_block_size)[:, None]
+        & (kv_end - kv_start == kv_block_size)[None, :]
+        & (q_start[:, None] >= kv_end[None, :] - 1)
+    )
+    partial = active & ~full if separate_full_blocks else active
+
+    def ordered(dense: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        counts = dense.sum(dim=-1, dtype=dtype)
+        indices = torch.argsort(
+            dense.to(torch.int32), dim=-1, descending=True, stable=True
+        ).to(dtype)
+        return counts.contiguous(), indices.contiguous()
+
+    kv_num_blocks, kv_indices = ordered(partial)
+    q_num_blocks, q_indices = ordered(partial.transpose(-2, -1))
+    result = {
+        "kv_num_blocks": kv_num_blocks,
+        "kv_indices": kv_indices,
+        "q_num_blocks": q_num_blocks,
+        "q_indices": q_indices,
+    }
+    if separate_full_blocks:
+        full_kv_num_blocks, full_kv_indices = ordered(full)
+        full_q_num_blocks, full_q_indices = ordered(full.transpose(-2, -1))
+        result.update(
+            {
+                "full_kv_num_blocks": full_kv_num_blocks,
+                "full_kv_indices": full_kv_indices,
+                "full_q_num_blocks": full_q_num_blocks,
+                "full_q_indices": full_q_indices,
+            }
+        )
+    return result
+
+
+def create_causal_block_mask_fake_generators(
+    q_len: int,
+    kv_len: int,
+    q_block_size: int,
+    kv_block_size: int,
+    *,
+    separate_full_blocks: bool,
+) -> dict[str, Callable[[IRNode], torch.Tensor]]:
+    """Return coordinated autotune generators for a canonical causal mask."""
+    cache: dict[tuple[torch.dtype, torch.device], dict[str, torch.Tensor]] = {}
+
+    def make_generator(name: str) -> Callable[[IRNode], torch.Tensor]:
+        def generate(x: IRNode) -> torch.Tensor:
+            size = V.graph.sizevars.optimization_hints(x.get_size())
+            key = (x.get_dtype(), x.get_device())
+            metadata = cache.get(key)
+            if metadata is None:
+                metadata = _create_causal_block_mask_fake_metadata(
+                    q_len,
+                    kv_len,
+                    q_block_size,
+                    kv_block_size,
+                    separate_full_blocks=separate_full_blocks,
+                    dtype=x.get_dtype(),
+                    device=x.get_device(),
+                )
+                cache[key] = metadata
+            value = metadata[name]
+            if tuple(size[-value.ndim :]) != tuple(value.shape):
+                raise AssertionError(
+                    f"unexpected {name} shape for causal autotuning: "
+                    f"expected suffix {tuple(value.shape)}, got {tuple(size)}"
+                )
+            return value.expand(*size[: -value.ndim], *value.shape).contiguous()
+
+        return generate
+
+    names = ["kv_num_blocks", "kv_indices", "q_num_blocks", "q_indices"]
+    if separate_full_blocks:
+        names.extend(
+            [
+                "full_kv_num_blocks",
+                "full_kv_indices",
+                "full_q_num_blocks",
+                "full_q_indices",
+            ]
+        )
+    return {name: make_generator(name) for name in names}
 
 
 def contiguous_last_dim(x):

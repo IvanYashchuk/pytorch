@@ -174,6 +174,36 @@ class InductorChoices:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype)
 
+    def use_flex_attention_bwd_traversal_scoped_masks(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        is_causal: bool,
+        user_pinned_config: bool,
+    ) -> bool:
+        """Select the single default backward mask body.
+
+        Ordinary max-autotune benchmarks both bodies instead. Keep this default
+        on the causal workload class covered by the current Rubin evidence until
+        the traversal-scoped body has broader coverage.
+        """
+        if (
+            user_pinned_config
+            or not is_causal
+            or device.type != "cuda"
+            or torch.version.hip
+        ):
+            return False
+        props = DeviceProperties.create(device)
+        # Rubin BF16 shape sweeps justify the default flip. Other architectures
+        # retain the legacy body until cross-architecture measurements do so.
+        return (
+            props.cc == 107
+            and props.multi_processor_count == 212
+            and dtype == torch.bfloat16
+        )
+
     def get_flex_decode_configs(
         self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
     ) -> list[Any]:

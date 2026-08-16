@@ -278,6 +278,7 @@ class FlexKernelOptions(TypedDict, total=False):
 class _KernelOptionsWithInternals(FlexKernelOptions, total=False):
     OUTPUT_LOGSUMEXP: bool
     OUTPUT_MAX: bool
+    AUTOTUNE_CAUSAL_BLOCK_MASK: bool
 
 
 class AuxRequest(NamedTuple):
@@ -941,6 +942,7 @@ class BlockMask:
     dq_write_order_full: Tensor | None
     dq_kv_order: Tensor | None
     dq_kv_order_spt: bool | None
+    _metadata_matches_mask_mod: bool
     BLOCK_SIZE: tuple[int, int]
     mask_mod: _mask_mod_signature
 
@@ -964,6 +966,7 @@ class BlockMask:
         "BLOCK_SIZE",
         "mask_mod",
         "dq_kv_order_spt",
+        "_metadata_matches_mask_mod",
     ]
 
     def __init__(
@@ -987,6 +990,7 @@ class BlockMask:
         dq_write_order_full: Tensor | None = None,
         dq_kv_order: Tensor | None = None,
         dq_kv_order_spt: bool | None = None,
+        _metadata_matches_mask_mod: bool = False,
     ) -> None:
         if kv_indices.dim() < 2:
             raise RuntimeError("BlockMask must have at least 2 dimensions")
@@ -1019,6 +1023,7 @@ class BlockMask:
         self.dq_write_order_full = dq_write_order_full
         self.dq_kv_order = dq_kv_order
         self.dq_kv_order_spt = dq_kv_order_spt
+        self._metadata_matches_mask_mod = _metadata_matches_mask_mod
         self.BLOCK_SIZE = BLOCK_SIZE
         self.mask_mod = mask_mod
 
@@ -1073,6 +1078,7 @@ class BlockMask:
         dq_write_order: Tensor | None = None,
         dq_write_order_full: Tensor | None = None,
         dq_kv_order: Tensor | bool | None = None,
+        _metadata_matches_mask_mod: bool = False,
     ) -> Self:
         """
         Creates a BlockMask instance from key-value block information.
@@ -1151,6 +1157,7 @@ class BlockMask:
             dq_write_order_full=dq_write_order_full,
             dq_kv_order=dq_kv_order_tensor,
             dq_kv_order_spt=dq_kv_order_spt,
+            _metadata_matches_mask_mod=_metadata_matches_mask_mod,
         )
 
     @overload
@@ -1565,6 +1572,7 @@ class BlockMask:
             BLOCK_SIZE=self.BLOCK_SIZE,
             mask_mod=self.mask_mod,
             dq_kv_order_spt=self.dq_kv_order_spt,
+            _metadata_matches_mask_mod=self._metadata_matches_mask_mod,
         )
 
     @staticmethod
@@ -1655,6 +1663,9 @@ class BlockMask:
             ),
             dq_kv_order=cast(Tensor | None, tensor_values["dq_kv_order"]),
             dq_kv_order_spt=cast(bool | None, context_values["dq_kv_order_spt"]),
+            _metadata_matches_mask_mod=cast(
+                bool, context_values["_metadata_matches_mask_mod"]
+            ),
         )
 
     def _flatten_with_keys(
@@ -1805,6 +1816,8 @@ def _create_sparse_block_from_block_mask(
     seq_lengths: tuple[int, int],
     Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
     KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+    *,
+    _metadata_matches_mask_mod: bool = False,
 ) -> BlockMask:
     partial_blocks, full_blocks = block_mask
 
@@ -1822,6 +1835,7 @@ def _create_sparse_block_from_block_mask(
         BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
         mask_mod=mask_mod,
         seq_lengths=seq_lengths,
+        _metadata_matches_mask_mod=_metadata_matches_mask_mod,
     )
 
 
@@ -2073,6 +2087,7 @@ def create_block_mask(
         (Q_LEN, KV_LEN),
         Q_BLOCK_SIZE,
         KV_BLOCK_SIZE,
+        _metadata_matches_mask_mod=True,
     )
 
     if compute_dq_write_order:
@@ -2534,6 +2549,12 @@ def flex_attention(
         return_lse,
         kernel_options,
         return_aux,
+    )
+    # Users may construct a BlockMask whose metadata is stricter than mask_mod.
+    # Only create_block_mask provides provenance that the two describe the same
+    # structure; overwrite this internal option so callers cannot force it.
+    kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = (
+        block_mask._metadata_matches_mask_mod
     )
 
     def _finalize_outputs(

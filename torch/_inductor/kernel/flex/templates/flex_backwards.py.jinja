@@ -164,13 +164,13 @@
         )
         {%- else %}
         # load Q and do: they stay in SRAM throughout the inner loop.
-        q = load_checked_2d(Q2, offs_m2, offs_k, stride_qm, stride_qd, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM, INDEX_DTYPE)
-        do = load_checked_2d(DO2, offs_m2, offs_v, stride_dom, stride_dod, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, V_HEAD_DIM, INDEX_DTYPE)
+        q = load_checked_2d(Q2, offs_m2, offs_k, stride_qm, stride_qd, IS_DIVISIBLE_Q2, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+        do = load_checked_2d(DO2, offs_m2, offs_v, stride_dom, stride_dod, IS_DIVISIBLE_Q2, SAFE_HEAD_DIM, Q_LEN, V_HEAD_DIM, INDEX_DTYPE)
         {%- endif %}
         if PRESCALE_QK:
             q = (q * SM_SCALE * RCP_LN2).to(MATMUL_PRECISION)
 
-        if IS_DIVISIBLE:
+        if IS_DIVISIBLE_Q2:
             Di = tl.load(DELTA2 + offs_m2)
             lse = tl.load(LSE2 + offs_m2)
         else:
@@ -218,7 +218,7 @@
         # Write back dQ.
         dq_ptrs = DQ2 + offs_m2[:, None].to(INDEX_DTYPE) * stride_dqm + offs_k[None, :].to(INDEX_DTYPE) * stride_dqd
         dq *= SM_SCALE
-        if IS_DIVISIBLE and SAFE_HEAD_DIM:
+        if IS_DIVISIBLE_Q2 and SAFE_HEAD_DIM:
             tl.store(dq_ptrs, dq)
         else:
             tl.store(dq_ptrs, dq, mask=(offs_m2[:, None] < Q_LEN) & (offs_k[None, :] < QK_HEAD_DIM))
@@ -268,8 +268,8 @@
         )
         {%- else %}
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = load_checked_2d(K, offs_n1, offs_k, stride_kn, stride_kd, IS_DIVISIBLE, SAFE_HEAD_DIM, KV_LEN, QK_HEAD_DIM, INDEX_DTYPE)
-        v = load_checked_2d(V, offs_n1, offs_v, stride_vn, stride_vd, IS_DIVISIBLE, SAFE_HEAD_DIM, KV_LEN, V_HEAD_DIM, INDEX_DTYPE)
+        k = load_checked_2d(K, offs_n1, offs_k, stride_kn, stride_kd, IS_DIVISIBLE_KV1, SAFE_HEAD_DIM, KV_LEN, QK_HEAD_DIM, INDEX_DTYPE)
+        v = load_checked_2d(V, offs_n1, offs_v, stride_vn, stride_vd, IS_DIVISIBLE_KV1, SAFE_HEAD_DIM, KV_LEN, V_HEAD_DIM, INDEX_DTYPE)
         {%- endif %}
         if PRESCALE_QK:
             k = (k * SM_SCALE * RCP_LN2).to(MATMUL_PRECISION)
@@ -363,7 +363,7 @@
         index_k = offs_k[None, :]
         index_v = offs_v[None, :]
 
-        if IS_DIVISIBLE and SAFE_HEAD_DIM:
+        if IS_DIVISIBLE_KV1 and SAFE_HEAD_DIM:
             tl.store(dv_ptrs, dv)
         else:
             tl.store(dv_ptrs, dv, mask=(index_n < KV_LEN) & (index_v < V_HEAD_DIM))
@@ -455,17 +455,17 @@ def bwd_dq_block_mn(
     kT_ptrs = K + offs_n2[None, :].to(INDEX_DTYPE) * stride_kn + offs_k[:, None].to(INDEX_DTYPE) * stride_kd
     vT_ptrs = V + offs_n2[None, :].to(INDEX_DTYPE) * stride_vn + offs_v[:, None].to(INDEX_DTYPE) * stride_vd
     # NB reversed order to since K is transposed
-    kT = load_checked_2d(kT_ptrs, offs_k, offs_n2, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE, QK_HEAD_DIM, KV_LEN, INDEX_DTYPE)
+    kT = load_checked_2d(kT_ptrs, offs_k, offs_n2, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE_KV2, QK_HEAD_DIM, KV_LEN, INDEX_DTYPE)
     {%- endif %}
     qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
     if not PRESCALE_QK:
         qk *= SM_SCALE
     # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
     pre_mod_scores = qk
-    n = get_bounded_indices(offs_n2[None, :], KV_LEN if not IS_DIVISIBLE else None)
+    n = get_bounded_indices(offs_n2[None, :], KV_LEN if not IS_DIVISIBLE_KV2 else None)
     # The boundary check is done for the outer loop, but here it's possible since we're iterating across N dim
     # that the M reads out of bounds for the PIDS spanning the Q_LEN boundary
-    m = get_bounded_indices(offs_m2[:, None], Q_LEN if not IS_DIVISIBLE else None)
+    m = get_bounded_indices(offs_m2[:, None], Q_LEN if not IS_DIVISIBLE_Q2 else None)
 
     {{ modification(
         subgraph_number=0,
@@ -495,7 +495,7 @@ def bwd_dq_block_mn(
     Example: lambda x, *_: 1 / score, this NaN would propagate regardless of other masking
     We only need to do this on the m1 dim since these elements take part in the final reduction
     for DQ #}
-    if not IS_DIVISIBLE:
+    if not IS_DIVISIBLE_KV2:
         post_mod_scores = tl.where(offs_n2[None, :] < KV_LEN, post_mod_scores, float("-inf"))
 
     if not IS_FULL_BLOCKS:
@@ -535,7 +535,7 @@ def bwd_dq_block_mn(
     )
     vT = tl.trans(v)
     {%- else %}
-    vT = load_checked_2d(vT_ptrs, offs_v, offs_n2, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE, V_HEAD_DIM, KV_LEN, INDEX_DTYPE)
+    vT = load_checked_2d(vT_ptrs, offs_v, offs_n2, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE_KV2, V_HEAD_DIM, KV_LEN, INDEX_DTYPE)
     {%- endif %}
     dp = tl.dot(do, vT, input_precision=FLOAT32_PRECISION)
     ds = p * (dp - Di[:, None])
@@ -563,7 +563,7 @@ def bwd_dq_block_mn(
         }
     ) | indent_except_first(1) }}
     {# See Note Selective masking DQ #}
-    if not IS_DIVISIBLE:
+    if not IS_DIVISIBLE_KV2:
         grad_scores = tl.where(offs_n2[None, :] < KV_LEN, grad_scores, 0.0)
 
     # ~~~~~~~~~~~~~~~~~~~ Apply other buffer grad writes ~~~~~~~~~~~~~
@@ -682,10 +682,10 @@ def bwd_dkdv_block_mn(
     qT_ptrs = Q + offs_m1[None, :].to(INDEX_DTYPE) * stride_qm + offs_k[:, None].to(INDEX_DTYPE) * stride_qd
     do_ptrs = DO + offs_m1[:, None].to(INDEX_DTYPE) * stride_dom + offs_v[None, :].to(INDEX_DTYPE) * stride_dod
     # NB reversed order since Q is transposed
-    qT = load_checked_2d(qT_ptrs, offs_k, offs_m1, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE, QK_HEAD_DIM, Q_LEN, INDEX_DTYPE)
+    qT = load_checked_2d(qT_ptrs, offs_k, offs_m1, None, None, SAFE_HEAD_DIM, IS_DIVISIBLE_Q1, QK_HEAD_DIM, Q_LEN, INDEX_DTYPE)
     {%- endif %}
     # Load LSE before computing qk to reduce pipeline stall.
-    if IS_DIVISIBLE:
+    if IS_DIVISIBLE_Q1:
         lse = tl.load(LSE + offs_m1)
     else:
         lse = tl.load(LSE + offs_m1, mask=offs_m1 < Q_LEN)
@@ -694,10 +694,10 @@ def bwd_dkdv_block_mn(
     if not PRESCALE_QK:
         qkT *= SM_SCALE
     # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-    m = get_bounded_indices(offs_m1[None, :], Q_LEN if not IS_DIVISIBLE else None)
+    m = get_bounded_indices(offs_m1[None, :], Q_LEN if not IS_DIVISIBLE_Q1 else None)
     # The boundary check is done for the outer loop, but here it's possible since we're iterating across M dim
     # that the n reads out of bounds for the PIDS spanning the KV_LEN boundary
-    n = get_bounded_indices(offs_n1[:, None], KV_LEN if not IS_DIVISIBLE else None)
+    n = get_bounded_indices(offs_n1[:, None], KV_LEN if not IS_DIVISIBLE_KV1 else None)
 
     pre_mod_scores = qkT
     {{ modification(
@@ -727,7 +727,7 @@ def bwd_dkdv_block_mn(
     Example: lambda x, *_: 1 / score, this NaN would propagate regardless of other masking
     We only need to do this on the m1 dim since these elements take part in the final reduction
     for DK/DV #}
-    if not IS_DIVISIBLE:
+    if not IS_DIVISIBLE_Q1:
         post_mod_scores = tl.where(offs_m1[None, :] < Q_LEN, post_mod_scores, float("-inf"))
 
     if not IS_FULL_BLOCKS:
@@ -761,12 +761,12 @@ def bwd_dkdv_block_mn(
         [(q_start + offset).to(tl.int32), 0],
     )
     {%- else %}
-    do = load_checked_2d(do_ptrs, offs_m1, offs_v, None, None, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, V_HEAD_DIM, INDEX_DTYPE)
+    do = load_checked_2d(do_ptrs, offs_m1, offs_v, None, None, IS_DIVISIBLE_Q1, SAFE_HEAD_DIM, Q_LEN, V_HEAD_DIM, INDEX_DTYPE)
     {%- endif %}
     # Compute dV.
     ppT = pT
     dv += tl.dot(ppT.to(MATMUL_PRECISION), do, input_precision=FLOAT32_PRECISION)
-    if IS_DIVISIBLE:
+    if IS_DIVISIBLE_Q1:
         Di = tl.load(DELTA + offs_m1)
     else:
         Di = tl.load(DELTA + offs_m1, mask=offs_m1 < Q_LEN)
@@ -798,7 +798,7 @@ def bwd_dkdv_block_mn(
     ) | indent_except_first(1) }}
 
     {# See Note: Selective masking DK/DV#}
-    if not IS_DIVISIBLE:
+    if not IS_DIVISIBLE_Q1:
         grad_scores = tl.where(offs_m1[None, :] < Q_LEN, grad_scores, 0.0)
 
     # ~~~~~~~~~~~~~~~~~~~ Apply other buffer grad writes ~~~~~~~~~~~~~
