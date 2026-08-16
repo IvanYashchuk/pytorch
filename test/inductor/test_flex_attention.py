@@ -35,6 +35,7 @@ from torch._inductor.kernel.flex.flex_attention import (
     _BWD_MASK_MODE_LEGACY_GLOBAL,
     _BWD_MASK_MODE_TRAVERSAL_SCOPED,
     _can_use_exact_causal_autotune_inputs,
+    flex_attention_backward_grid,
     _is_causal_mask_graph,
     _select_flex_attention_bwd_mask_options,
 )
@@ -615,6 +616,24 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             "IS_DIVISIBLE_Q2": exact[2],
             "IS_DIVISIBLE_KV2": exact[3],
         }
+
+    def test_causal_dq_load_balance_grid_preserves_program_count(self):
+        arguments = (1, 32, 769, 128, 8, 4096)
+        legacy = flex_attention_backward_grid(
+            *arguments,
+            {"BLOCK_M2": 64, "BLOCK_N1": 64},
+        )
+        balanced = flex_attention_backward_grid(
+            *arguments,
+            {
+                "BLOCK_M2": 64,
+                "BLOCK_N1": 64,
+                "CAUSAL_DQ_LOAD_BALANCE": True,
+            },
+        )
+        self.assertEqual(legacy, (116, 1, 8))
+        self.assertEqual(balanced, (928, 1, 1))
+        self.assertEqual(math.prod(legacy), math.prod(balanced))
 
     def test_max_autotune_mask_mode_order_and_dedup(self):
         self.assertIn(

@@ -51,12 +51,41 @@
 
     MATMUL_PRECISION = Q.dtype.element_ty
 
-    pid = tl.program_id(0).to(INDEX_DTYPE)
     NUM_KV_BLOCKS = tl.cdiv(KV_LEN, BLOCK_N1)
     NUM_Q_BLOCKS = tl.cdiv(Q_LEN, BLOCK_M2)
+    {%- if CAUSAL_DQ_LOAD_BALANCE %}
+    flat_pid = tl.program_id(0).to(INDEX_DTYPE)
+    DQ_PROGRAMS = NUM_Q_BLOCKS * ZQ * HQ
+    is_dq = flat_pid < DQ_PROGRAMS
 
+    # Group all heads of the expensive late-query DQ blocks first.
+    dq_block_rank = flat_pid // (ZQ * HQ)
+    dq_head_batch = flat_pid % (ZQ * HQ)
+    dq_off_hq = dq_head_batch % HQ
+    dq_off_zq = dq_head_batch // HQ
+    dq_start_m2_block = NUM_Q_BLOCKS - 1 - dq_block_rank
+    dq_off_hkv = dq_off_hq // GQA_SHARED_HEADS
+    dq_pid = (
+        NUM_KV_BLOCKS
+        + (dq_off_hq % GQA_SHARED_HEADS) * NUM_Q_BLOCKS
+        + dq_start_m2_block
+    )
+
+    # DKV block cost is also causal-ordered: lower KV blocks consume more Q.
+    dkv_flat_pid = flat_pid - DQ_PROGRAMS
+    dkv_pid = dkv_flat_pid // (ZQ * HKV)
+    dkv_head_batch = dkv_flat_pid % (ZQ * HKV)
+    dkv_off_hkv = dkv_head_batch % HKV
+    dkv_off_zq = dkv_head_batch // HKV
+
+    pid = tl.where(is_dq, dq_pid, dkv_pid)
+    off_zq = tl.where(is_dq, dq_off_zq, dkv_off_zq)
+    off_hkv = tl.where(is_dq, dq_off_hkv, dkv_off_hkv)
+    {%- else %}
+    pid = tl.program_id(0).to(INDEX_DTYPE)
     off_zq = tl.program_id(1).to(INDEX_DTYPE) # q batch idx
     off_hkv = tl.program_id(2).to(INDEX_DTYPE) # kv head idx
+    {%- endif %}
     off_zkv = off_zq % ZKV # kv batch idx
 
     SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}

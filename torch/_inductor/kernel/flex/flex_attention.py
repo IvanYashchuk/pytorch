@@ -845,12 +845,16 @@ def flex_attention_backward_grid(
     parallelize over ceil_div(q_heads//kv_heads * num_key_value, key_value_block_size).
     To do this will either require atomic updates to some grad values or to have a two pass kernel design.
     """
-    return (
+    programs_per_batch_kv_head = (
         cdiv(num_queries, meta["BLOCK_M2"]) * (q_heads // kv_heads)
-        + cdiv(num_key_value, meta["BLOCK_N1"]),
-        batch_size,
-        kv_heads,
+        + cdiv(num_key_value, meta["BLOCK_N1"])
     )
+    if meta.get("CAUSAL_DQ_LOAD_BALANCE", False):
+        # Flatten the launch so the template can group all heads of each causal
+        # DQ block. DQ and DKV are each ordered from expensive to cheap, so a
+        # partial final hardware wave cannot contain the longest programs.
+        return (programs_per_batch_kv_head * batch_size * kv_heads, 1, 1)
+    return (programs_per_batch_kv_head, batch_size, kv_heads)
 
 
 flex_attention_backward_template = TritonTemplate(
