@@ -165,8 +165,7 @@ def _can_use_exact_causal_autotune_inputs(
     if not _is_causal_mask_graph(mask_graph):
         return False
     static_values = tuple(
-        _static_int(value)
-        for value in (q_len, kv_len, q_block_size, kv_block_size)
+        _static_int(value) for value in (q_len, kv_len, q_block_size, kv_block_size)
     )
     if any(value is None or value <= 0 for value in static_values):
         return False
@@ -208,14 +207,29 @@ def _apply_exact_causal_kernel_facts(
     exact_causal_metadata: bool,
     max_autotune: bool,
     use_block_contiguity: bool,
+    is_backward: bool,
+    query_length: int,
+    sparse_query_block_size: int,
+    has_full_blocks: bool,
 ) -> None:
     """Apply profitable default facts from a provenance-checked causal mask."""
     if not exact_causal_metadata or max_autotune or not use_block_contiguity:
         return
-    # The forward KV and backward Q block lists are contiguous intervals.
-    # Top-left causal attention also makes every row safe, but enabling that
-    # fact can regress the forward kernel, so keep its existing policy.
-    kernel_options["BLOCKS_ARE_CONTIGUOUS"] = True
+    if not is_backward:
+        kernel_options["BLOCKS_ARE_CONTIGUOUS"] = True
+        return
+
+    if kernel_options["BLOCKS_ARE_CONTIGUOUS"]:
+        return
+
+    kernel_options["BLOCKS_ARE_CONTIGUOUS_KV"] = True
+    # A padded Q tail is a second partial block in transposed metadata. Past
+    # two blocks it is separated from the diagonal partial block by full blocks.
+    kernel_options["BLOCKS_ARE_CONTIGUOUS_Q"] = (
+        not has_full_blocks
+        or query_length <= 2 * sparse_query_block_size
+        or query_length % sparse_query_block_size == 0
+    )
 
 
 def _sanitize_kernel_options_for_triton(
@@ -618,6 +632,10 @@ def flex_attention(
             head_dim=head_dim,
             sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         ),
+        is_backward=False,
+        query_length=V.graph.sizevars.guard_int(seq_len_q),
+        sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
+        has_full_blocks=has_full_blocks,
     )
 
     # Note, we don't need to pass in the captured buffers explicitly
@@ -1040,6 +1058,12 @@ def flex_attention_backward(*args, **kwargs):
     kernel_options.setdefault("PRESCALE_QK", False)
     kernel_options.setdefault("ROWS_GUARANTEED_SAFE", False)
     kernel_options.setdefault("BLOCKS_ARE_CONTIGUOUS", False)
+    kernel_options.setdefault(
+        "BLOCKS_ARE_CONTIGUOUS_KV", kernel_options["BLOCKS_ARE_CONTIGUOUS"]
+    )
+    kernel_options.setdefault(
+        "BLOCKS_ARE_CONTIGUOUS_Q", kernel_options["BLOCKS_ARE_CONTIGUOUS"]
+    )
     kernel_options.setdefault("WRITE_DQ", True)
     seq_q_divisible = can_skip_boundary_checks(seq_len_q, SPARSE_Q_BLOCK_SIZE)
     seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, SPARSE_KV_BLOCK_SIZE)
@@ -1236,6 +1260,10 @@ def flex_attention_backward(*args, **kwargs):
             head_dim=head_dim,
             sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         ),
+        is_backward=True,
+        query_length=V.graph.sizevars.guard_int(seq_len_q),
+        sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
+        has_full_blocks=has_full_blocks,
     )
 
     choices: list[Any] = []

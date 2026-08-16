@@ -21,6 +21,7 @@ from unittest import expectedFailure, mock, skip, skipUnless
 from unittest.mock import patch
 
 import sympy
+
 import torch
 import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
@@ -28,16 +29,14 @@ from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwis
 from torch._inductor import config, metrics
 from torch._inductor.choices import InductorChoices
 from torch._inductor.exc import InductorError
+from torch._inductor.kernel.flex.common import _create_causal_block_mask_fake_metadata
 from torch._inductor.kernel.flex.flex_attention import (
+    _apply_exact_causal_kernel_facts,
     _BWD_MASK_MODE_LEGACY_GLOBAL,
     _BWD_MASK_MODE_TRAVERSAL_SCOPED,
-    _apply_exact_causal_kernel_facts,
     _can_use_exact_causal_autotune_inputs,
     _is_causal_mask_graph,
     _select_flex_attention_bwd_mask_options,
-)
-from torch._inductor.kernel.flex.common import (
-    _create_causal_block_mask_fake_metadata,
 )
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
 from torch._inductor.select_algorithm import AlgorithmSelectorCache
@@ -895,6 +894,10 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             exact_causal_metadata=False,
             max_autotune=False,
             use_block_contiguity=True,
+            is_backward=False,
+            query_length=257,
+            sparse_query_block_size=128,
+            has_full_blocks=True,
         )
         self.assertEqual(
             kernel_options,
@@ -909,6 +912,10 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             exact_causal_metadata=True,
             max_autotune=False,
             use_block_contiguity=True,
+            is_backward=False,
+            query_length=257,
+            sparse_query_block_size=128,
+            has_full_blocks=True,
         )
         self.assertEqual(
             kernel_options,
@@ -927,6 +934,10 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             exact_causal_metadata=True,
             max_autotune=True,
             use_block_contiguity=True,
+            is_backward=False,
+            query_length=257,
+            sparse_query_block_size=128,
+            has_full_blocks=True,
         )
         self.assertFalse(max_options["BLOCKS_ARE_CONTIGUOUS"])
 
@@ -939,8 +950,49 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             exact_causal_metadata=True,
             max_autotune=False,
             use_block_contiguity=False,
+            is_backward=False,
+            query_length=257,
+            sparse_query_block_size=128,
+            has_full_blocks=True,
         )
         self.assertFalse(disabled_options["BLOCKS_ARE_CONTIGUOUS"])
+
+        backward_options = {
+            "BLOCKS_ARE_CONTIGUOUS": False,
+            "BLOCKS_ARE_CONTIGUOUS_KV": False,
+            "BLOCKS_ARE_CONTIGUOUS_Q": False,
+        }
+        _apply_exact_causal_kernel_facts(
+            backward_options,
+            exact_causal_metadata=True,
+            max_autotune=False,
+            use_block_contiguity=True,
+            is_backward=True,
+            query_length=257,
+            sparse_query_block_size=128,
+            has_full_blocks=True,
+        )
+        self.assertTrue(backward_options["BLOCKS_ARE_CONTIGUOUS_KV"])
+        self.assertFalse(backward_options["BLOCKS_ARE_CONTIGUOUS_Q"])
+
+        for query_length, has_full_blocks in ((191, True), (256, True), (257, False)):
+            backward_options = {
+                "BLOCKS_ARE_CONTIGUOUS": False,
+                "BLOCKS_ARE_CONTIGUOUS_KV": False,
+                "BLOCKS_ARE_CONTIGUOUS_Q": False,
+            }
+            _apply_exact_causal_kernel_facts(
+                backward_options,
+                exact_causal_metadata=True,
+                max_autotune=False,
+                use_block_contiguity=True,
+                is_backward=True,
+                query_length=query_length,
+                sparse_query_block_size=128,
+                has_full_blocks=has_full_blocks,
+            )
+            self.assertTrue(backward_options["BLOCKS_ARE_CONTIGUOUS_KV"])
+            self.assertTrue(backward_options["BLOCKS_ARE_CONTIGUOUS_Q"])
 
 
 @large_tensor_test_class("2GB", device=test_device[0])
@@ -3605,6 +3657,84 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                     "IS_DIVISIBLE_KV2": False,
                 },
             )
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    @common_utils.parametrize(
+        "q_len, expected_q_contiguous", ((256, True), (257, False))
+    )
+    def test_exact_causal_backward_axis_contiguity(
+        self, device, q_len, expected_q_contiguous
+    ):
+        class ExactCausalChoices(InductorChoices):
+            def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
+                return True
+
+            def use_flex_attention_exact_causal_block_contiguity(self, *args, **kwargs):
+                return True
+
+            def uuid(self):
+                return "test_exact_causal_backward_axis_contiguity"
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        torch.manual_seed(0)
+        block_mask = create_block_mask(
+            causal_mask,
+            B=None,
+            H=None,
+            Q_LEN=q_len,
+            KV_LEN=384,
+            device=device,
+        )
+        q = torch.randn(
+            1, 2, q_len, 64, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        k = torch.randn(
+            1, 2, 384, 64, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        v = torch.randn_like(k, requires_grad=True)
+
+        def attention(q, k, v):
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                kernel_options={"BACKEND": "TRITON"},
+            )
+
+        with (
+            config.patch(inductor_choices_class=ExactCausalChoices),
+            V.set_choices_handler(ExactCausalChoices()),
+        ):
+            eager_out = attention(q, k, v)
+            compiled_out, forward_codes = run_and_get_code(
+                torch.compile(attention, fullgraph=True), q, k, v
+            )
+            grad = torch.randn_like(eager_out)
+            eager_grads = torch.autograd.grad(eager_out, (q, k, v), grad)
+            compiled_grads, backward_codes = run_and_get_code(
+                lambda: torch.autograd.grad(compiled_out, (q, k, v), grad)
+            )
+
+        self.assertEqual(eager_out, compiled_out, atol=2e-2, rtol=2e-2)
+        for eager_grad, compiled_grad in zip(eager_grads, compiled_grads):
+            self.assertEqual(eager_grad, compiled_grad, atol=2e-2, rtol=2e-2)
+
+        self.assertIn(
+            "BLOCKS_ARE_CONTIGUOUS : tl.constexpr = True",
+            "\n".join(forward_codes),
+        )
+        backward_code = "\n".join(backward_codes)
+        self.assertIn("BLOCKS_ARE_CONTIGUOUS_KV : tl.constexpr = True", backward_code)
+        self.assertIn(
+            f"BLOCKS_ARE_CONTIGUOUS_Q : tl.constexpr = {expected_q_contiguous}",
+            backward_code,
+        )
 
     @supported_platform
     @skip_on_cpu

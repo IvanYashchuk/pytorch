@@ -422,7 +422,7 @@ def bwd_dq_inner(
         # Increment pointers.
         offset = get_offset_for_next_block(
             start_n, kv_indices, sparse_kv_num_blocks,
-            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N2, BLOCKS_ARE_CONTIGUOUS
+            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N2, BLOCKS_ARE_CONTIGUOUS_KV
         )
 
         kv_offset += offset
@@ -651,7 +651,7 @@ def bwd_dkdv_inner(
         # Increment pointers.
         offset = get_offset_for_next_block(
             start_m, q_indices, sparse_q_num_blocks,
-            SPARSE_Q_BLOCK_SIZE, SPARSE_Q_MULTIPLE, BLOCK_M1, BLOCKS_ARE_CONTIGUOUS
+            SPARSE_Q_BLOCK_SIZE, SPARSE_Q_MULTIPLE, BLOCK_M1, BLOCKS_ARE_CONTIGUOUS_Q
         )
         offs_m1 += offset
         offset_block += offset
