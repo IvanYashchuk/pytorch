@@ -635,6 +635,25 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         self.assertEqual(balanced, (928, 1, 1))
         self.assertEqual(math.prod(legacy), math.prod(balanced))
 
+    def test_causal_dq_gqa_tail_pack_reduces_one_row_tail_programs(self):
+        arguments = (1, 32, 513, 128, 8, 4096)
+        legacy = flex_attention_backward_grid(
+            *arguments,
+            {"BLOCK_M2": 64, "BLOCK_N1": 64},
+        )
+        packed = flex_attention_backward_grid(
+            *arguments,
+            {
+                "BLOCK_M2": 64,
+                "BLOCK_N1": 64,
+                "CAUSAL_DQ_LOAD_BALANCE": True,
+                "CAUSAL_DQ_GQA_TAIL_PACK": True,
+            },
+        )
+        self.assertEqual(legacy, (100, 1, 8))
+        self.assertEqual(packed, (776, 1, 1))
+        self.assertEqual(math.prod(legacy) - math.prod(packed), 24)
+
     def test_max_autotune_mask_mode_order_and_dedup(self):
         self.assertIn(
             "BWD_MASK_MODE", AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS

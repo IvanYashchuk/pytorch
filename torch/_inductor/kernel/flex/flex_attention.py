@@ -129,6 +129,17 @@ def _is_causal_mask_graph(graph_module: torch.fx.GraphModule) -> bool:
     )
 
 
+def _graph_uses_placeholder(
+    graph_module: torch.fx.GraphModule, placeholder_name: str
+) -> bool:
+    return any(
+        node.op == "placeholder"
+        and node.name == placeholder_name
+        and bool(node.users)
+        for node in graph_module.graph.nodes
+    )
+
+
 def _static_int(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, sympy.Integer)) else None
 
@@ -845,9 +856,19 @@ def flex_attention_backward_grid(
     parallelize over ceil_div(q_heads//kv_heads * num_key_value, key_value_block_size).
     To do this will either require atomic updates to some grad values or to have a two pass kernel design.
     """
-    programs_per_batch_kv_head = (
-        cdiv(num_queries, meta["BLOCK_M2"]) * (q_heads // kv_heads)
-        + cdiv(num_key_value, meta["BLOCK_N1"])
+    q_head_ratio = q_heads // kv_heads
+    if meta.get("CAUSAL_DQ_GQA_TAIL_PACK", False):
+        # One DQ program packs the one-row query tail from every GQA head that
+        # shares a KV head. Eligibility guarantees a static one-row tail.
+        dq_programs_per_batch_kv_head = (
+            (num_queries // meta["BLOCK_M2"]) * q_head_ratio + 1
+        )
+    else:
+        dq_programs_per_batch_kv_head = (
+            cdiv(num_queries, meta["BLOCK_M2"]) * q_head_ratio
+        )
+    programs_per_batch_kv_head = dq_programs_per_batch_kv_head + cdiv(
+        num_key_value, meta["BLOCK_N1"]
     )
     if meta.get("CAUSAL_DQ_LOAD_BALANCE", False):
         # Flatten the launch so the template can group all heads of each causal
@@ -1069,6 +1090,7 @@ def flex_attention_backward(*args, **kwargs):
         "BLOCKS_ARE_CONTIGUOUS_Q", kernel_options["BLOCKS_ARE_CONTIGUOUS"]
     )
     kernel_options.setdefault("WRITE_DQ", True)
+    kernel_options.setdefault("CAUSAL_DQ_GQA_TAIL_PACK", False)
     seq_q_divisible = can_skip_boundary_checks(seq_len_q, SPARSE_Q_BLOCK_SIZE)
     seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, SPARSE_KV_BLOCK_SIZE)
     if seq_q_divisible and seq_kv_divisible:
@@ -1249,6 +1271,9 @@ def flex_attention_backward(*args, **kwargs):
         full_q_indices=full_q_indices,
         has_full_blocks=has_full_blocks,
     )
+    score_mod_is_head_independent = not _graph_uses_placeholder(
+        fw_graph.graph_module, "h"
+    ) and not _graph_uses_placeholder(joint_graph.graph_module, "h")
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
@@ -1331,6 +1356,17 @@ def flex_attention_backward(*args, **kwargs):
         cur_kernel_options.setdefault("BLOCK_N1", block_n1)
         cur_kernel_options.setdefault("BLOCK_M2", block_m2)
         cur_kernel_options.setdefault("BLOCK_N2", block_n2)
+        static_q_len = _static_int(seq_len_q)
+        cur_kernel_options["CAUSAL_DQ_GQA_TAIL_PACK"] = bool(
+            cur_kernel_options.get("CAUSAL_DQ_GQA_TAIL_PACK", False)
+            and cur_kernel_options.get("CAUSAL_DQ_LOAD_BALANCE", False)
+            and exact_causal_autotune_inputs
+            and score_mod_is_head_independent
+            and gqa_shared_heads > 1
+            and static_q_len is not None
+            and static_q_len % block_m2 == 1
+            and not cur_kernel_options["USE_TMA"]
+        )
 
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
