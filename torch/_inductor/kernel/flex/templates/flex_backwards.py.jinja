@@ -355,7 +355,7 @@
             dk, dv = bwd_dkdv_inner(
                 {{gen_argdefs()}},
                 Q1, DO1, DELTA1, LSE1,
-                desc_q, desc_do, q_start,
+                desc_q, desc_do, q_start, start_n1,
                 dk, dv, k, v,
                 off_zq, off_hq1, offs_n1, offs_m1,
                 stride_qm, stride_qd, stride_dom, stride_dod,
@@ -376,7 +376,7 @@
                 dk, dv = bwd_dkdv_inner(
                     {{gen_argdefs()}},
                     Q1, DO1, DELTA1, LSE1,
-                    desc_q, desc_do, q_start,
+                    desc_q, desc_do, q_start, start_n1,
                     dk, dv, k, v,
                     off_zq, off_hq1, offs_n1, offs_m1,
                     stride_qm, stride_qd, stride_dom, stride_dod,
@@ -641,7 +641,7 @@ def bwd_dq_block_mn(
 def bwd_dkdv_inner(
     {{gen_argdefs()}},
     Q, DO, DELTA, LSE, # pointers
-    desc_q, desc_do, q_start,
+    desc_q, desc_do, q_start, start_n1,
     dk, dv, k, v,
     off_z, off_hq, offs_n1, offs_m1,
     stride_qm, stride_qd, stride_dom, stride_dod,
@@ -670,7 +670,7 @@ def bwd_dkdv_inner(
         dk, dv = bwd_dkdv_block_mn(
             {{gen_argdefs()}},
             dk, dv, Q, k, v, DO, DELTA, LSE,
-            desc_q, desc_do, q_start, offset_block, Q_LEN, KV_LEN,
+            desc_q, desc_do, q_start, start_n1, offset_block, Q_LEN, KV_LEN,
             off_z, off_hq, offs_n1, offs_m1, offs_k, offs_v,
             stride_qm, stride_qd, stride_dom, stride_dod,
             q_indices, sparse_q_num_blocks,
@@ -692,7 +692,7 @@ def bwd_dkdv_inner(
 def bwd_dkdv_block_mn(
     {{gen_argdefs()}},
     dk, dv, Q, k, v, DO, DELTA, LSE,
-    desc_q, desc_do, q_start, offset, Q_LEN, KV_LEN,
+    desc_q, desc_do, q_start, start_n1, offset, Q_LEN, KV_LEN,
     off_z, off_hq, offs_n1, offs_m1, offs_k, offs_v,
     stride_qm, stride_qd, stride_dom, stride_dod,
     q_indices, sparse_q_num_blocks,
@@ -765,7 +765,7 @@ def bwd_dkdv_block_mn(
             # subtiles that precede every valid tail row. Padding is already
             # masked by Q_LEN above, so those CTA-uniform causal-full subtiles
             # can skip the elementwise causal predicate.
-            if offs_m1[0] < offs_n1[-1]:
+            if q_start + offset < start_n1 + BLOCK_N1 - 1:
                 causal_mask = offs_m1[None, :] >= offs_n1[:, None]
                 post_mod_scores = tl.where(
                     causal_mask, post_mod_scores, float("-inf")
