@@ -202,6 +202,22 @@ def _can_use_exact_causal_autotune_inputs(
     return True
 
 
+def _apply_exact_causal_kernel_facts(
+    kernel_options: dict[str, Any],
+    *,
+    exact_causal_metadata: bool,
+    max_autotune: bool,
+    use_block_contiguity: bool,
+) -> None:
+    """Apply profitable default facts from a provenance-checked causal mask."""
+    if not exact_causal_metadata or max_autotune or not use_block_contiguity:
+        return
+    # The forward KV and backward Q block lists are contiguous intervals.
+    # Top-left causal attention also makes every row safe, but enabling that
+    # fact can regress the forward kernel, so keep its existing policy.
+    kernel_options["BLOCKS_ARE_CONTIGUOUS"] = True
+
+
 def _sanitize_kernel_options_for_triton(
     kernel_options: dict[str, Any],
 ) -> tuple[dict[str, Any], _Backend]:
@@ -590,6 +606,19 @@ def flex_attention(
         has_full_blocks=has_full_blocks,
     )
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
+    _apply_exact_causal_kernel_facts(
+        kernel_options,
+        exact_causal_metadata=exact_causal_autotune_inputs,
+        max_autotune=config.max_autotune,
+        use_block_contiguity=V.choices.use_flex_attention_exact_causal_block_contiguity(
+            query.get_device(),
+            dtype,
+            is_backward=False,
+            query_length=V.graph.sizevars.guard_int(seq_len_q),
+            head_dim=head_dim,
+            sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
+        ),
+    )
 
     # Note, we don't need to pass in the captured buffers explicitly
     # because they're implicitly added by the score_mod function
@@ -1193,11 +1222,24 @@ def flex_attention_backward(*args, **kwargs):
         has_full_blocks=has_full_blocks,
     )
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
+    dtype = query.get_dtype()
+    head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    _apply_exact_causal_kernel_facts(
+        kernel_options,
+        exact_causal_metadata=exact_causal_autotune_inputs,
+        max_autotune=config.max_autotune,
+        use_block_contiguity=V.choices.use_flex_attention_exact_causal_block_contiguity(
+            query.get_device(),
+            dtype,
+            is_backward=True,
+            query_length=V.graph.sizevars.guard_int(seq_len_q),
+            head_dim=head_dim,
+            sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
+        ),
+    )
 
     choices: list[Any] = []
 
-    dtype = query.get_dtype()
-    head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
     configs: list[FlexBwDConfig] = V.choices.get_flex_attention_bwd_configs(
         head_dim, dtype, query.get_device().type
     )

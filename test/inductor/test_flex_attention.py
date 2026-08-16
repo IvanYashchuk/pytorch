@@ -31,6 +31,7 @@ from torch._inductor.exc import InductorError
 from torch._inductor.kernel.flex.flex_attention import (
     _BWD_MASK_MODE_LEGACY_GLOBAL,
     _BWD_MASK_MODE_TRAVERSAL_SCOPED,
+    _apply_exact_causal_kernel_facts,
     _can_use_exact_causal_autotune_inputs,
     _is_causal_mask_graph,
     _select_flex_attention_bwd_mask_options,
@@ -733,6 +734,78 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                 )
             )
 
+    def test_exact_causal_block_contiguity_profitability_gate(self):
+        rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        blackwell = types.SimpleNamespace(cc=100, multi_processor_count=152)
+        choices = InductorChoices()
+        common = {
+            "query_length": 128,
+            "head_dim": 256,
+            "sparse_query_block_size": 128,
+        }
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=rubin
+        ):
+            self.assertFalse(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=False,
+                    **common,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=True,
+                    **common,
+                )
+            )
+            self.assertTrue(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=True,
+                    **(common | {"query_length": 129}),
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=False,
+                    **(common | {"query_length": 256}),
+                )
+            )
+            self.assertTrue(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=False,
+                    **(common | {"query_length": 257}),
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.float16,
+                    is_backward=False,
+                    **common,
+                )
+            )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=blackwell
+        ):
+            self.assertFalse(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=False,
+                    **common,
+                )
+            )
+
     def test_causal_mask_graph_match(self):
         def mask_graph(target, args):
             graph = torch.fx.Graph()
@@ -811,6 +884,63 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                 full_q_indices=MetadataNode(1, 1, 32, 2),
             )
         )
+
+    def test_exact_causal_kernel_facts(self):
+        kernel_options = {
+            "ROWS_GUARANTEED_SAFE": False,
+            "BLOCKS_ARE_CONTIGUOUS": False,
+        }
+        _apply_exact_causal_kernel_facts(
+            kernel_options,
+            exact_causal_metadata=False,
+            max_autotune=False,
+            use_block_contiguity=True,
+        )
+        self.assertEqual(
+            kernel_options,
+            {
+                "ROWS_GUARANTEED_SAFE": False,
+                "BLOCKS_ARE_CONTIGUOUS": False,
+            },
+        )
+
+        _apply_exact_causal_kernel_facts(
+            kernel_options,
+            exact_causal_metadata=True,
+            max_autotune=False,
+            use_block_contiguity=True,
+        )
+        self.assertEqual(
+            kernel_options,
+            {
+                "ROWS_GUARANTEED_SAFE": False,
+                "BLOCKS_ARE_CONTIGUOUS": True,
+            },
+        )
+
+        max_options = {
+            "ROWS_GUARANTEED_SAFE": False,
+            "BLOCKS_ARE_CONTIGUOUS": False,
+        }
+        _apply_exact_causal_kernel_facts(
+            max_options,
+            exact_causal_metadata=True,
+            max_autotune=True,
+            use_block_contiguity=True,
+        )
+        self.assertFalse(max_options["BLOCKS_ARE_CONTIGUOUS"])
+
+        disabled_options = {
+            "ROWS_GUARANTEED_SAFE": False,
+            "BLOCKS_ARE_CONTIGUOUS": False,
+        }
+        _apply_exact_causal_kernel_facts(
+            disabled_options,
+            exact_causal_metadata=True,
+            max_autotune=False,
+            use_block_contiguity=False,
+        )
+        self.assertFalse(disabled_options["BLOCKS_ARE_CONTIGUOUS"])
 
 
 @large_tensor_test_class("2GB", device=test_device[0])

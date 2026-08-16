@@ -204,6 +204,36 @@ class InductorChoices:
             and dtype == torch.bfloat16
         )
 
+    def use_flex_attention_exact_causal_block_contiguity(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        is_backward: bool,
+        query_length: int,
+        head_dim: int,
+        sparse_query_block_size: int,
+    ) -> bool:
+        """Select the measured default policy for exact causal block lists."""
+        if device.type != "cuda" or torch.version.hip:
+            return False
+        props = DeviceProperties.create(device)
+        if not (
+            props.cc == 107
+            and props.multi_processor_count == 212
+            and dtype == torch.bfloat16
+        ):
+            return False
+
+        if head_dim < 256:
+            return True
+
+        # D256 needs a larger query grid to repay the changed indexing path.
+        # Backward wins after the first sparse query block; forward is noisy or
+        # slower through two blocks and starts from a smaller broad benefit.
+        minimum_query_work = sparse_query_block_size * (1 if is_backward else 2)
+        return query_length > minimum_query_work
+
     def get_flex_decode_configs(
         self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
     ) -> list[Any]:
