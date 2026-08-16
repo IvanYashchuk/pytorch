@@ -245,7 +245,8 @@ class TestA100DefaultFlexConfig(TestCase):
 class TestRubinDefaultFlexBackwardConfig(TestCase):
     def test_bf16_head_dim_128(self):
         heuristic = CUDAConfigHeuristic()
-        rubin = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        rubin_short = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        rubin_long = FlexBwDConfig(32, 64, 64, 32, 3, 4)
         sm10x = FlexBwDConfig(64, 128, 128, 64, 3, 4)
 
         with (
@@ -253,8 +254,12 @@ class TestRubinDefaultFlexBackwardConfig(TestCase):
             patch("torch.cuda.get_device_capability", return_value=(10, 7)),
         ):
             self.assertEqual(
-                heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16),
-                [rubin],
+                heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16, seq_len=767),
+                [rubin_short],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16, seq_len=768),
+                [rubin_long],
             )
             self.assertEqual(
                 heuristic.get_flex_attn_bwd_configs(128, torch.float16),
@@ -272,13 +277,20 @@ class TestRubinDefaultFlexBackwardConfig(TestCase):
 
     def test_max_autotune_does_not_duplicate_rubin_default(self):
         heuristic = CUDAConfigHeuristic()
-        rubin = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        rubin_short = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        rubin_long = FlexBwDConfig(32, 64, 64, 32, 3, 4)
         with (
             inductor_config.patch(max_autotune=True),
             patch("torch.cuda.get_device_capability", return_value=(10, 7)),
         ):
-            configs = heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16)
-        self.assertEqual(configs.count(rubin), 1)
+            short_configs = heuristic.get_flex_attn_bwd_configs(
+                128, torch.bfloat16, seq_len=767
+            )
+            long_configs = heuristic.get_flex_attn_bwd_configs(
+                128, torch.bfloat16, seq_len=768
+            )
+        self.assertEqual(short_configs.count(rubin_short), 1)
+        self.assertEqual(long_configs.count(rubin_long), 1)
 
 
 if __name__ == "__main__":

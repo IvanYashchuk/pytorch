@@ -1231,7 +1231,11 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        *,
+        seq_len: sympy.Expr | None = None,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1460,7 +1464,11 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        *,
+        seq_len: sympy.Expr | None = None,
     ) -> list[FlexBwDConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
@@ -1525,10 +1533,18 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         # fmt: on
 
         if capability == (10, 7) and dtype == torch.bfloat16 and head_dim == 128:
-            # Rubin's smaller backward tile is already part of the ordinary
-            # max-autotune set. It wins the broad causal GQA default surface;
-            # keeping this architecture-specific leaves SM100 unchanged.
-            default_config = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+            # Both configs are already in the ordinary max-autotune set. A
+            # counterbalanced causal-GQA sweep finds the wider tile wins every
+            # stationary row from Q=768 onward; keep the sequence threshold and
+            # architecture guard explicit so SM100 and other dtypes are unchanged.
+            long_query = (
+                isinstance(seq_len, (int, sympy.Integer)) and int(seq_len) >= 768
+            )
+            default_config = (
+                FlexBwDConfig(32, 64, 64, 32, 3, 4)
+                if long_query
+                else FlexBwDConfig(32, 32, 32, 32, 3, 4)
+            )
         elif head_dim <= 256:
             default_config = config_map[capability_class](head_dim)
         else:
@@ -1935,7 +1951,11 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        *,
+        seq_len: sympy.Expr | None = None,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -2077,7 +2097,11 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_fwd_configs
 
     def get_flex_attn_bwd_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        *,
+        seq_len: sympy.Expr | None = None,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 

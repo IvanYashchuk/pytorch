@@ -169,10 +169,17 @@ class InductorChoices:
         return flex_heuristics.get_flex_attn_fwd_configs(head_dim, seq_len, dtype)
 
     def get_flex_attention_bwd_configs(
-        self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+        *,
+        seq_len: sympy.Expr | None = None,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype)
+        return flex_heuristics.get_flex_attn_bwd_configs(
+            head_dim, dtype, seq_len=seq_len
+        )
 
     def use_flex_attention_bwd_traversal_scoped_masks(
         self,

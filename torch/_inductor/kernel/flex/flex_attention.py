@@ -1269,7 +1269,10 @@ def flex_attention_backward(*args, **kwargs):
     choices: list[Any] = []
 
     configs: list[FlexBwDConfig] = V.choices.get_flex_attention_bwd_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        seq_len=V.graph.sizevars.guard_int(seq_len_q),
     )
 
     # Default config for warp specialization
