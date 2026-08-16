@@ -1524,7 +1524,12 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         }
         # fmt: on
 
-        if head_dim <= 256:
+        if capability == (10, 7) and dtype == torch.bfloat16 and head_dim == 128:
+            # Rubin's smaller backward tile is already part of the ordinary
+            # max-autotune set. It wins the broad causal GQA default surface;
+            # keeping this architecture-specific leaves SM100 unchanged.
+            default_config = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        elif head_dim <= 256:
             default_config = config_map[capability_class](head_dim)
         else:
             default_config = FlexBwDConfig(16, 16, 16, 16, 1, 4)

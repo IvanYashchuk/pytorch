@@ -1,5 +1,8 @@
 # Owner(s): ["module: inductor"]
+from unittest.mock import patch
+
 import torch
+from torch._inductor import config as inductor_config
 from torch._inductor.heuristics.registry import (
     _TEMPLATE_HEURISTIC_REGISTRY,
     clear_registry,
@@ -10,6 +13,7 @@ from torch._inductor.heuristics.template.base import TemplateConfigHeuristics
 from torch._inductor.heuristics.template.triton import (
     BlackwellGPUGemmConfig,
     CUDAConfigHeuristic,
+    FlexBwDConfig,
     FlexConfig,
 )
 from torch._inductor.test_case import run_tests, TestCase
@@ -236,6 +240,45 @@ class TestA100DefaultFlexConfig(TestCase):
         h = CUDAConfigHeuristic()
         self.assertEqual(h.a100_default_flex_config[(torch.bfloat16, 192)], expected)
         self.assertEqual(h.a100_default_flex_config[(torch.float16, 192)], expected)
+
+
+class TestRubinDefaultFlexBackwardConfig(TestCase):
+    def test_bf16_head_dim_128(self):
+        heuristic = CUDAConfigHeuristic()
+        rubin = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        sm10x = FlexBwDConfig(64, 128, 128, 64, 3, 4)
+
+        with (
+            inductor_config.patch(max_autotune=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+        ):
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16),
+                [rubin],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(128, torch.float16),
+                [sm10x],
+            )
+
+        with (
+            inductor_config.patch(max_autotune=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16),
+                [sm10x],
+            )
+
+    def test_max_autotune_does_not_duplicate_rubin_default(self):
+        heuristic = CUDAConfigHeuristic()
+        rubin = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        with (
+            inductor_config.patch(max_autotune=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+        ):
+            configs = heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16)
+        self.assertEqual(configs.count(rubin), 1)
 
 
 if __name__ == "__main__":
