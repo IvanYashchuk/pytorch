@@ -760,26 +760,39 @@ def bwd_dkdv_block_mn(
         post_mod_scores = tl.where(offs_m1[None, :] < Q_LEN, post_mod_scores, float("-inf"))
 
     if not IS_FULL_BLOCKS:
-        {{ modification(
-            subgraph_number=2,
-            output_name="mask_mod_output",
-            b="off_z",
-            h="off_hq",
-            m="m",
-            n="n",
-            input_shapes={
-                "m": ("1", "BLOCK_M1"),
-                "n": ("BLOCK_N1", "1"),
-            },
-            input_dtypes={
-                "b": "index",
-                "h": "index",
-                "m": "index",
-                "n": "index",
-            }
-        ) | indent_except_first(2) }}
-        # (grads) apply mask for fully masked block
-        post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
+        if AUTOTUNE_CAUSAL_BLOCK_MASK:
+            # A padded Q tail is conservatively listed as partial even for KV
+            # subtiles that precede every valid tail row. Padding is already
+            # masked by Q_LEN above, so those CTA-uniform causal-full subtiles
+            # can skip the elementwise causal predicate.
+            if offs_m1[0] < offs_n1[-1]:
+                causal_mask = offs_m1[None, :] >= offs_n1[:, None]
+                post_mod_scores = tl.where(
+                    causal_mask, post_mod_scores, float("-inf")
+                )
+        else:
+            {{ modification(
+                subgraph_number=2,
+                output_name="mask_mod_output",
+                b="off_z",
+                h="off_hq",
+                m="m",
+                n="n",
+                input_shapes={
+                    "m": ("1", "BLOCK_M1"),
+                    "n": ("BLOCK_N1", "1"),
+                },
+                input_dtypes={
+                    "b": "index",
+                    "h": "index",
+                    "m": "index",
+                    "n": "index",
+                }
+            ) | indent_except_first(3) }}
+            # (grads) apply mask for fully masked block
+            post_mod_scores = tl.where(
+                mask_mod_output, post_mod_scores, float("-inf")
+            )
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if not PRESCALE_QK:
         post_mod_scores *= RCP_LN2
