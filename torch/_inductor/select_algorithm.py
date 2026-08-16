@@ -3970,6 +3970,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 "BLOCK_N1",
                 "BLOCK_M2",
                 "BLOCK_N2",
+                "BWD_MASK_MODE",
                 "USE_TMA",
                 "kpack",
                 "matrix_instr_nonkdim",

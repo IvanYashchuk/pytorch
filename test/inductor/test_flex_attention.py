@@ -25,10 +25,19 @@ import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 from torch._inductor import config, metrics
+from torch._inductor.choices import InductorChoices
 from torch._inductor.exc import InductorError
+from torch._inductor.kernel.flex.flex_attention import (
+    _BWD_MASK_MODE_LEGACY_GLOBAL,
+    _BWD_MASK_MODE_TRAVERSAL_SCOPED,
+    _is_causal_mask_graph,
+    _select_flex_attention_bwd_mask_options,
+)
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.nn.attention import SDPBackend
 from torch.nn.attention.experimental._paged_attention import PagedAttention
 from torch.nn.attention.flex_attention import (
@@ -587,6 +596,155 @@ def batch_reserve(paged_attention: PagedAttention, target_seq_len: Tensor):
         paged_attention.reserve(
             torch.tensor(b),
             target_seq_len[b],
+        )
+
+
+class TestFlexAttentionBwdMaskOptions(InductorTestCase):
+    @staticmethod
+    def _options(marker, is_divisible, exact):
+        return {
+            "marker": marker,
+            "IS_DIVISIBLE": is_divisible,
+            "IS_DIVISIBLE_Q1": exact[0],
+            "IS_DIVISIBLE_KV1": exact[1],
+            "IS_DIVISIBLE_Q2": exact[2],
+            "IS_DIVISIBLE_KV2": exact[3],
+        }
+
+    def test_max_autotune_mask_mode_order_and_dedup(self):
+        self.assertIn(
+            "BWD_MASK_MODE", AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS
+        )
+        options = [
+            self._options("a", False, (True, False, True, False)),
+            self._options("b", True, (True, True, True, True)),
+            self._options("c", False, (False, False, False, True)),
+        ]
+        selected = _select_flex_attention_bwd_mask_options(
+            options,
+            max_autotune=True,
+            default_use_traversal_scoped=False,
+        )
+        self.assertEqual(
+            [(option["marker"], option["BWD_MASK_MODE"]) for option in selected],
+            [
+                ("a", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("b", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("c", _BWD_MASK_MODE_LEGACY_GLOBAL),
+                ("a", _BWD_MASK_MODE_TRAVERSAL_SCOPED),
+                ("c", _BWD_MASK_MODE_TRAVERSAL_SCOPED),
+            ],
+        )
+        self.assertEqual(
+            tuple(
+                selected[0][key]
+                for key in (
+                    "IS_DIVISIBLE_Q1",
+                    "IS_DIVISIBLE_KV1",
+                    "IS_DIVISIBLE_Q2",
+                    "IS_DIVISIBLE_KV2",
+                )
+            ),
+            (False, False, False, False),
+        )
+
+    def test_max_autotune_retains_traversal_mask_mode(self):
+        options = [self._options("a", False, (True, False, True, False))]
+        selected = _select_flex_attention_bwd_mask_options(
+            options,
+            max_autotune=True,
+            default_use_traversal_scoped=True,
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0]["BWD_MASK_MODE"], _BWD_MASK_MODE_LEGACY_GLOBAL)
+        self.assertEqual(selected[1]["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
+
+    def test_default_mask_mode_uses_overridable_choice(self):
+        class TraversalScopedChoices(InductorChoices):
+            def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
+                return True
+
+            def uuid(self):
+                return "test_flex_attention_bwd_traversal_scoped_masks"
+
+        self.assertFalse(
+            InductorChoices().use_flex_attention_bwd_traversal_scoped_masks(
+                torch.device("cpu"),
+                torch.bfloat16,
+                is_causal=True,
+                user_pinned_config=False,
+            )
+        )
+        use_traversal = (
+            TraversalScopedChoices().use_flex_attention_bwd_traversal_scoped_masks(
+                torch.device("cpu"),
+                torch.float32,
+                user_pinned_config=True,
+            )
+        )
+        selected = _select_flex_attention_bwd_mask_options(
+            [self._options("a", False, (True, False, True, False))],
+            max_autotune=False,
+            default_use_traversal_scoped=use_traversal,
+        )
+        self.assertEqual(selected[0]["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
+
+    def test_default_mask_mode_profitability_gate(self):
+        rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        choices = InductorChoices()
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=rubin
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.float16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=True,
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=False,
+                    user_pinned_config=False,
+                )
+            )
+
+    def test_causal_mask_graph_match(self):
+        def mask_graph(target, args):
+            graph = torch.fx.Graph()
+            placeholders = [graph.placeholder(name) for name in ("b", "h", "q", "kv")]
+            graph.output(
+                graph.call_function(target, tuple(placeholders[i] for i in args))
+            )
+            return torch.fx.GraphModule({}, graph)
+
+        self.assertTrue(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.ge.Tensor, (2, 3)))
+        )
+        self.assertFalse(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.ge.Tensor, (3, 2)))
+        )
+        self.assertFalse(
+            _is_causal_mask_graph(mask_graph(torch.ops.aten.gt.Tensor, (2, 3)))
         )
 
 
@@ -2887,7 +3045,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 for grad, input_name in zip(grads, input_names):
                     self.assertIsNotNone(
                         grad,
-                        lambda msg: f"{msg}\n{input_name} should receive gradients in {description}",
+                        lambda msg: (
+                            f"{msg}\n{input_name} should receive gradients in {description}"
+                        ),
                     )
 
     @supported_platform
@@ -3107,6 +3267,151 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         # Test divisible and non-divisible shapes
         test_shapes = [256, 255, 383, 384]
         _ = [test_shape(S, backend) for S in test_shapes]
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_backward_independent_divisibility_guards(self, device):
+        class TraversalScopedChoices(InductorChoices):
+            def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
+                return True
+
+            def uuid(self):
+                return "test_flex_attention_bwd_traversal_scoped_masks"
+
+        def causal_mask(b, h, q, kv):
+            return q >= kv
+
+        kernel_options = {
+            "BACKEND": "TRITON",
+            "fwd_BLOCK_M": 32,
+            "fwd_BLOCK_N": 32,
+            "fwd_num_stages": 1,
+            "fwd_num_warps": 4,
+            "bwd_BLOCK_M1": 32,
+            "bwd_BLOCK_N1": 64,
+            "bwd_BLOCK_M2": 64,
+            "bwd_BLOCK_N2": 32,
+            "bwd_num_stages": 1,
+            "bwd_num_warps": 4,
+        }
+
+        def check_shape(q_len, kv_len, expected, block_size=(128, 128)):
+            options = {
+                **kernel_options,
+                **{f"bwd_{name}": not value for name, value in expected.items()},
+            }
+            block_mask = create_block_mask(
+                causal_mask,
+                1,
+                1,
+                q_len,
+                kv_len,
+                device=device,
+                BLOCK_SIZE=block_size,
+            )
+            q = torch.randn(
+                1, 2, q_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            k = torch.randn(
+                1, 2, kv_len, 64, device=device, dtype=torch.float16, requires_grad=True
+            )
+            v = torch.randn_like(k, requires_grad=True)
+
+            def attention(q, k, v):
+                return flex_attention(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    kernel_options=options,
+                )
+
+            eager_out = attention(q, k, v)
+            compiled_out, _ = run_and_get_code(
+                torch.compile(attention, fullgraph=True), q, k, v
+            )
+            grad = torch.randn_like(eager_out)
+            eager_grads = torch.autograd.grad(eager_out, (q, k, v), grad)
+            compiled_grads, backward_codes = run_and_get_code(
+                lambda: torch.autograd.grad(compiled_out, (q, k, v), grad)
+            )
+
+            self.assertEqual(eager_out, compiled_out, atol=1e-2, rtol=1e-2)
+            for eager_grad, compiled_grad in zip(eager_grads, compiled_grads):
+                self.assertEqual(eager_grad, compiled_grad, atol=1e-2, rtol=1e-2)
+
+            backward_code = "\n".join(backward_codes)
+            expected_mode = (
+                _BWD_MASK_MODE_LEGACY_GLOBAL
+                if len(set(expected.values())) == 1
+                else _BWD_MASK_MODE_TRAVERSAL_SCOPED
+            )
+            self.assertIn(
+                f"BWD_MASK_MODE : tl.constexpr = {expected_mode}",
+                backward_code,
+            )
+            for name, value in expected.items():
+                self.assertIn(
+                    f"{name} : tl.constexpr = {value}",
+                    backward_code,
+                )
+
+        with (
+            config.patch(inductor_choices_class=TraversalScopedChoices),
+            V.set_choices_handler(TraversalScopedChoices()),
+        ):
+            check_shape(
+                128,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                192,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": False,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                96,
+                128,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": False,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                128,
+                96,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": False,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": True,
+                },
+            )
+            check_shape(
+                128,
+                192,
+                {
+                    "IS_DIVISIBLE_Q1": True,
+                    "IS_DIVISIBLE_KV1": True,
+                    "IS_DIVISIBLE_Q2": True,
+                    "IS_DIVISIBLE_KV2": False,
+                },
+            )
 
     @supported_platform
     @skip_on_cpu
@@ -4444,7 +4749,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             self.assertEqual(
                 out_stride_order,
                 query_stride_order,
-                lambda msg: f"{msg}\nStride order mismatch: out {out_stride_order}, query {query_stride_order}",
+                lambda msg: (
+                    f"{msg}\nStride order mismatch: out {out_stride_order}, query {query_stride_order}"
+                ),
             )
 
     @supported_platform
@@ -4510,7 +4817,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 self.assertEqual(
                     input_stride_order,
                     orig_stride_order,
-                    lambda msg: f"{msg}\nMode: {mode}, Stride order mismatch for {name}: grad {input_stride_order}, input {orig_stride_order}.",
+                    lambda msg: (
+                        f"{msg}\nMode: {mode}, Stride order mismatch for {name}: grad {input_stride_order}, input {orig_stride_order}."
+                    ),
                 )
 
     @supported_platform
@@ -8143,7 +8452,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
         self.assertEqual(
             result.shape,
             expected_shape,
-            lambda msg: f"{msg}\nExpected output shape {expected_shape}, but got {result.shape}",
+            lambda msg: (
+                f"{msg}\nExpected output shape {expected_shape}, but got {result.shape}"
+            ),
         )
 
     @supported_platform
@@ -8710,7 +9021,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             if original_value is None:
                 self.assertIsNone(
                     reconstructed_value,
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} should be None but got {reconstructed_value}",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} should be None but got {reconstructed_value}"
+                    ),
                 )
             else:
                 self.assertIsInstance(
@@ -8720,7 +9033,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
                 )
                 self.assertTrue(
                     torch.equal(original_value, reconstructed_value),
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} not equal after reconstruction"
+                    ),
                 )
 
         # Verify all context attributes are equal (using _CONTEXT_ATTRS)
@@ -8731,7 +9046,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             self.assertEqual(
                 original_value,
                 reconstructed_value,
-                lambda msg: f"{msg}\nContext attribute {attr_name} not equal after reconstruction",
+                lambda msg: (
+                    f"{msg}\nContext attribute {attr_name} not equal after reconstruction"
+                ),
             )
 
     @supported_platform
@@ -8805,18 +9122,24 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             if isinstance(original_value, torch.Tensor):
                 self.assertTrue(
                     torch.equal(original_value, reconstructed_value),
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} not equal after reconstruction"
+                    ),
                 )
             elif original_value is None:
                 self.assertIsNone(
                     reconstructed_value,
-                    lambda msg: f"{msg}\nAttribute {attr_name} should be None but got {reconstructed_value}",
+                    lambda msg: (
+                        f"{msg}\nAttribute {attr_name} should be None but got {reconstructed_value}"
+                    ),
                 )
             else:
                 self.assertEqual(
                     original_value,
                     reconstructed_value,
-                    lambda msg: f"{msg}\nAttribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nAttribute {attr_name} not equal after reconstruction"
+                    ),
                 )
 
 
@@ -9398,8 +9721,10 @@ class TestLearnableBiases(InductorTestCase):
         self.assertLessEqual(
             comp_error,
             (ref_error * fudge_factor),
-            lambda msg: f"{msg}\nTensor: {tensor_name}\nCompiled error ({comp_error:.8f}) exceeds "
-            f"reference error ({ref_error:.8f}) * fudge_factor ({fudge_factor})",
+            lambda msg: (
+                f"{msg}\nTensor: {tensor_name}\nCompiled error ({comp_error:.8f}) exceeds "
+                f"reference error ({ref_error:.8f}) * fudge_factor ({fudge_factor})"
+            ),
         )
 
     def _check_outputs_and_grads(
@@ -10484,7 +10809,9 @@ class TestLearnableBiases(InductorTestCase):
             flex_error = rmse(flex, gold)
             self.assertTrue(
                 ref_error * 1.2 >= flex_error,
-                lambda msg: f"{msg}\n{name} -> Ref error: {ref_error}, Flex eager Error: {flex_error}",
+                lambda msg: (
+                    f"{msg}\n{name} -> Ref error: {ref_error}, Flex eager Error: {flex_error}"
+                ),
             )
 
 

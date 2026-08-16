@@ -16,6 +16,7 @@ from torch._inductor.virtualized import V
 from torch.nn.attention.flex_attention import _Backend
 from torch.utils._sympy.functions import FloorDiv
 
+from ... import config
 from ...ir import ComputedBuffer, ExternKernel, FixedLayout, TensorBox
 from ...lowering import empty, empty_strided, lowerings, register_lowering, to_dtype
 from ...runtime.runtime_utils import is_power_of_2
@@ -30,6 +31,7 @@ from .common import (
     _flex_kernel_tuning_options,
     build_subgraph_buffer,
     can_skip_boundary_checks,
+    can_skip_tile_boundary_checks,
     create_indices_fake,
     create_num_blocks_fake_generator,
     create_placeholder,
@@ -64,6 +66,66 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
 Expr = sympy.Expr
+
+_BWD_MASK_MODE_LEGACY_GLOBAL = "'legacy_global'"
+_BWD_MASK_MODE_TRAVERSAL_SCOPED = "'traversal_scoped'"
+_BWD_MASK_DIVISIBILITY_KEYS = (
+    "IS_DIVISIBLE_Q1",
+    "IS_DIVISIBLE_KV1",
+    "IS_DIVISIBLE_Q2",
+    "IS_DIVISIBLE_KV2",
+)
+
+
+def _select_flex_attention_bwd_mask_options(
+    legal_options: Sequence[dict[str, Any]],
+    *,
+    max_autotune: bool,
+    default_use_traversal_scoped: bool,
+) -> list[dict[str, Any]]:
+    """Apply the effective backward mask body and preserve autotune ordering."""
+    legacy_options = []
+    traversal_options = []
+    default_options = []
+    for options in legal_options:
+        legacy = options["IS_DIVISIBLE"]
+        exact = tuple(options[key] for key in _BWD_MASK_DIVISIBILITY_KEYS)
+
+        legacy_option = options.copy()
+        legacy_option["BWD_MASK_MODE"] = _BWD_MASK_MODE_LEGACY_GLOBAL
+        legacy_option.update(dict.fromkeys(_BWD_MASK_DIVISIBILITY_KEYS, legacy))
+        legacy_options.append(legacy_option)
+
+        if exact != (legacy,) * len(_BWD_MASK_DIVISIBILITY_KEYS):
+            traversal_option = options.copy()
+            traversal_option["BWD_MASK_MODE"] = _BWD_MASK_MODE_TRAVERSAL_SCOPED
+            traversal_options.append(traversal_option)
+            default_options.append(
+                traversal_option if default_use_traversal_scoped else legacy_option
+            )
+        else:
+            default_options.append(legacy_option)
+
+    if max_autotune:
+        return legacy_options + traversal_options
+    return default_options
+
+
+def _is_causal_mask_graph(graph_module: torch.fx.GraphModule) -> bool:
+    """Match the exact top-left causal predicate ``q_idx >= kv_idx``."""
+    nodes = list(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    outputs = [node for node in nodes if node.op == "output"]
+    if len(placeholders) != 4 or len(outputs) != 1:
+        return False
+    predicate = outputs[0].args[0]
+    return (
+        isinstance(predicate, torch.fx.Node)
+        and predicate.op == "call_function"
+        and predicate.target is torch.ops.aten.ge.Tensor
+        and predicate.args == (placeholders[2], placeholders[3])
+        and not predicate.kwargs
+    )
 
 
 def _sanitize_kernel_options_for_triton(
@@ -1016,6 +1078,7 @@ def flex_attention_backward(*args, **kwargs):
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
+    legal_kernel_options: list[dict[str, Any]] = []
 
     original_kernel_options = kernel_options.copy()
 
@@ -1068,6 +1131,18 @@ def flex_attention_backward(*args, **kwargs):
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
+        cur_kernel_options["IS_DIVISIBLE_Q1"] = can_skip_boundary_checks(
+            seq_len_q, SPARSE_Q_BLOCK_SIZE, cur_kernel_options["BLOCK_M1"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_KV1"] = can_skip_tile_boundary_checks(
+            seq_len_kv, cur_kernel_options["BLOCK_N1"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_Q2"] = can_skip_tile_boundary_checks(
+            seq_len_q, cur_kernel_options["BLOCK_M2"]
+        )
+        cur_kernel_options["IS_DIVISIBLE_KV2"] = can_skip_boundary_checks(
+            seq_len_kv, SPARSE_KV_BLOCK_SIZE, cur_kernel_options["BLOCK_N2"]
+        )
 
         if (
             cur_kernel_options["SPARSE_KV_BLOCK_SIZE"] % cur_kernel_options["BLOCK_N1"]
@@ -1101,6 +1176,37 @@ def flex_attention_backward(*args, **kwargs):
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
 
+        legal_kernel_options.append(cur_kernel_options)
+
+    user_pinned_config = any(
+        key.startswith("bwd_")
+        or key
+        in {
+            "BLOCK_M1",
+            "BLOCK_N1",
+            "BLOCK_M2",
+            "BLOCK_N2",
+            "num_stages",
+            "num_warps",
+        }
+        for key in original_kernel_options
+    )
+    default_use_traversal_scoped = (
+        not config.max_autotune
+        and V.choices.use_flex_attention_bwd_traversal_scoped_masks(
+            device,
+            dtype,
+            is_causal=_is_causal_mask_graph(mask_graph.graph_module),
+            user_pinned_config=user_pinned_config,
+        )
+    )
+    kernel_options_by_mask_mode = _select_flex_attention_bwd_mask_options(
+        legal_kernel_options,
+        max_autotune=config.max_autotune,
+        default_use_traversal_scoped=default_use_traversal_scoped,
+    )
+
+    for cur_kernel_options in kernel_options_by_mask_mode:
         flex_attention_backward_template.maybe_append_choice(
             choices=choices,
             input_nodes=[
