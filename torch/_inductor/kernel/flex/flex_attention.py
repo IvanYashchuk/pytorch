@@ -83,10 +83,12 @@ def _select_flex_attention_bwd_mask_options(
     *,
     max_autotune: bool,
     default_use_traversal_scoped: bool,
+    autotune_block_contiguity: tuple[bool, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the effective backward mask body and preserve autotune ordering."""
     legacy_options = []
     traversal_options = []
+    contiguous_options = []
     default_options = []
     for options in legal_options:
         legacy = options["IS_DIVISIBLE"]
@@ -107,8 +109,17 @@ def _select_flex_attention_bwd_mask_options(
         else:
             default_options.append(legacy_option)
 
+        if max_autotune and autotune_block_contiguity is not None:
+            contiguous_option = options.copy()
+            contiguous_option["BWD_MASK_MODE"] = _BWD_MASK_MODE_TRAVERSAL_SCOPED
+            (
+                contiguous_option["BLOCKS_ARE_CONTIGUOUS_KV"],
+                contiguous_option["BLOCKS_ARE_CONTIGUOUS_Q"],
+            ) = autotune_block_contiguity
+            contiguous_options.append(contiguous_option)
+
     if max_autotune:
-        return legacy_options + traversal_options
+        return legacy_options + traversal_options + contiguous_options
     return default_options
 
 
@@ -222,14 +233,30 @@ def _apply_exact_causal_kernel_facts(
     if kernel_options["BLOCKS_ARE_CONTIGUOUS"]:
         return
 
-    kernel_options["BLOCKS_ARE_CONTIGUOUS_KV"] = True
+    (
+        kernel_options["BLOCKS_ARE_CONTIGUOUS_KV"],
+        kernel_options["BLOCKS_ARE_CONTIGUOUS_Q"],
+    ) = _exact_causal_backward_block_contiguity(
+        query_length,
+        sparse_query_block_size,
+        has_full_blocks,
+    )
+
+
+def _exact_causal_backward_block_contiguity(
+    query_length: int,
+    sparse_query_block_size: int,
+    has_full_blocks: bool,
+) -> tuple[bool, bool]:
+    """Return safe KV- and Q-list contiguity for exact causal metadata."""
     # A padded Q tail is a second partial block in transposed metadata. Past
     # two blocks it is separated from the diagonal partial block by full blocks.
-    kernel_options["BLOCKS_ARE_CONTIGUOUS_Q"] = (
+    q_blocks_are_contiguous = (
         not has_full_blocks
         or query_length <= 2 * sparse_query_block_size
         or query_length % sparse_query_block_size == 0
     )
+    return True, q_blocks_are_contiguous
 
 
 def _sanitize_kernel_options_for_triton(
@@ -1248,18 +1275,21 @@ def flex_attention_backward(*args, **kwargs):
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
-    _apply_exact_causal_kernel_facts(
-        kernel_options,
-        exact_causal_metadata=exact_causal_autotune_inputs,
-        max_autotune=config.max_autotune,
-        use_block_contiguity=V.choices.use_flex_attention_exact_causal_block_contiguity(
+    use_exact_causal_block_contiguity = (
+        V.choices.use_flex_attention_exact_causal_block_contiguity(
             query.get_device(),
             dtype,
             is_backward=True,
             query_length=V.graph.sizevars.guard_int(seq_len_q),
             head_dim=head_dim,
             sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
-        ),
+        )
+    )
+    _apply_exact_causal_kernel_facts(
+        kernel_options,
+        exact_causal_metadata=exact_causal_autotune_inputs,
+        max_autotune=config.max_autotune,
+        use_block_contiguity=use_exact_causal_block_contiguity,
         is_backward=True,
         query_length=V.graph.sizevars.guard_int(seq_len_q),
         sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
@@ -1400,10 +1430,22 @@ def flex_attention_backward(*args, **kwargs):
             user_pinned_config=user_pinned_config,
         )
     )
+    autotune_block_contiguity = None
+    if (
+        config.max_autotune
+        and exact_causal_autotune_inputs
+        and use_exact_causal_block_contiguity
+    ):
+        autotune_block_contiguity = _exact_causal_backward_block_contiguity(
+            V.graph.sizevars.guard_int(seq_len_q),
+            SPARSE_Q_BLOCK_SIZE,
+            has_full_blocks,
+        )
     kernel_options_by_mask_mode = _select_flex_attention_bwd_mask_options(
         legal_kernel_options,
         max_autotune=config.max_autotune,
         default_use_traversal_scoped=default_use_traversal_scoped,
+        autotune_block_contiguity=autotune_block_contiguity,
     )
 
     for cur_kernel_options in kernel_options_by_mask_mode:

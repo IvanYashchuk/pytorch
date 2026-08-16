@@ -3971,6 +3971,8 @@ class AlgorithmSelectorCache(PersistentCache):
                 "BLOCK_M2",
                 "BLOCK_N2",
                 "BWD_MASK_MODE",
+                "BLOCKS_ARE_CONTIGUOUS_KV",
+                "BLOCKS_ARE_CONTIGUOUS_Q",
                 "AUTOTUNE_CAUSAL_BLOCK_MASK",
                 "USE_TMA",
                 "kpack",

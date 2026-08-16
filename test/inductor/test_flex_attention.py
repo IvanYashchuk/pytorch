@@ -664,6 +664,28 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         self.assertEqual(selected[0]["BWD_MASK_MODE"], _BWD_MASK_MODE_LEGACY_GLOBAL)
         self.assertEqual(selected[1]["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
 
+    def test_max_autotune_adds_exact_causal_contiguity_axis(self):
+        self.assertIn(
+            "BLOCKS_ARE_CONTIGUOUS_KV",
+            AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS,
+        )
+        self.assertIn(
+            "BLOCKS_ARE_CONTIGUOUS_Q",
+            AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS,
+        )
+        options = [self._options("a", False, (True, False, True, False))]
+        selected = _select_flex_attention_bwd_mask_options(
+            options,
+            max_autotune=True,
+            default_use_traversal_scoped=False,
+            autotune_block_contiguity=(True, False),
+        )
+        self.assertEqual(len(selected), 3)
+        contiguous = selected[-1]
+        self.assertEqual(contiguous["BWD_MASK_MODE"], _BWD_MASK_MODE_TRAVERSAL_SCOPED)
+        self.assertTrue(contiguous["BLOCKS_ARE_CONTIGUOUS_KV"])
+        self.assertFalse(contiguous["BLOCKS_ARE_CONTIGUOUS_Q"])
+
     def test_default_mask_mode_uses_overridable_choice(self):
         class TraversalScopedChoices(InductorChoices):
             def use_flex_attention_bwd_traversal_scoped_masks(self, *args, **kwargs):
