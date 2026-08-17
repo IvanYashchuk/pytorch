@@ -123,23 +123,64 @@
     kv_indices = KV_IDX + sparse_idx_zhm_offset
     kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_block_zhm_offset)
 
+    {%- if RUNTIME_SPLIT_KV|default(false) %}
+    tl.static_assert(RUNTIME_SPLIT_KV_LOW <= SPLIT_KV)
+    tl.static_assert(RUNTIME_SPLIT_KV_HIGH <= SPLIT_KV)
+    runtime_sparse_idx_z = RUNTIME_SPLIT_KV_BATCH_THRESHOLD % SPARSE_Z
+    runtime_block_offset = runtime_sparse_idx_z * stride_block_z + sparse_idx_h * stride_block_h + sparse_idx_m * stride_block_row
+    runtime_kv_num_blocks = tl.load(KV_NUM_BLKS + runtime_block_offset)
+    {%- if HAS_FULL_BLOCKS %}
+    runtime_full_block_offset = runtime_sparse_idx_z * stride_full_block_z + sparse_idx_h * stride_full_block_h + sparse_idx_m * stride_full_block_row
+    runtime_full_kv_num_blocks = tl.load(FULL_KV_NUM_BLKS + runtime_full_block_offset)
+    runtime_kv_num_blocks = tl.maximum(
+        runtime_kv_num_blocks, runtime_full_kv_num_blocks
+    )
+    {%- endif %}
+    effective_split_kv = tl.where(
+        runtime_kv_num_blocks >= RUNTIME_SPLIT_KV_MIN_BLOCKS,
+        RUNTIME_SPLIT_KV_HIGH,
+        RUNTIME_SPLIT_KV_LOW,
+    )
+    {%- endif %}
+
     # Make sure each split is a multiple of BLOCK_N
     if HAS_FULL_BLOCKS:
         full_kv_num_blocks = tl.load(
             FULL_KV_NUM_BLKS + sparse_full_block_zhm_offset
         )
         max_kv_num_blocks = tl.maximum(kv_num_blocks, full_kv_num_blocks)
+        {%- if RUNTIME_SPLIT_KV|default(false) %}
+        TILE_KV_OG = tl.cdiv(
+            max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, effective_split_kv
+        )
+        {%- else %}
         TILE_KV_OG = tl.cdiv(
             max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV
         )
+        {%- endif %}
     else:
+        {%- if RUNTIME_SPLIT_KV|default(false) %}
+        TILE_KV_OG = tl.cdiv(
+            kv_num_blocks * SPARSE_KV_BLOCK_SIZE, effective_split_kv
+        )
+        {%- else %}
         TILE_KV_OG = tl.cdiv(kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV)
+        {%- endif %}
     TILE_KV = tl.cdiv(TILE_KV_OG, BLOCK_N) * BLOCK_N
     TILE_KV_MULTIPLE: tl.constexpr = (TILE_KV // BLOCK_N)
 
     # Calculate KV blocks that belong to this CTA.
+    {%- if RUNTIME_SPLIT_KV|default(false) %}
+    split_is_active = off_t < effective_split_kv
+    active_off_t = tl.where(split_is_active, off_t, 0)
+    block_n_start = active_off_t * TILE_KV_MULTIPLE                 # n_offset inside sparse block
+    block_n_end = tl.where(                                         # end BLOCK_N
+        split_is_active, block_n_start + TILE_KV_MULTIPLE, 0
+    )
+    {%- else %}
     block_n_start = off_t * TILE_KV_MULTIPLE                        # n_offset inside sparse block
     block_n_end = block_n_start + TILE_KV_MULTIPLE                  # end BLOCK_N
+    {%- endif %}
 
     MAX_KV_IDX = {{size("KV_IDX", -1)}}
     indices_idx = (block_n_start // SPARSE_KV_MULTIPLE) % (MAX_KV_IDX)
@@ -195,8 +236,18 @@
         kv_num_blocks = full_kv_num_blocks
         MAX_FULL_KV_IDX = {{size("FULL_KV_IDX", -1)}}
         # Assign full block in a reverse order for off_t. Prioritize the last CTA.
+        {%- if RUNTIME_SPLIT_KV|default(false) %}
+        reverse_off_t = tl.where(
+            split_is_active, effective_split_kv - off_t - 1, 0
+        )
+        block_n_start = reverse_off_t * TILE_KV_MULTIPLE
+        block_n_end = tl.where(
+            split_is_active, block_n_start + TILE_KV_MULTIPLE, 0
+        )
+        {%- else %}
         block_n_start = (SPLIT_KV - off_t - 1) * TILE_KV_MULTIPLE
         block_n_end = block_n_start + TILE_KV_MULTIPLE
+        {%- endif %}
         indices_idx = (block_n_start // SPARSE_KV_MULTIPLE) % (MAX_FULL_KV_IDX)
         off_n_block_in_sparse = block_n_start % SPARSE_KV_MULTIPLE
         off_n = tl.load(kv_indices + indices_idx) * SPARSE_KV_BLOCK_SIZE + off_n_block_in_sparse * BLOCK_N

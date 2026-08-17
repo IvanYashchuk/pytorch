@@ -341,11 +341,53 @@ def create_flex_decoding_kernel(*args, **kwargs):
     )
 
     kernel_options.setdefault("SM_SCALE", scale)
-    split_kv_was_explicit = "SPLIT_KV" in kernel_options
-    kernel_options.setdefault(
-        "SPLIT_KV",
-        get_split_k(B, Hkv, max_kv_work, num_block_m, query.get_device()),
-    )
+    runtime_split_kv = bool(kernel_options.get("RUNTIME_SPLIT_KV", False))
+    split_kv_was_explicit = "SPLIT_KV" in kernel_options or runtime_split_kv
+    if runtime_split_kv:
+        runtime_split_low = kernel_options.get("RUNTIME_SPLIT_KV_LOW")
+        runtime_split_high = kernel_options.get("RUNTIME_SPLIT_KV_HIGH")
+        runtime_batch_threshold = kernel_options.get(
+            "RUNTIME_SPLIT_KV_BATCH_THRESHOLD"
+        )
+        runtime_min_blocks = kernel_options.get("RUNTIME_SPLIT_KV_MIN_BLOCKS")
+        runtime_values = (
+            runtime_split_low,
+            runtime_split_high,
+            runtime_batch_threshold,
+            runtime_min_blocks,
+        )
+        if not all(isinstance(value, (int, sympy.Integer)) for value in runtime_values):
+            raise ValueError("runtime SPLIT_KV options must be concrete integers")
+        runtime_split_low = int(runtime_split_low)
+        runtime_split_high = int(runtime_split_high)
+        runtime_batch_threshold = int(runtime_batch_threshold)
+        runtime_min_blocks = int(runtime_min_blocks)
+        if min(runtime_split_low, runtime_split_high, runtime_min_blocks) < 1:
+            raise ValueError("runtime SPLIT_KV counts and work threshold must be positive")
+        if not 0 <= runtime_batch_threshold < int(B):
+            raise ValueError(
+                "runtime SPLIT_KV batch threshold must index the static batch"
+            )
+        runtime_split_capacity = max(runtime_split_low, runtime_split_high)
+        if (
+            "SPLIT_KV" in kernel_options
+            and int(kernel_options["SPLIT_KV"]) != runtime_split_capacity
+        ):
+            raise ValueError(
+                "SPLIT_KV must equal the largest runtime split for scratch ownership"
+            )
+        kernel_options["RUNTIME_SPLIT_KV_LOW"] = runtime_split_low
+        kernel_options["RUNTIME_SPLIT_KV_HIGH"] = runtime_split_high
+        kernel_options["RUNTIME_SPLIT_KV_BATCH_THRESHOLD"] = (
+            runtime_batch_threshold
+        )
+        kernel_options["RUNTIME_SPLIT_KV_MIN_BLOCKS"] = runtime_min_blocks
+        kernel_options["SPLIT_KV"] = runtime_split_capacity
+    else:
+        kernel_options.setdefault(
+            "SPLIT_KV",
+            get_split_k(B, Hkv, max_kv_work, num_block_m, query.get_device()),
+        )
     split_kv = kernel_options["SPLIT_KV"]
     if not isinstance(split_kv, (int, sympy.Integer)) or int(split_kv) < 1:
         raise ValueError(f"SPLIT_KV must be a positive integer, got {split_kv!r}")
