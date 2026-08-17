@@ -198,6 +198,76 @@ def get_split_k(
     return split_k
 
 
+def _get_rubin_flex_decode_runtime_split_policy(
+    B: int,
+    Hq: int,
+    Hkv: int,
+    seq_len_q: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    sparse_kv_block_size: int,
+    max_kv_work: int,
+    num_block_m: int,
+    device: torch.device,
+) -> tuple[int, tuple[tuple[int, int, int], ...]] | None:
+    """Select the measured long-context Rubin GQA decode split surface."""
+    values = (
+        B,
+        Hq,
+        Hkv,
+        seq_len_q,
+        qk_head_dim,
+        v_head_dim,
+        sparse_kv_block_size,
+        max_kv_work,
+        num_block_m,
+    )
+    if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+        return None
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or int(B) not in (64, 128)
+        or (int(Hq), int(Hkv)) != (32, 2)
+        or int(seq_len_q) != 1
+        or (int(qk_head_dim), int(v_head_dim)) != (256, 256)
+        or dtype != torch.bfloat16
+        or int(sparse_kv_block_size) != 64
+        or int(max_kv_work) < 131072
+        or int(num_block_m) != 1
+    ):
+        return None
+    properties = get_interface_for_device(device.type).get_device_properties(device)
+    if (
+        (properties.major, properties.minor) != (10, 7)
+        or properties.multi_processor_count not in (212, 216)
+    ):
+        return None
+    if int(B) == 64:
+        return (
+            16,
+            (
+                (20, 64, 12),
+                (28, 64, 9),
+                (40, 64, 13),
+                (55, 64, 5),
+                (63, 64, 13),
+            ),
+        )
+    return (
+        16,
+        (
+            (24, 64, 9),
+            (40, 64, 6),
+            (56, 64, 14),
+            (80, 64, 16),
+            (111, 64, 5),
+            (127, 64, 14),
+        ),
+    )
+
+
 def _create_runtime_split_band_buffer(
     kv_num_blocks,
     full_kv_num_blocks,
@@ -431,6 +501,34 @@ def create_flex_decoding_kernel(*args, **kwargs):
     )
 
     kernel_options.setdefault("SM_SCALE", scale)
+    runtime_option_names = (
+        "SPLIT_KV",
+        "RUNTIME_SPLIT_KV",
+        "RUNTIME_SPLIT_KV_DEFAULT",
+        "RUNTIME_SPLIT_KV_BANDS",
+        "RUNTIME_SPLIT_KV_LOW",
+        "RUNTIME_SPLIT_KV_HIGH",
+        "RUNTIME_SPLIT_KV_BATCH_THRESHOLD",
+        "RUNTIME_SPLIT_KV_MIN_BLOCKS",
+    )
+    if not any(name in kernel_options for name in runtime_option_names):
+        runtime_policy = _get_rubin_flex_decode_runtime_split_policy(
+            B,
+            Hq,
+            Hkv,
+            seq_len_q,
+            qk_head_dim,
+            v_head_dim,
+            dtype,
+            SPARSE_KV_BLOCK_SIZE,
+            max_kv_work,
+            num_block_m,
+            query.get_device(),
+        )
+        if runtime_policy is not None:
+            runtime_default, runtime_bands = runtime_policy
+            kernel_options["RUNTIME_SPLIT_KV_DEFAULT"] = runtime_default
+            kernel_options["RUNTIME_SPLIT_KV_BANDS"] = runtime_bands
     runtime_split_bands = kernel_options.get("RUNTIME_SPLIT_KV_BANDS")
     runtime_split_kv = bool(kernel_options.get("RUNTIME_SPLIT_KV", False)) or (
         runtime_split_bands is not None

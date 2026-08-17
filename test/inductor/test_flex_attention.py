@@ -5337,6 +5337,107 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             self.assertEqual(get_split_k(64, 2, sympy.Symbol("s"), 1, device), 2)
             self.assertEqual(get_split_k(64, 2, 142016, sympy.Symbol("m"), device), 2)
 
+    @common_utils.parametrize("sm_count", (212, 216))
+    def test_flex_decode_rubin_runtime_split_policy(self, sm_count):
+        from torch._inductor.kernel.flex.flex_decoding import (
+            _get_rubin_flex_decode_runtime_split_policy,
+        )
+
+        properties = types.SimpleNamespace(
+            multi_processor_count=sm_count, major=10, minor=7
+        )
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = properties
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            self.assertEqual(
+                _get_rubin_flex_decode_runtime_split_policy(
+                    64, 32, 2, 1, 256, 256, torch.bfloat16, 64, 142016, 1, device
+                ),
+                (
+                    16,
+                    (
+                        (20, 64, 12),
+                        (28, 64, 9),
+                        (40, 64, 13),
+                        (55, 64, 5),
+                        (63, 64, 13),
+                    ),
+                ),
+            )
+            self.assertEqual(
+                _get_rubin_flex_decode_runtime_split_policy(
+                    128,
+                    32,
+                    2,
+                    1,
+                    256,
+                    256,
+                    torch.bfloat16,
+                    64,
+                    142016,
+                    1,
+                    device,
+                ),
+                (
+                    16,
+                    (
+                        (24, 64, 9),
+                        (40, 64, 6),
+                        (56, 64, 14),
+                        (80, 64, 16),
+                        (111, 64, 5),
+                        (127, 64, 14),
+                    ),
+                ),
+            )
+
+    def test_flex_decode_rubin_runtime_split_policy_fails_closed(self):
+        from torch._inductor.kernel.flex.flex_decoding import (
+            _get_rubin_flex_decode_runtime_split_policy,
+        )
+
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = types.SimpleNamespace(
+            multi_processor_count=200, major=10, minor=7
+        )
+        base = [64, 32, 2, 1, 256, 256, torch.bfloat16, 64, 142016, 1, device]
+        cases = []
+        for index, replacement in (
+            (0, 32),
+            (1, 16),
+            (2, 1),
+            (3, 2),
+            (4, 128),
+            (5, 128),
+            (6, torch.float16),
+            (7, 128),
+            (8, 131071),
+            (9, 2),
+        ):
+            case = list(base)
+            case[index] = replacement
+            cases.append(case)
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            for case in cases:
+                self.assertIsNone(
+                    _get_rubin_flex_decode_runtime_split_policy(*case)
+                )
+            self.assertIsNone(_get_rubin_flex_decode_runtime_split_policy(*base))
+
     def test_flex_decode_split_policy_uses_largest_sparse_list(self):
         from torch._inductor.kernel.flex.flex_decoding import (
             _get_split_policy_max_kv_work,
