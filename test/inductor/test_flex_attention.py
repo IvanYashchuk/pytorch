@@ -5079,13 +5079,94 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         generated = "\n".join(code)
         self.assertIn("runtime_kv_num_blocks", generated)
         self.assertIn("effective_split_kv", generated)
+        self.assertNotIn("ml_mask = split_is_active", generated)
         self.assertIn("empty_strided_cuda((2, 4, 4, 1)", generated)
-        torch.testing.assert_close(
-            low_result, low_reference, atol=2e-2, rtol=2e-2
+        torch.testing.assert_close(low_result, low_reference, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(high_result, high_reference, atol=2e-2, rtol=2e-2)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_flex_decode_runtime_split_bands_mask_inactive_scratch(self, device):
+        dtype = torch.float16
+        head_dim = 64
+        sparse_block_size = 128
+        q = torch.randn((3, 4, 1, head_dim), device=device, dtype=dtype)
+        k = torch.randn(
+            (1, 1, 5 * sparse_block_size, head_dim), device=device, dtype=dtype
         )
-        torch.testing.assert_close(
-            high_result, high_reference, atol=2e-2, rtol=2e-2
+        v = torch.randn_like(k)
+        partial_indices = torch.arange(5, device=device, dtype=torch.int32)
+        partial_indices = partial_indices.view(1, 1, 1, 5).expand(3, 1, 1, 5)
+
+        def make_mask(partial_counts):
+            return BlockMask.from_kv_blocks(
+                kv_num_blocks=torch.tensor(
+                    partial_counts, device=device, dtype=torch.int32
+                ).view(3, 1, 1),
+                kv_indices=partial_indices,
+                BLOCK_SIZE=(16, sparse_block_size),
+                seq_lengths=(1, 5 * sparse_block_size),
+                compute_q_blocks=False,
+            )
+
+        masks = (
+            make_mask([5, 1, 1]),
+            make_mask([5, 5, 1]),
+            make_mask([5, 5, 5]),
         )
+
+        def attention(q, k, v, block_mask):
+            return flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON_DECODE",
+                    "RUNTIME_SPLIT_KV_DEFAULT": 4,
+                    "RUNTIME_SPLIT_KV_BANDS": ((1, 4, 3), (2, 4, 2)),
+                },
+            )
+
+        compiled = torch.compile(attention, fullgraph=True)
+        first_result, code = run_and_get_code(compiled, q, k, v, masks[0])
+        results = (
+            first_result,
+            compiled(q, k, v, masks[1]),
+            compiled(q, k, v, masks[2]),
+        )
+
+        def explicit_attention(split_kv):
+            def run(q, k, v, block_mask):
+                return flex_attention(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    enable_gqa=True,
+                    kernel_options={
+                        "BACKEND": "TRITON_DECODE",
+                        "SPLIT_KV": split_kv,
+                    },
+                )
+
+            return torch.compile(run, fullgraph=True)
+
+        references = tuple(
+            explicit_attention(split_kv)(q, k, v, block_mask)
+            for split_kv, block_mask in zip((4, 3, 2), masks)
+        )
+        generated = "\n".join(code)
+        self.assertIn("EFFECTIVE_SPLIT_KV", generated)
+        self.assertIn("effective_split_kv", generated)
+        self.assertIn("ml_mask = split_is_active", generated)
+        self.assertIn("mask = mask & split_is_active", generated)
+        self.assertIn("empty_strided_cuda((3, 4, 4, 1)", generated)
+        for result, reference in zip(results, references):
+            torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
 
     @supported_platform
     @skip_on_cpu

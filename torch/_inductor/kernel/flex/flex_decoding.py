@@ -8,7 +8,7 @@ import sympy
 
 import torch
 from torch._dynamo.device_interface import get_interface_for_device
-from torch._inductor.virtualized import V
+from torch._inductor.virtualized import ops, V
 from torch.utils._sympy.functions import FloorDiv, Mod
 
 from ... import ir
@@ -198,6 +198,83 @@ def get_split_k(
     return split_k
 
 
+def _create_runtime_split_band_buffer(
+    kv_num_blocks,
+    full_kv_num_blocks,
+    has_full_blocks: bool,
+    runtime_default: int,
+    runtime_split_bands: tuple[tuple[int, int, int], ...],
+):
+    """Evaluate a runtime split policy once per sparse head and query block."""
+    kv_num_blocks_loader = kv_num_blocks.make_loader()
+    full_kv_num_blocks_loader = (
+        full_kv_num_blocks.make_loader() if has_full_blocks else None
+    )
+    dtype = kv_num_blocks.get_dtype()
+    sparse_batch = V.graph.sizevars.guard_int(kv_num_blocks.get_size()[0])
+
+    def inner_fn(index):
+        sparse_h, sparse_m = index
+        effective_split = ops.constant(runtime_default, dtype)
+        for batch_threshold, min_blocks, split in runtime_split_bands:
+            load_index = (batch_threshold % sparse_batch, sparse_h, sparse_m)
+            num_blocks = kv_num_blocks_loader(load_index)
+            if full_kv_num_blocks_loader is not None:
+                num_blocks = ops.maximum(
+                    num_blocks, full_kv_num_blocks_loader(load_index)
+                )
+            effective_split = ops.where(
+                ops.ge(num_blocks, ops.constant(min_blocks, dtype)),
+                ops.constant(split, dtype),
+                effective_split,
+            )
+        return effective_split
+
+    result = ir.TensorBox.create(
+        ir.Pointwise(
+            device=kv_num_blocks.get_device(),
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=kv_num_blocks.get_size()[1:],
+        )
+    )
+    result.realize()
+    return result
+
+
+def _mask_inactive_runtime_splits(
+    buffer,
+    effective_split_kv,
+    gqa_shared_heads,
+    sparse_q_block_size,
+    fill_value,
+):
+    """Mask scratch loads from runtime-inactive decode splits."""
+    buffer_loader = buffer.make_loader()
+    effective_split_loader = effective_split_kv.make_loader()
+    effective_h, effective_m = effective_split_kv.get_size()
+
+    def inner_fn(index):
+        effective_index = (
+            Mod(FloorDiv(index[2], gqa_shared_heads), effective_h),
+            Mod(FloorDiv(index[3], sparse_q_block_size), effective_m),
+        )
+        active = ops.lt(
+            ops.index_expr(index[1], torch.int32),
+            effective_split_loader(effective_index),
+        )
+        return ops.masked(active, lambda: buffer_loader(index), fill_value)
+
+    return ir.TensorBox.create(
+        ir.Pointwise(
+            device=buffer.get_device(),
+            dtype=buffer.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=buffer.get_size(),
+        )
+    )
+
+
 def _get_split_policy_max_kv_work(
     partial_capacity: int,
     full_capacity: int | None,
@@ -341,34 +418,100 @@ def create_flex_decoding_kernel(*args, **kwargs):
     )
 
     kernel_options.setdefault("SM_SCALE", scale)
-    runtime_split_kv = bool(kernel_options.get("RUNTIME_SPLIT_KV", False))
+    runtime_split_bands = kernel_options.get("RUNTIME_SPLIT_KV_BANDS")
+    runtime_split_kv = bool(kernel_options.get("RUNTIME_SPLIT_KV", False)) or (
+        runtime_split_bands is not None
+    )
     split_kv_was_explicit = "SPLIT_KV" in kernel_options or runtime_split_kv
     if runtime_split_kv:
-        runtime_split_low = kernel_options.get("RUNTIME_SPLIT_KV_LOW")
-        runtime_split_high = kernel_options.get("RUNTIME_SPLIT_KV_HIGH")
-        runtime_batch_threshold = kernel_options.get(
-            "RUNTIME_SPLIT_KV_BATCH_THRESHOLD"
-        )
-        runtime_min_blocks = kernel_options.get("RUNTIME_SPLIT_KV_MIN_BLOCKS")
-        runtime_values = (
-            runtime_split_low,
-            runtime_split_high,
-            runtime_batch_threshold,
-            runtime_min_blocks,
-        )
-        if not all(isinstance(value, (int, sympy.Integer)) for value in runtime_values):
-            raise ValueError("runtime SPLIT_KV options must be concrete integers")
-        runtime_split_low = int(runtime_split_low)
-        runtime_split_high = int(runtime_split_high)
-        runtime_batch_threshold = int(runtime_batch_threshold)
-        runtime_min_blocks = int(runtime_min_blocks)
-        if min(runtime_split_low, runtime_split_high, runtime_min_blocks) < 1:
-            raise ValueError("runtime SPLIT_KV counts and work threshold must be positive")
-        if not 0 <= runtime_batch_threshold < int(B):
-            raise ValueError(
-                "runtime SPLIT_KV batch threshold must index the static batch"
+        runtime_split_capacity = 0
+        if runtime_split_bands is not None:
+            two_level_keys = (
+                "RUNTIME_SPLIT_KV_LOW",
+                "RUNTIME_SPLIT_KV_HIGH",
+                "RUNTIME_SPLIT_KV_BATCH_THRESHOLD",
+                "RUNTIME_SPLIT_KV_MIN_BLOCKS",
             )
-        runtime_split_capacity = max(runtime_split_low, runtime_split_high)
+            if any(key in kernel_options for key in two_level_keys):
+                raise ValueError(
+                    "runtime SPLIT_KV bands and two-level options are mutually exclusive"
+                )
+            runtime_default = kernel_options.get("RUNTIME_SPLIT_KV_DEFAULT")
+            if not isinstance(runtime_default, (int, sympy.Integer)):
+                raise ValueError("runtime SPLIT_KV default must be a concrete integer")
+            runtime_default = int(runtime_default)
+            if runtime_default < 1:
+                raise ValueError("runtime SPLIT_KV default must be positive")
+            if not isinstance(runtime_split_bands, (tuple, list)):
+                raise ValueError("runtime SPLIT_KV bands must be a tuple or list")
+            normalized_bands = []
+            previous_batch_threshold = -1
+            for band in runtime_split_bands:
+                if not isinstance(band, (tuple, list)) or len(band) != 3:
+                    raise ValueError(
+                        "each runtime SPLIT_KV band must be "
+                        "(batch_threshold, min_blocks, split)"
+                    )
+                if not all(isinstance(value, (int, sympy.Integer)) for value in band):
+                    raise ValueError("runtime SPLIT_KV bands must contain integers")
+                batch_threshold, min_blocks, split = map(int, band)
+                if not 0 <= batch_threshold < int(B):
+                    raise ValueError(
+                        "runtime SPLIT_KV band threshold must index the static batch"
+                    )
+                if batch_threshold <= previous_batch_threshold:
+                    raise ValueError(
+                        "runtime SPLIT_KV batch thresholds must be strictly increasing"
+                    )
+                if min(min_blocks, split) < 1:
+                    raise ValueError(
+                        "runtime SPLIT_KV band split and work threshold must be positive"
+                    )
+                normalized_bands.append((batch_threshold, min_blocks, split))
+                previous_batch_threshold = batch_threshold
+            if not normalized_bands:
+                raise ValueError("runtime SPLIT_KV bands must not be empty")
+            runtime_split_bands = tuple(normalized_bands)
+            runtime_split_capacity = max(
+                runtime_default, *(band[2] for band in runtime_split_bands)
+            )
+            kernel_options["RUNTIME_SPLIT_KV"] = True
+            kernel_options["RUNTIME_SPLIT_KV_DEFAULT"] = runtime_default
+            kernel_options["RUNTIME_SPLIT_KV_BANDS"] = runtime_split_bands
+        else:
+            runtime_split_low = kernel_options.get("RUNTIME_SPLIT_KV_LOW")
+            runtime_split_high = kernel_options.get("RUNTIME_SPLIT_KV_HIGH")
+            runtime_batch_threshold = kernel_options.get(
+                "RUNTIME_SPLIT_KV_BATCH_THRESHOLD"
+            )
+            runtime_min_blocks = kernel_options.get("RUNTIME_SPLIT_KV_MIN_BLOCKS")
+            runtime_values = (
+                runtime_split_low,
+                runtime_split_high,
+                runtime_batch_threshold,
+                runtime_min_blocks,
+            )
+            if not all(
+                isinstance(value, (int, sympy.Integer)) for value in runtime_values
+            ):
+                raise ValueError("runtime SPLIT_KV options must be concrete integers")
+            runtime_split_low = int(runtime_split_low)
+            runtime_split_high = int(runtime_split_high)
+            runtime_batch_threshold = int(runtime_batch_threshold)
+            runtime_min_blocks = int(runtime_min_blocks)
+            if min(runtime_split_low, runtime_split_high, runtime_min_blocks) < 1:
+                raise ValueError(
+                    "runtime SPLIT_KV counts and work threshold must be positive"
+                )
+            if not 0 <= runtime_batch_threshold < int(B):
+                raise ValueError(
+                    "runtime SPLIT_KV batch threshold must index the static batch"
+                )
+            runtime_split_capacity = max(runtime_split_low, runtime_split_high)
+            kernel_options["RUNTIME_SPLIT_KV_LOW"] = runtime_split_low
+            kernel_options["RUNTIME_SPLIT_KV_HIGH"] = runtime_split_high
+            kernel_options["RUNTIME_SPLIT_KV_BATCH_THRESHOLD"] = runtime_batch_threshold
+            kernel_options["RUNTIME_SPLIT_KV_MIN_BLOCKS"] = runtime_min_blocks
         if (
             "SPLIT_KV" in kernel_options
             and int(kernel_options["SPLIT_KV"]) != runtime_split_capacity
@@ -376,12 +519,6 @@ def create_flex_decoding_kernel(*args, **kwargs):
             raise ValueError(
                 "SPLIT_KV must equal the largest runtime split for scratch ownership"
             )
-        kernel_options["RUNTIME_SPLIT_KV_LOW"] = runtime_split_low
-        kernel_options["RUNTIME_SPLIT_KV_HIGH"] = runtime_split_high
-        kernel_options["RUNTIME_SPLIT_KV_BATCH_THRESHOLD"] = (
-            runtime_batch_threshold
-        )
-        kernel_options["RUNTIME_SPLIT_KV_MIN_BLOCKS"] = runtime_min_blocks
         kernel_options["SPLIT_KV"] = runtime_split_capacity
     else:
         kernel_options.setdefault(
@@ -392,6 +529,16 @@ def create_flex_decoding_kernel(*args, **kwargs):
     if not isinstance(split_kv, (int, sympy.Integer)) or int(split_kv) < 1:
         raise ValueError(f"SPLIT_KV must be a positive integer, got {split_kv!r}")
     kernel_options["SPLIT_KV"] = int(split_kv)
+
+    effective_split_kv = None
+    if runtime_split_bands is not None:
+        effective_split_kv = _create_runtime_split_band_buffer(
+            kv_num_blocks,
+            full_kv_num_blocks,
+            has_full_blocks,
+            kernel_options["RUNTIME_SPLIT_KV_DEFAULT"],
+            runtime_split_bands,
+        )
 
     set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)
 
@@ -523,19 +670,23 @@ def create_flex_decoding_kernel(*args, **kwargs):
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
 
+        template_input_nodes = [
+            query,
+            key,
+            value,
+            buf_M,
+            buf_L,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+        ]
+        if effective_split_kv is not None:
+            template_input_nodes.append(effective_split_kv)
+
         flex_decoding_template.maybe_append_choice(
             choices=choices,
-            input_nodes=[
-                query,
-                key,
-                value,
-                buf_M,
-                buf_L,
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-            ],
+            input_nodes=template_input_nodes,
             layout=layout_acc,
             subgraphs=[
                 score_mod_subgraph,
@@ -565,6 +716,7 @@ def create_flex_decoding_kernel(*args, **kwargs):
             full_kv_num_blocks,
             full_kv_indices,
         ]
+        + ([effective_split_kv] if effective_split_kv is not None else [])
         + list(score_mod_other_buffers)
         + list(mask_mod_other_buffers)
     )
@@ -578,6 +730,18 @@ def create_flex_decoding_kernel(*args, **kwargs):
         7: create_num_blocks_fake_generator(full_kv_indices),
         8: create_indices_fake,
     }
+    if effective_split_kv is not None:
+
+        def create_effective_split_fake(x):
+            size = V.graph.sizevars.optimization_hints(x.get_size())
+            return torch.full(
+                size,
+                kernel_options["RUNTIME_SPLIT_KV_DEFAULT"],
+                dtype=x.get_dtype(),
+                device=x.get_device(),
+            )
+
+        input_gen_fns[9] = create_effective_split_fake
 
     buf_ACC, _ = autotune_select_algorithm(
         "flex_decoding",
@@ -598,6 +762,29 @@ def create_flex_decoding_kernel(*args, **kwargs):
     )
 
     # Reduction
+
+    if effective_split_kv is not None:
+        buf_M = _mask_inactive_runtime_splits(
+            buf_M,
+            effective_split_kv,
+            gqa_shared_heads,
+            SPARSE_Q_BLOCK_SIZE,
+            -float("inf"),
+        )
+        buf_L = _mask_inactive_runtime_splits(
+            buf_L,
+            effective_split_kv,
+            gqa_shared_heads,
+            SPARSE_Q_BLOCK_SIZE,
+            0.0,
+        )
+        buf_ACC = _mask_inactive_runtime_splits(
+            buf_ACC,
+            effective_split_kv,
+            gqa_shared_heads,
+            SPARSE_Q_BLOCK_SIZE,
+            0.0,
+        )
 
     g_M = lowerings[aten.max](buf_M, dim=1, keepdim=True)[0]
     # See [Note] Handle fully masked out rows:
