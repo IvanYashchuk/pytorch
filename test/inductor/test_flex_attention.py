@@ -777,6 +777,46 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
             [short],
         )
 
+    def test_causal_dq_max_near_tie_prefers_retained_family(self):
+        class Choice:
+            def __init__(self, config, *, mask="'legacy_global'", policy=2122):
+                self.info = {
+                    "FLEX_BWD_CONFIG_POLICY": policy,
+                    "CAUSAL_DQ_LOAD_BALANCE": True,
+                    "BWD_MASK_MODE": mask,
+                    "BLOCK_M1": config.block_m1,
+                    "BLOCK_N1": config.block_n1,
+                    "BLOCK_M2": config.block_m2,
+                    "BLOCK_N2": config.block_n2,
+                    "num_stages": config.num_stages,
+                    "num_warps": config.num_warps,
+                }
+
+            def info_dict(self):
+                return self.info
+
+        middle = Choice(FlexBwDConfig(32, 64, 64, 32, 3, 8))
+        long = Choice(FlexBwDConfig(64, 64, 64, 32, 3, 8))
+        choices = InductorChoices()
+
+        self.assertIs(
+            choices.override_best_choice(middle, {middle: 1.0, long: 1.004}),
+            long,
+        )
+        self.assertIs(
+            choices.override_best_choice(middle, {middle: 1.0, long: 1.006}),
+            middle,
+        )
+        different_mask = Choice(
+            FlexBwDConfig(64, 64, 64, 32, 3, 8), mask="'traversal_scoped'"
+        )
+        self.assertIs(
+            choices.override_best_choice(
+                middle, {middle: 1.0, different_mask: 1.001}
+            ),
+            middle,
+        )
+
     @skipIfRocm
     def test_causal_dkdv_tail_trim_profitability_gate(self):
         choices = InductorChoices()

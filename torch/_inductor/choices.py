@@ -136,6 +136,7 @@ class InductorChoices:
         200: (2001, 257, 609),
         212: (2122, 288, 528),
     }
+    _FLEX_CAUSAL_DQ_MAX_NEAR_TIE_RATIO = 1.005
 
     def get_config_heuristics(
         self, device_type: str | None = "cuda"
@@ -606,6 +607,48 @@ class InductorChoices:
         timings: dict[ChoiceCaller, float],
     ) -> ChoiceCaller:
         """Hook to override the autotuning best choice after benchmarking."""
+        def flex_policy_identity(choice: ChoiceCaller) -> tuple[Any, ...] | None:
+            info_fn = getattr(choice, "info_dict", None)
+            if info_fn is None:
+                return None
+            info = info_fn()
+            policy = info.get("FLEX_BWD_CONFIG_POLICY")
+            if policy not in {
+                band[0] for band in self._FLEX_CAUSAL_DQ_LAUNCH_BANDS.values()
+            } or info.get("CAUSAL_DQ_LOAD_BALANCE") not in (True, "True"):
+                return None
+            keys = (
+                "BLOCK_M1",
+                "BLOCK_N1",
+                "BLOCK_M2",
+                "BLOCK_N2",
+                "num_stages",
+                "num_warps",
+            )
+            if any(key not in info for key in keys):
+                return None
+            return (
+                policy,
+                info.get("BWD_MASK_MODE"),
+                *(int(info[key]) for key in keys),
+            )
+
+        identity = flex_policy_identity(best_choice)
+        if identity is None or identity[2:] != (32, 64, 64, 32, 3, 8):
+            return best_choice
+
+        best_time = timings[best_choice]
+        if not 0 < best_time < float("inf"):
+            return best_choice
+        retained_identity = (*identity[:2], 64, 64, 64, 32, 3, 8)
+        retained_choices = [
+            choice
+            for choice, timing in timings.items()
+            if flex_policy_identity(choice) == retained_identity
+            and timing <= best_time * self._FLEX_CAUSAL_DQ_MAX_NEAR_TIE_RATIO
+        ]
+        if retained_choices:
+            return min(retained_choices, key=timings.__getitem__)
         return best_choice
 
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
