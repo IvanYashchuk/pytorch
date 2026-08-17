@@ -3969,6 +3969,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 "BLOCK_N1",
                 "BLOCK_M2",
                 "BLOCK_N2",
+                "SPLIT_KV",
                 "USE_TMA",
                 "kpack",
                 "matrix_instr_nonkdim",
@@ -4037,6 +4038,7 @@ class AlgorithmSelectorCache(PersistentCache):
         is_collective=False,
         min_speedup_threshold: float = 1.0,  # Only pick non-fallback if faster by this ratio
         benchmark_with_cudagraphs: bool = False,  # Use CUDA graphs for ExternKernelCaller benchmarking
+        return_choice_only: bool = False,
     ):
         from .codegen.cutlass.kernel import CUTLASSTemplateCaller
 
@@ -4056,6 +4058,13 @@ class AlgorithmSelectorCache(PersistentCache):
             layout.device.type == "cpu" and config.cpu_backend != "triton"
         ):
             return_multi_template = False
+        if return_choice_only:
+            return_multi_template = False
+
+        def choice_result(choice: ChoiceCaller):
+            if return_choice_only:
+                return None, choice
+            return choice.output_node(), choice
 
         # TODO - assert that we have not mutating kernels here
 
@@ -4066,13 +4075,11 @@ class AlgorithmSelectorCache(PersistentCache):
         if len(choices) == 1:
             if not isinstance(choices[0], CUTLASSTemplateCaller):
                 # CUTLASSTemplateCaller still needs to go through the autotuning process to retrieve workspace size.
-                node = choices[0].output_node()
-                return node, choices[0]
+                return choice_result(choices[0])
 
         if config.deterministic:
             choice = self.pick_deterministic_choice(choices)
-            node = choice.output_node()
-            return node, choice
+            return choice_result(choice)
 
         inputs_key = create_inputs_key(input_nodes)
 
@@ -4232,14 +4239,13 @@ class AlgorithmSelectorCache(PersistentCache):
         if timings == {}:
             for choice in choices:
                 if isinstance(choice, ExternKernelCaller):
-                    node = choice.output_node()
+                    node, choice = choice_result(choice)
                     log.debug(
                         "Autotuning returned empty timings, falling back to first `ExternKernelCaller`: %s",
                         node,
                     )
                     return node, choice
-            node = choices[0].output_node()
-            choice = choices[0]
+            node, choice = choice_result(choices[0])
             log.debug(
                 "Autotuning returned empty timings, falling back to first choice: %s",
                 node,
@@ -4304,7 +4310,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 best_choice = min(non_fallback_choices, key=lambda c: timings[c])
 
         choice = best_choice
-        node = choice.output_node()
+        node, choice = choice_result(choice)
 
         log.debug("Autotuning selected choice: %s", node)
         return node, choice

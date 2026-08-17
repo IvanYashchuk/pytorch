@@ -20,6 +20,7 @@ from typing import TypeVar
 from unittest import expectedFailure, mock, skip, skipUnless
 from unittest.mock import patch
 
+import sympy
 import torch
 import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
@@ -2778,7 +2779,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 for grad, input_name in zip(grads, input_names):
                     self.assertIsNotNone(
                         grad,
-                        lambda msg: f"{msg}\n{input_name} should receive gradients in {description}",
+                        lambda msg: (
+                            f"{msg}\n{input_name} should receive gradients in {description}"
+                        ),
                     )
 
     @supported_platform
@@ -4335,7 +4338,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             self.assertEqual(
                 out_stride_order,
                 query_stride_order,
-                lambda msg: f"{msg}\nStride order mismatch: out {out_stride_order}, query {query_stride_order}",
+                lambda msg: (
+                    f"{msg}\nStride order mismatch: out {out_stride_order}, query {query_stride_order}"
+                ),
             )
 
     @supported_platform
@@ -4401,7 +4406,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 self.assertEqual(
                     input_stride_order,
                     orig_stride_order,
-                    lambda msg: f"{msg}\nMode: {mode}, Stride order mismatch for {name}: grad {input_stride_order}, input {orig_stride_order}.",
+                    lambda msg: (
+                        f"{msg}\nMode: {mode}, Stride order mismatch for {name}: grad {input_stride_order}, input {orig_stride_order}."
+                    ),
                 )
 
     @supported_platform
@@ -4937,9 +4944,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             device=device,
             dtype=torch.int32,
         ).view(2, 1, 1, 5)
-        partial_counts = torch.tensor(
-            [1, 5], device=device, dtype=torch.int32
-        ).view(2, 1, 1)
+        partial_counts = torch.tensor([1, 5], device=device, dtype=torch.int32).view(
+            2, 1, 1
+        )
         full_counts = torch.tensor([6, 2], device=device, dtype=torch.int32).view(
             2, 1, 1
         )
@@ -4971,9 +4978,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             "max_kv_num_blocks = tl.maximum(kv_num_blocks, full_kv_num_blocks)",
             generated,
         )
-        self.assertIn(
-            "max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV", generated
-        )
+        self.assertIn("max_kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV", generated)
         self.assertNotIn("tl.cdiv(KV_LEN, SPLIT_KV)", generated)
         token_offsets = torch.arange(sparse_block_size, device=device)
         references = []
@@ -4991,12 +4996,310 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             ).flatten()
             selected_k = k[0, 0, token_indices].float()
             selected_v = v[0, 0, token_indices].float()
-            scores = (
-                q[batch].float() @ selected_k.transpose(-2, -1)
-            ) / math.sqrt(head_dim)
+            scores = (q[batch].float() @ selected_k.transpose(-2, -1)) / math.sqrt(
+                head_dim
+            )
             references.append(scores.softmax(dim=-1) @ selected_v)
         reference = torch.stack(references).to(dtype)
         torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_flex_decode_split_policy_uses_physical_kv_and_fwd_block_m(self, device):
+        """The split gate sees dense work and the effective forward M tile."""
+        q = torch.randn((1, 16, 2, 64), device=device, dtype=torch.float16)
+        k = torch.randn((1, 1, 1024, 64), device=device, dtype=torch.float16)
+        v = torch.randn_like(k)
+
+        def attention(q, k, v):
+            return flex_attention(
+                q,
+                k,
+                v,
+                enable_gqa=True,
+                kernel_options={
+                    "BACKEND": "TRITON_DECODE",
+                    "fwd_BLOCK_M": 16,
+                },
+            )
+
+        with mock.patch(
+            "torch._inductor.kernel.flex.flex_decoding.get_split_k", return_value=1
+        ) as get_split:
+            run_and_get_code(torch.compile(attention, fullgraph=True), q, k, v)
+
+        get_split.assert_called_once()
+        B, H, max_kv_work, num_block_m, split_device = get_split.call_args.args
+        self.assertEqual((B, H), (1, 1))
+        self.assertEqual(max_kv_work, 1024)
+        self.assertEqual(num_block_m, 2)
+        self.assertEqual(split_device, q.device)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    @skip_on_xpu
+    def test_flex_decode_selected_split_owns_scratch_and_explicit_skips_tuning(
+        self, device
+    ):
+        q = torch.randn((1, 16, 1, 64), device=device, dtype=torch.float16)
+        k = torch.randn((1, 1, 1024, 64), device=device, dtype=torch.float16)
+        v = torch.randn_like(k)
+
+        def implicit_attention(q, k, v):
+            return flex_attention(
+                q,
+                k,
+                v,
+                enable_gqa=True,
+                kernel_options={"BACKEND": "TRITON_DECODE"},
+            )
+
+        tune_target = (
+            "torch._inductor.kernel.flex.flex_decoding."
+            "_autotune_rubin_flex_decode_split_kv"
+        )
+        reference = implicit_attention(q, k, v)
+        with mock.patch(tune_target, return_value=3) as split_tuner:
+            result, code = run_and_get_code(
+                torch.compile(implicit_attention, fullgraph=True), q, k, v
+            )
+        split_tuner.assert_called_once()
+        generated = "\n".join(code)
+        self.assertIn("SPLIT_KV : tl.constexpr = 3", generated)
+        self.assertIn("empty_strided_cuda((1, 3, 16, 1)", generated)
+        self.assertTrue(torch.isfinite(result).all())
+        torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
+
+        def explicit_attention(q, k, v):
+            return flex_attention(
+                q,
+                k,
+                v,
+                enable_gqa=True,
+                kernel_options={"BACKEND": "TRITON_DECODE", "SPLIT_KV": 2},
+            )
+
+        with mock.patch(tune_target) as split_tuner:
+            _, code = run_and_get_code(
+                torch.compile(explicit_attention, fullgraph=True), q, k, v
+            )
+        split_tuner.assert_not_called()
+        generated = "\n".join(code)
+        self.assertIn("SPLIT_KV : tl.constexpr = 2", generated)
+        self.assertIn("empty_strided_cuda((1, 2, 16, 1)", generated)
+
+    @common_utils.parametrize(
+        "case",
+        [
+            (24, 2, 142016, 1, 8),
+            (32, 2, 142016, 1, 8),
+            (64, 2, 142016, 1, 4),
+            (128, 2, 142016, 1, 2),
+            (423, 1, 142016, 1, 2),
+            (424, 1, 142016, 1, 1),
+            (32, 2, 24575, 1, 6),
+            (32, 2, 24576, 1, 8),
+            (48, 2, 16383, 1, 4),
+            (48, 2, 16384, 1, 6),
+            (64, 2, 8191, 1, 2),
+            (64, 2, 8192, 1, 4),
+            (128, 2, 4095, 1, 1),
+            (128, 2, 4096, 1, 2),
+            (64, 2, 142016, 2, 2),
+        ],
+    )
+    def test_flex_decode_split_k_rubin_two_wave_target(self, case):
+        from torch._inductor.kernel.flex.flex_decoding import get_split_k
+
+        B, H, max_kv_work, num_block_m, expected = case
+        properties = types.SimpleNamespace(multi_processor_count=212, major=10, minor=7)
+        device = torch.device("cuda", 3)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = properties
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            self.assertEqual(
+                get_split_k(B, H, max_kv_work, num_block_m, device), expected
+            )
+        device_interface.get_device_properties.assert_called_once_with(device)
+
+    def test_flex_decode_split_k_symbolic_work_fails_closed(self):
+        from torch._inductor.kernel.flex.flex_decoding import get_split_k
+
+        properties = types.SimpleNamespace(multi_processor_count=212, major=10, minor=7)
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = properties
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            self.assertEqual(get_split_k(64, 2, sympy.Symbol("s"), 1, device), 2)
+            self.assertEqual(get_split_k(64, 2, 142016, sympy.Symbol("m"), device), 2)
+
+    def test_flex_decode_split_policy_uses_largest_sparse_list(self):
+        from torch._inductor.kernel.flex.flex_decoding import (
+            _get_split_policy_max_kv_work,
+            get_split_k,
+        )
+
+        properties = types.SimpleNamespace(multi_processor_count=212, major=10, minor=7)
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = properties
+        below_threshold = _get_split_policy_max_kv_work(80, 80, 64, 10240)
+        at_threshold = _get_split_policy_max_kv_work(80, 128, 64, 10240)
+        self.assertEqual(below_threshold, 5120)
+        self.assertEqual(at_threshold, 8192)
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            self.assertEqual(get_split_k(64, 2, below_threshold, 1, device), 2)
+            self.assertEqual(get_split_k(64, 2, at_threshold, 1, device), 4)
+
+    def test_flex_decode_split_proxy_occupancy_and_broadcast_gate(self):
+        from torch._inductor.kernel.flex.flex_decoding_split_autotune import (
+            _create_bucket_num_blocks_fake,
+            _mask_batch_matches_query,
+        )
+        from torch._inductor.virtualized import V
+
+        class FakeNode:
+            def __init__(self, batch):
+                self.batch = batch
+
+            def get_size(self):
+                return [self.batch, 1, 1]
+
+            def get_dtype(self):
+                return torch.int32
+
+            def get_device(self):
+                return torch.device("cpu")
+
+        graph = mock.Mock()
+        graph.sizevars.optimization_hints.side_effect = lambda values: values
+        with V.set_graph_handler(graph):
+            values = _create_bucket_num_blocks_fake(7)(FakeNode(5))
+        torch.testing.assert_close(
+            values.flatten(), torch.tensor([7, 7, 7, 0, 0], dtype=torch.int32)
+        )
+        self.assertTrue(_mask_batch_matches_query(5, [FakeNode(5), FakeNode(5)]))
+        self.assertFalse(_mask_batch_matches_query(5, [FakeNode(1), FakeNode(1)]))
+
+    @common_utils.parametrize(
+        "backend_case",
+        [
+            (
+                "cuda",
+                types.SimpleNamespace(multi_processor_count=152, major=10, minor=0),
+                None,
+                [(32, 2, 4), (64, 2, 2), (128, 2, 1)],
+            ),
+            (
+                "xpu",
+                types.SimpleNamespace(gpu_subslice_count=64),
+                None,
+                [(16, 2, 4), (33, 2, 1)],
+            ),
+            (
+                "cuda",
+                types.SimpleNamespace(multi_processor_count=212),
+                "6.0",
+                [(64, 2, 2)],
+            ),
+        ],
+    )
+    def test_flex_decode_split_k_preserves_other_backend_policy(self, backend_case):
+        from torch._inductor.kernel.flex.flex_decoding import get_split_k
+
+        device_type, properties, hip_version, cases = backend_case
+        device = torch.device(device_type, 1)
+        device_interface = mock.Mock()
+        device_interface.get_device_properties.return_value = properties
+        with (
+            mock.patch.object(torch.version, "hip", hip_version),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            for B, H, expected in cases:
+                self.assertEqual(get_split_k(B, H, 142016, 1, device), expected)
+
+    def test_flex_decode_split_kv_autotune_candidates(self, device):
+        from torch._inductor.kernel.flex.flex_decoding_split_autotune import (
+            _get_split_kv_autotune_candidates,
+        )
+
+        self.assertEqual(
+            _get_split_kv_autotune_candidates(6, 212, 64, 12),
+            (6, 3, 12, 10),
+        )
+        self.assertEqual(
+            _get_split_kv_autotune_candidates(2, 212, 128, 12),
+            (2, 1, 4, 8, 5),
+        )
+        self.assertEqual(
+            _get_split_kv_autotune_candidates(4, 212, 64, 8),
+            (4, 2, 8),
+        )
+        self.assertEqual(
+            _get_split_kv_autotune_candidates(52, 212, 8, 12),
+            (52, 1, 2, 4, 8, 12),
+        )
+        self.assertEqual(
+            _get_split_kv_autotune_candidates(106, 212, 4, 12),
+            (106, 1, 2, 4, 8, 12),
+        )
+
+    def test_flex_decode_graph_module_cache_key_includes_get_attr_state(self, device):
+        from torch._inductor.kernel.flex.flex_decoding_split_autotune import (
+            _graph_module_cache_key,
+        )
+
+        class AddBuffer(torch.nn.Module):
+            def __init__(self, value):
+                super().__init__()
+                self.register_buffer("value", torch.tensor(value))
+
+            def forward(self, x):
+                return x + self.value
+
+        first = torch.fx.symbolic_trace(AddBuffer(1.0))
+        equivalent = torch.fx.symbolic_trace(AddBuffer(1.0))
+        second = torch.fx.symbolic_trace(AddBuffer(2.0))
+        large = torch.fx.symbolic_trace(AddBuffer(torch.ones(1025)))
+        self.assertEqual(
+            _graph_module_cache_key(first),
+            _graph_module_cache_key(equivalent),
+        )
+        self.assertNotEqual(
+            _graph_module_cache_key(first),
+            _graph_module_cache_key(second),
+        )
+        self.assertIsNone(_graph_module_cache_key(large))
+
+        from torch._inductor.codecache import BypassFxGraphCache
+
+        with mock.patch("torch._inductor.codecache.FxGraphCachePickler") as pickler:
+            pickler.return_value.get_hash.side_effect = BypassFxGraphCache
+            self.assertIsNone(_graph_module_cache_key(first))
 
     def test_unbacked_flex_decoding_eligibility_falls_back(self, device):
         from torch._inductor.kernel.flex.flex_decoding import _use_flex_decoding
@@ -8120,7 +8423,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
         self.assertEqual(
             result.shape,
             expected_shape,
-            lambda msg: f"{msg}\nExpected output shape {expected_shape}, but got {result.shape}",
+            lambda msg: (
+                f"{msg}\nExpected output shape {expected_shape}, but got {result.shape}"
+            ),
         )
 
     @supported_platform
@@ -8687,7 +8992,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             if original_value is None:
                 self.assertIsNone(
                     reconstructed_value,
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} should be None but got {reconstructed_value}",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} should be None but got {reconstructed_value}"
+                    ),
                 )
             else:
                 self.assertIsInstance(
@@ -8697,7 +9004,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
                 )
                 self.assertTrue(
                     torch.equal(original_value, reconstructed_value),
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} not equal after reconstruction"
+                    ),
                 )
 
         # Verify all context attributes are equal (using _CONTEXT_ATTRS)
@@ -8708,7 +9017,9 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             self.assertEqual(
                 original_value,
                 reconstructed_value,
-                lambda msg: f"{msg}\nContext attribute {attr_name} not equal after reconstruction",
+                lambda msg: (
+                    f"{msg}\nContext attribute {attr_name} not equal after reconstruction"
+                ),
             )
 
     @supported_platform
@@ -8782,18 +9093,24 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
             if isinstance(original_value, torch.Tensor):
                 self.assertTrue(
                     torch.equal(original_value, reconstructed_value),
-                    lambda msg: f"{msg}\nTensor attribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nTensor attribute {attr_name} not equal after reconstruction"
+                    ),
                 )
             elif original_value is None:
                 self.assertIsNone(
                     reconstructed_value,
-                    lambda msg: f"{msg}\nAttribute {attr_name} should be None but got {reconstructed_value}",
+                    lambda msg: (
+                        f"{msg}\nAttribute {attr_name} should be None but got {reconstructed_value}"
+                    ),
                 )
             else:
                 self.assertEqual(
                     original_value,
                     reconstructed_value,
-                    lambda msg: f"{msg}\nAttribute {attr_name} not equal after reconstruction",
+                    lambda msg: (
+                        f"{msg}\nAttribute {attr_name} not equal after reconstruction"
+                    ),
                 )
 
 
@@ -8998,15 +9315,11 @@ class TestPagedAttention(InductorTestCase):
         )
         page_table = torch.tensor([3, 1, 6, 2], device=device)
         paged_cache.page_table[0, :4] = page_table
-        paged_cache.physical_to_logical[0, page_table] = torch.arange(
-            4, device=device
-        )
+        paged_cache.physical_to_logical[0, page_table] = torch.arange(4, device=device)
 
         kv_num_blocks = torch.tensor([[[1]]], dtype=torch.int32, device=device)
         kv_indices = torch.tensor([[[[3]]]], dtype=torch.int32, device=device)
-        full_kv_num_blocks = torch.tensor(
-            [[[3]]], dtype=torch.int32, device=device
-        )
+        full_kv_num_blocks = torch.tensor([[[3]]], dtype=torch.int32, device=device)
         full_kv_indices = torch.tensor(
             [[[[0, 1, 2]]]], dtype=torch.int32, device=device
         )
@@ -9039,9 +9352,7 @@ class TestPagedAttention(InductorTestCase):
         self.assertIsNone(converted.full_q_num_blocks)
         self.assertIsNone(converted.full_q_indices)
         self.assertEqual(converted.seq_lengths, (128, 1024))
-        expected_dense = torch.zeros(
-            (1, 1, 1, 8), dtype=torch.int32, device=device
-        )
+        expected_dense = torch.zeros((1, 1, 1, 8), dtype=torch.int32, device=device)
         expected_dense[..., [1, 2, 3, 6]] = 1
         self.assertEqual(converted.to_dense(), expected_dense)
 
@@ -9071,9 +9382,7 @@ class TestPagedAttention(InductorTestCase):
         # before computing the transposed Q metadata.
         backward_mask = paged_cache.convert_logical_block_mask(logical_mask)
         self.assertEqual(backward_mask.kv_indices.shape[-1], paged_cache.n_pages)
-        self.assertEqual(
-            backward_mask.full_kv_indices.shape[-1], paged_cache.n_pages
-        )
+        self.assertEqual(backward_mask.full_kv_indices.shape[-1], paged_cache.n_pages)
         self.assertIsNotNone(backward_mask.q_num_blocks)
         self.assertIsNotNone(backward_mask.q_indices)
 
@@ -9082,9 +9391,7 @@ class TestPagedAttention(InductorTestCase):
         paged_cache = PagedAttention(
             n_pages=8, page_size=4, max_batch_size=2, device=device
         )
-        page_tables = torch.tensor(
-            [[1, 3], [6, 2]], dtype=torch.int64, device=device
-        )
+        page_tables = torch.tensor([[1, 3], [6, 2]], dtype=torch.int64, device=device)
         paged_cache.page_table[:, :2] = page_tables
         logical_pages = torch.arange(2, device=device)
         for batch in range(2):
@@ -9507,8 +9814,10 @@ class TestLearnableBiases(InductorTestCase):
         self.assertLessEqual(
             comp_error,
             (ref_error * fudge_factor),
-            lambda msg: f"{msg}\nTensor: {tensor_name}\nCompiled error ({comp_error:.8f}) exceeds "
-            f"reference error ({ref_error:.8f}) * fudge_factor ({fudge_factor})",
+            lambda msg: (
+                f"{msg}\nTensor: {tensor_name}\nCompiled error ({comp_error:.8f}) exceeds "
+                f"reference error ({ref_error:.8f}) * fudge_factor ({fudge_factor})"
+            ),
         )
 
     def _check_outputs_and_grads(
@@ -10593,7 +10902,9 @@ class TestLearnableBiases(InductorTestCase):
             flex_error = rmse(flex, gold)
             self.assertTrue(
                 ref_error * 1.2 >= flex_error,
-                lambda msg: f"{msg}\n{name} -> Ref error: {ref_error}, Flex eager Error: {flex_error}",
+                lambda msg: (
+                    f"{msg}\n{name} -> Ref error: {ref_error}, Flex eager Error: {flex_error}"
+                ),
             )
 
 

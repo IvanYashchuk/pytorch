@@ -301,6 +301,7 @@ def flex_attention(
             mask_graph_buffer,
             score_mod_other_buffers,
             mask_mod_other_buffers,
+            subgraph.graph_module,
         )
 
     (

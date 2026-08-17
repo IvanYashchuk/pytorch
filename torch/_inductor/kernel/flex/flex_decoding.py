@@ -7,6 +7,7 @@ from typing import Any
 import sympy
 
 import torch
+from torch._dynamo.device_interface import get_interface_for_device
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import FloorDiv, Mod
 
@@ -33,6 +34,7 @@ from .common import (
     maybe_realize,
     set_head_dim_values,
 )
+from .flex_decoding_split_autotune import _autotune_rubin_flex_decode_split_kv
 
 
 aten = torch.ops.aten
@@ -156,20 +158,56 @@ flex_decoding_template = TritonTemplate(
 )
 
 
-def get_split_k(B: int, H: int, Mk: int) -> int:
-    if torch.xpu.is_available():
-        num_SM = torch.xpu.get_device_properties("xpu").gpu_subslice_count
+def get_split_k(
+    B: int,
+    H: int,
+    max_kv_work: int,
+    num_block_m: int,
+    device: torch.device,
+) -> int:
+    device_interface = get_interface_for_device(device.type)
+    properties = device_interface.get_device_properties(device)
+    if device.type == "xpu":
+        num_SM = properties.gpu_subslice_count
+        is_rubin = False
     else:
-        num_SM = torch.cuda.get_device_properties("cuda").multi_processor_count
+        num_SM = properties.multi_processor_count
+        is_rubin = (
+            device.type == "cuda"
+            and torch.version.hip is None
+            and (properties.major, properties.minor) == (10, 7)
+        )
     bh = max(B * H, 1)  # NOTE: Handle B*h=0 case
     if not isinstance(bh, (int, sympy.Integer)):
         raise AssertionError("B and H must be concrete integers")
-    split_k = num_SM // bh * 2  # Each SM should at least get one block.
+    split_k = max(num_SM // bh * 2, 1)
+    # On Rubin Q1 decode, measured split counts up to six can undershoot two waves.
+    # Use block-mask capacity as a static work proxy; short work can regress.
+    if (
+        is_rubin
+        and isinstance(num_block_m, (int, sympy.Integer))
+        and num_block_m == 1
+        and split_k <= 6
+        and bh < num_SM * 2
+        and isinstance(max_kv_work, (int, sympy.Integer))
+        and max_kv_work >= split_k * 4096
+    ):
+        split_k = ceildiv(num_SM, bh) * 2
     # TODO: workload evening at runtime for splits fully masked out.
-    # Before we have runtime workload evening, assign 2 splits per SM.
-    split_k = max(split_k, 1)
 
     return split_k
+
+
+def _get_split_policy_max_kv_work(
+    partial_capacity: int,
+    full_capacity: int | None,
+    sparse_kv_block_size: int,
+    seq_len_kv: int,
+):
+    max_kv_blocks = partial_capacity
+    if full_capacity is not None:
+        max_kv_blocks = sympy.Max(max_kv_blocks, full_capacity)
+    return sympy.Min(max_kv_blocks * sparse_kv_block_size, seq_len_kv)
 
 
 def create_flex_decoding_kernel(*args, **kwargs):
@@ -185,6 +223,7 @@ def create_flex_decoding_kernel(*args, **kwargs):
         mask_mod_subgraph,
         score_mod_other_buffers,
         mask_mod_other_buffers,
+        score_mod_graph,
     ) = args
     (
         _,  # q_length
@@ -221,13 +260,19 @@ def create_flex_decoding_kernel(*args, **kwargs):
         k: V.graph.sizevars.guard_int(v) if isinstance(v, sympy.Symbol) else v
         for k, v in kernel_options.items()
     }
-
+    # Forward-prefixed options must be normalized before computing any layout,
+    # grid, or safety predicate that they can affect.
+    for name in list(kernel_options):
+        if name.startswith("fwd_"):
+            kernel_options[name[4:]] = kernel_options.pop(name)
     seq_q_divisible = can_skip_boundary_checks(seq_len_q, SPARSE_Q_BLOCK_SIZE)
     seq_kv_divisible = can_skip_boundary_checks(seq_len_kv, SPARSE_KV_BLOCK_SIZE)
     if seq_q_divisible and seq_kv_divisible:
         kernel_options.setdefault("IS_DIVISIBLE", True)
     else:
         kernel_options.setdefault("IS_DIVISIBLE", False)
+    SPARSE_Q_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_Q_BLOCK_SIZE)
+    SPARSE_KV_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_KV_BLOCK_SIZE)
 
     # Calculate GQA head sharing
     gqa_shared_heads = FloorDiv(Hq, Hkv)
@@ -236,10 +281,27 @@ def create_flex_decoding_kernel(*args, **kwargs):
             "Number of shared query heads sharing the same KV head must be power of 2. "
         )
     kernel_options.setdefault("GQA_SHARED_HEADS", gqa_shared_heads)
+    kernel_options.setdefault(
+        "BLOCK_M",
+        max(
+            next_power_of_2(
+                V.graph.sizevars.optimization_hint(seq_len_q) * gqa_shared_heads
+            ),
+            1 if query.get_device().type == "xpu" else 16,
+        ),
+    )
+    block_m = kernel_options["BLOCK_M"]
+    num_block_m = ceildiv(seq_len_q * gqa_shared_heads, block_m)
 
     # Determine if there are "full" blocks where we only need to apply score_mod, and can skip mask_mod
     has_full_blocks = full_kv_num_blocks is not None
     kernel_options.setdefault("HAS_FULL_BLOCKS", has_full_blocks)
+    max_kv_work = _get_split_policy_max_kv_work(
+        kv_indices.get_size()[-1],
+        full_kv_indices.get_size()[-1] if has_full_blocks else None,
+        SPARSE_KV_BLOCK_SIZE,
+        seq_len_kv,
+    )
     if not has_full_blocks:
         # Create a placeholder full block list in case it is empty
         full_kv_num_blocks, full_kv_indices = (
@@ -278,25 +340,57 @@ def create_flex_decoding_kernel(*args, **kwargs):
         head_dim, dtype, query.get_device().type
     )
 
-    # TODO: fix autotuning.
-
     kernel_options.setdefault("SM_SCALE", scale)
-    kernel_options.setdefault("SPLIT_KV", get_split_k(B, Hkv, seq_len_kv))
-    MAX_SPLIT_KV = kernel_options["SPLIT_KV"]
+    split_kv_was_explicit = "SPLIT_KV" in kernel_options
+    kernel_options.setdefault(
+        "SPLIT_KV",
+        get_split_k(B, Hkv, max_kv_work, num_block_m, query.get_device()),
+    )
+    split_kv = kernel_options["SPLIT_KV"]
+    if not isinstance(split_kv, (int, sympy.Integer)) or int(split_kv) < 1:
+        raise ValueError(f"SPLIT_KV must be a positive integer, got {split_kv!r}")
+    kernel_options["SPLIT_KV"] = int(split_kv)
 
-    # create config dependent intermediate buffers
-    buf_ACC_shape = [B, MAX_SPLIT_KV, Hq, seq_len_q, v_head_dim]
+    set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)
+
+    if not split_kv_was_explicit:
+        selected_split_kv = _autotune_rubin_flex_decode_split_kv(
+            query,
+            key,
+            value,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_graph,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+            has_full_blocks,
+            SPARSE_Q_BLOCK_SIZE,
+            SPARSE_KV_BLOCK_SIZE,
+            configs,
+        )
+        if selected_split_kv is not None:
+            kernel_options["SPLIT_KV"] = selected_split_kv
+
+    # The selected split owns its complete scratch layout. Split autotuning
+    # benchmarks candidate-private layouts before reaching this point.
+    split_kv = kernel_options["SPLIT_KV"]
+    buf_ACC_shape = [B, split_kv, Hq, seq_len_q, v_head_dim]
     buf_ML_shape = buf_ACC_shape[:-1]
     buf_M = empty_strided(
         buf_ML_shape,
         None,
-        dtype=torch.float32,  # The rowmax is always stored in fp32 regardless of the input dtype
+        dtype=torch.float32,
         device=query.get_device(),
     )
     buf_L = empty_strided(
         buf_ML_shape,
         None,
-        dtype=torch.float32,  # The intermediate sumexp is always stored in fp32 regardless of the input dtype
+        dtype=torch.float32,
         device=query.get_device(),
     )
 
@@ -305,23 +399,6 @@ def create_flex_decoding_kernel(*args, **kwargs):
         torch.float32,
         buf_ACC_shape,
         FlexibleLayout.contiguous_strides(buf_ACC_shape),
-    )
-
-    set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)
-
-    kernel_options.setdefault(
-        "BLOCK_M",
-        (
-            # m
-            # if V.graph.sizevars.evaluate_expr(sympy.Lt(query.get_size()[-2], 0))
-            # else  # Always use a BLOCK_M > 16 before Triton fix https://github.com/triton-lang/triton/pull/4061 is in pin
-            max(
-                next_power_of_2(
-                    V.graph.sizevars.optimization_hint(seq_len_q) * gqa_shared_heads
-                ),
-                1 if torch.xpu.is_available() else 16,
-            )
-        ),
     )
 
     query = ir.ExternKernel.realize_input(query)
@@ -340,14 +417,10 @@ def create_flex_decoding_kernel(*args, **kwargs):
 
     kernel_options.setdefault(
         "SAFE_M_BOUNDARY",
-        Mod(seq_len_q * gqa_shared_heads, kernel_options["BLOCK_M"]) == 0,
+        Mod(seq_len_q * gqa_shared_heads, block_m) == 0,
     )
     # TODO: This feels sketchy
     kernel_options.setdefault("SAFE_N_BOUNDARY", True)
-    # Mark SPARSE_KV_BLOCK_SIZE as static shapes and add guards.
-    SPARSE_Q_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_Q_BLOCK_SIZE)
-    SPARSE_KV_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_KV_BLOCK_SIZE)
-
     original_kernel_options = kernel_options.copy()
     # Note, we don't need to pass in the captured buffers explicitly
     # because they're implicitly added by the score_mod function
@@ -454,6 +527,9 @@ def create_flex_decoding_kernel(*args, **kwargs):
         + list(mask_mod_other_buffers)
     )
 
+    # Producer configs are tuned against their established full-capacity fake
+    # inputs. The outer complete-graph selector independently benchmarks
+    # half-full capture-bucket occupancy while using these same producer configs.
     input_gen_fns = {
         5: create_num_blocks_fake_generator(kv_indices),
         6: create_indices_fake,

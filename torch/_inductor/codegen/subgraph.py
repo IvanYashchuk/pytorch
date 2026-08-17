@@ -71,6 +71,8 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         description: str,
         make_fx_graph: Callable[..., Any],
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
+        extra_hash_key: str = "",
+        config_patches: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
 
@@ -111,12 +113,13 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
 
         self.sym_inputs = get_symbolic_inputs(self.input_nodes)
         self.sym_input_values = self._compute_sym_input_values()
+        self.extra_hash_key = extra_hash_key
 
         # Cached decomposition info for range-based dispatch (set via cache_decomposition)
         self.decomposition: Callable[..., Any] | None = None
         self.decomposition_kwargs: dict[str, Any] = {}
         # Config patches to apply during kernel codegen (e.g., coordinate_descent_tuning)
-        self.config_patches: dict[str, Any] = {}
+        self.config_patches = dict(config_patches or {})
         # Cache compiled module to avoid recompiling on every benchmark call
         self._compiled_module: Any = None
         # Cache benchmark request for async autotuning
@@ -295,6 +298,8 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
                 *[str(inp.get_size()) for inp in self.input_nodes],
                 *[str(inp.get_stride()) for inp in self.input_nodes],
                 str(self.gm.graph),
+                str(sorted(self.config_patches.items())),
+                self.extra_hash_key,
             ]
         )
 
@@ -355,6 +360,8 @@ class SubgraphTemplate(KernelTemplate):
         make_fx_graph: Callable[..., Any],
         description: str = "",
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
+        extra_hash_key: str = "",
+        config_patches: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SubgraphChoiceCaller:
         """
@@ -380,6 +387,8 @@ class SubgraphTemplate(KernelTemplate):
             description=description,
             make_fx_graph=make_fx_graph,
             input_gen_fns=input_gen_fns,
+            extra_hash_key=extra_hash_key,
+            config_patches=config_patches,
         )
 
     def generate_custom_op_choices(
@@ -482,6 +491,7 @@ class SubgraphTemplate(KernelTemplate):
                     make_fx_graph=make_fx_graph,
                     description=f"CustomOp {decomp.__name__}",
                     input_gen_fns=input_gen_fns,
+                    config_patches=config_patches,
                 )
             except _ShapeEnvGuardError:
                 log.info(
@@ -493,8 +503,6 @@ class SubgraphTemplate(KernelTemplate):
 
             # Cache decomposition info for range-based dispatch
             choice.cache_decomposition(decomp, decomp_kwargs)
-            # Store config_patches for this choice
-            choice.config_patches = config_patches
             choices.append(choice)
 
         return choices
