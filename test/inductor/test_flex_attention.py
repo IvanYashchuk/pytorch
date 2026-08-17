@@ -5088,33 +5088,38 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @skip_on_cpu
     @skip_on_mps
     @skip_on_xpu
-    def test_flex_decode_runtime_split_bands_mask_inactive_scratch(self, device):
+    def test_flex_decode_runtime_split_bands_per_row_tile_cap(self, device):
+        from torch._dynamo.exc import BackendCompilerFailed
+
         dtype = torch.float16
         head_dim = 64
         sparse_block_size = 128
-        q = torch.randn((3, 4, 1, head_dim), device=device, dtype=dtype)
+        q = torch.randn((3, 2, 1, head_dim), device=device, dtype=dtype)
         k = torch.randn(
-            (1, 1, 5 * sparse_block_size, head_dim), device=device, dtype=dtype
+            (1, 2, 5 * sparse_block_size, head_dim), device=device, dtype=dtype
         )
         v = torch.randn_like(k)
-        partial_indices = torch.arange(5, device=device, dtype=torch.int32)
-        partial_indices = partial_indices.view(1, 1, 1, 5).expand(3, 1, 1, 5)
+        partial_indices = torch.zeros((3, 2, 1, 1), device=device, dtype=torch.int32)
+        full_indices = torch.arange(1, 5, device=device, dtype=torch.int32)
+        full_indices = full_indices.view(1, 1, 1, 4).expand(3, 2, 1, 4)
 
-        def make_mask(partial_counts):
+        def make_mask(full_counts):
             return BlockMask.from_kv_blocks(
-                kv_num_blocks=torch.tensor(
-                    partial_counts, device=device, dtype=torch.int32
-                ).view(3, 1, 1),
+                kv_num_blocks=torch.ones((3, 2, 1), device=device, dtype=torch.int32),
                 kv_indices=partial_indices,
+                full_kv_num_blocks=torch.tensor(
+                    full_counts, device=device, dtype=torch.int32
+                ).view(3, 2, 1),
+                full_kv_indices=full_indices,
                 BLOCK_SIZE=(16, sparse_block_size),
                 seq_lengths=(1, 5 * sparse_block_size),
                 compute_q_blocks=False,
             )
 
         masks = (
-            make_mask([5, 1, 1]),
-            make_mask([5, 5, 1]),
-            make_mask([5, 5, 5]),
+            make_mask([[4, 2], [0, 0], [0, 0]]),
+            make_mask([[4, 2], [4, 4], [0, 0]]),
+            make_mask([[4, 2], [4, 4], [4, 4]]),
         )
 
         def attention(q, k, v, block_mask):
@@ -5123,11 +5128,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 k,
                 v,
                 block_mask=block_mask,
-                enable_gqa=True,
+                enable_gqa=False,
                 kernel_options={
                     "BACKEND": "TRITON_DECODE",
-                    "RUNTIME_SPLIT_KV_DEFAULT": 4,
-                    "RUNTIME_SPLIT_KV_BANDS": ((1, 4, 3), (2, 4, 2)),
+                    "RUNTIME_SPLIT_KV_DEFAULT": 8,
+                    "RUNTIME_SPLIT_KV_BANDS": ((1, 4, 6), (2, 4, 5)),
                 },
             )
 
@@ -5146,7 +5151,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                     k,
                     v,
                     block_mask=block_mask,
-                    enable_gqa=True,
+                    enable_gqa=False,
                     kernel_options={
                         "BACKEND": "TRITON_DECODE",
                         "SPLIT_KV": split_kv,
@@ -5157,16 +5162,34 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         references = tuple(
             explicit_attention(split_kv)(q, k, v, block_mask)
-            for split_kv, block_mask in zip((4, 3, 2), masks)
+            for split_kv, block_mask in zip((8, 6, 5), masks)
         )
         generated = "\n".join(code)
         self.assertIn("EFFECTIVE_SPLIT_KV", generated)
         self.assertIn("effective_split_kv", generated)
         self.assertIn("ml_mask = split_is_active", generated)
         self.assertIn("mask = mask & split_is_active", generated)
-        self.assertIn("empty_strided_cuda((3, 4, 4, 1)", generated)
+        self.assertIn("empty_strided_cuda((3, 2, 1)", generated)
+        self.assertIn("empty_strided_cuda((3, 8, 2, 1)", generated)
         for result, reference in zip(results, references):
             torch.testing.assert_close(result, reference, atol=2e-2, rtol=2e-2)
+
+        mismatched_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks=torch.ones((3, 2, 1), device=device, dtype=torch.int32),
+            kv_indices=partial_indices,
+            full_kv_num_blocks=torch.full(
+                (1, 2, 1), 4, device=device, dtype=torch.int32
+            ),
+            full_kv_indices=full_indices[:1],
+            BLOCK_SIZE=(16, sparse_block_size),
+            seq_lengths=(1, 5 * sparse_block_size),
+            compute_q_blocks=False,
+        )
+        with self.assertRaisesRegex(
+            BackendCompilerFailed,
+            "runtime SPLIT_KV bands require matching partial/full count shapes",
+        ):
+            torch.compile(attention, fullgraph=True)(q, k, v, mismatched_mask)
 
     @supported_platform
     @skip_on_cpu

@@ -204,8 +204,9 @@ def _create_runtime_split_band_buffer(
     has_full_blocks: bool,
     runtime_default: int,
     runtime_split_bands: tuple[tuple[int, int, int], ...],
+    sparse_tiles_per_block: int,
 ):
-    """Evaluate a runtime split policy once per sparse head and query block."""
+    """Evaluate a runtime split policy and cap it at each row's tile work."""
     kv_num_blocks_loader = kv_num_blocks.make_loader()
     full_kv_num_blocks_loader = (
         full_kv_num_blocks.make_loader() if has_full_blocks else None
@@ -214,7 +215,7 @@ def _create_runtime_split_band_buffer(
     sparse_batch = V.graph.sizevars.guard_int(kv_num_blocks.get_size()[0])
 
     def inner_fn(index):
-        sparse_h, sparse_m = index
+        sparse_z, sparse_h, sparse_m = index
         effective_split = ops.constant(runtime_default, dtype)
         for batch_threshold, min_blocks, split in runtime_split_bands:
             load_index = (batch_threshold % sparse_batch, sparse_h, sparse_m)
@@ -228,14 +229,22 @@ def _create_runtime_split_band_buffer(
                 ops.constant(split, dtype),
                 effective_split,
             )
-        return effective_split
+        row_index = (sparse_z, sparse_h, sparse_m)
+        row_blocks = kv_num_blocks_loader(row_index)
+        if full_kv_num_blocks_loader is not None:
+            row_blocks = ops.maximum(row_blocks, full_kv_num_blocks_loader(row_index))
+        row_split_limit = ops.maximum(
+            ops.mul(row_blocks, ops.constant(sparse_tiles_per_block, dtype)),
+            ops.constant(1, dtype),
+        )
+        return ops.minimum(effective_split, row_split_limit)
 
     result = ir.TensorBox.create(
         ir.Pointwise(
             device=kv_num_blocks.get_device(),
             dtype=dtype,
             inner_fn=inner_fn,
-            ranges=kv_num_blocks.get_size()[1:],
+            ranges=kv_num_blocks.get_size(),
         )
     )
     result.realize()
@@ -252,10 +261,11 @@ def _mask_inactive_runtime_splits(
     """Mask scratch loads from runtime-inactive decode splits."""
     buffer_loader = buffer.make_loader()
     effective_split_loader = effective_split_kv.make_loader()
-    effective_h, effective_m = effective_split_kv.get_size()
+    effective_z, effective_h, effective_m = effective_split_kv.get_size()
 
     def inner_fn(index):
         effective_index = (
+            Mod(index[0], effective_z),
             Mod(FloorDiv(index[2], gqa_shared_heads), effective_h),
             Mod(FloorDiv(index[3], sparse_q_block_size), effective_m),
         )
@@ -532,12 +542,32 @@ def create_flex_decoding_kernel(*args, **kwargs):
 
     effective_split_kv = None
     if runtime_split_bands is not None:
+        if has_full_blocks and (
+            kv_num_blocks.get_size() != full_kv_num_blocks.get_size()
+        ):
+            raise ValueError(
+                "runtime SPLIT_KV bands require matching partial/full count shapes"
+            )
+        configured_block_n = kernel_options.get("BLOCK_N")
+        if configured_block_n is None:
+            min_block_n = min(
+                min(conf.block_n, SPARSE_KV_BLOCK_SIZE) for conf in configs
+            )
+        elif isinstance(configured_block_n, (int, sympy.Integer)):
+            min_block_n = int(configured_block_n)
+        else:
+            raise ValueError("runtime SPLIT_KV BLOCK_N must be a concrete integer")
+        if min_block_n < 1 or SPARSE_KV_BLOCK_SIZE % min_block_n != 0:
+            raise ValueError(
+                "runtime SPLIT_KV requires BLOCK_N to divide the sparse KV block"
+            )
         effective_split_kv = _create_runtime_split_band_buffer(
             kv_num_blocks,
             full_kv_num_blocks,
             has_full_blocks,
             kernel_options["RUNTIME_SPLIT_KV_DEFAULT"],
             runtime_split_bands,
+            SPARSE_KV_BLOCK_SIZE // min_block_n,
         )
 
     set_head_dim_values(kernel_options, qk_head_dim, v_head_dim, V.graph.sizevars)

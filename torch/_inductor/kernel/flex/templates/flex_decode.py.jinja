@@ -98,7 +98,7 @@
     sparse_idx_m = off_block_m * BLOCK_M_PER_HQ // SPARSE_Q_BLOCK_SIZE
     stride_block_z, stride_block_h, stride_block_row = {{stride("KV_NUM_BLKS")}}
     {%- if RUNTIME_SPLIT_KV_BANDS|default(false) %}
-    stride_effective_split_h, stride_effective_split_m = {{stride("EFFECTIVE_SPLIT_KV")}}
+    stride_effective_split_z, stride_effective_split_h, stride_effective_split_m = {{stride("EFFECTIVE_SPLIT_KV")}}
     {%- endif %}
     sparse_block_zhm_offset = sparse_idx_z * stride_block_z + sparse_idx_h * stride_block_h + sparse_idx_m * stride_block_row
     stride_kv_z, stride_kv_h, stride_kv_row, stride_kv_col = {{stride("KV_IDX")}}
@@ -138,6 +138,7 @@
     {%- endfor %}
     effective_split_kv = tl.load(
         EFFECTIVE_SPLIT_KV
+        + sparse_idx_z * stride_effective_split_z
         + sparse_idx_h * stride_effective_split_h
         + sparse_idx_m * stride_effective_split_m
     )
