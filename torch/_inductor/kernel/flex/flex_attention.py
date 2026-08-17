@@ -78,6 +78,27 @@ _BWD_MASK_DIVISIBILITY_KEYS = (
 )
 
 
+def _get_flex_attention_causal_dq_policy_configs(
+    preferred_config: FlexBwDConfig | None,
+    *,
+    max_autotune: bool,
+) -> list[FlexBwDConfig]:
+    """Keep every measured load-balanced family available to max autotune."""
+    if preferred_config is None:
+        return []
+
+    policy_configs = [preferred_config]
+    if max_autotune and preferred_config == preferred_config.__class__(
+        32, 64, 64, 32, 3, 8
+    ):
+        # The middle family is the default winner in the measured launch band,
+        # but the retained long family wins selected shapes such as Q512. Both
+        # require causal-DQ load ordering; max autotune must benchmark both
+        # complete identities instead of replacing one with the other.
+        policy_configs.append(preferred_config.__class__(64, 64, 64, 32, 3, 8))
+    return policy_configs
+
+
 def _select_flex_attention_bwd_mask_options(
     legal_options: Sequence[dict[str, Any]],
     *,
@@ -1375,6 +1396,10 @@ def flex_attention_backward(*args, **kwargs):
         else None
     )
     config_policy, preferred_config = causal_dq_launch_policy or (0, None)
+    policy_configs = _get_flex_attention_causal_dq_policy_configs(
+        preferred_config,
+        max_autotune=config.max_autotune,
+    )
     _apply_exact_causal_kernel_facts(
         kernel_options,
         exact_causal_metadata=exact_causal_autotune_inputs,
@@ -1402,12 +1427,13 @@ def flex_attention_backward(*args, **kwargs):
         query.get_device().type,
         seq_len=query_length,
     )
-    if preferred_config is not None:
+    if policy_configs:
         if config.max_autotune:
-            if preferred_config not in configs:
-                configs.append(preferred_config)
+            for policy_config in policy_configs:
+                if policy_config not in configs:
+                    configs.append(policy_config)
         else:
-            configs = [preferred_config]
+            configs = policy_configs
 
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
@@ -1459,7 +1485,7 @@ def flex_attention_backward(*args, **kwargs):
         cur_kernel_options.setdefault("BLOCK_N1", block_n1)
         cur_kernel_options.setdefault("BLOCK_M2", block_m2)
         cur_kernel_options.setdefault("BLOCK_N2", block_n2)
-        selected_load_config = preferred_config is not None and tuple(
+        config_identity = tuple(
             cur_kernel_options[name]
             for name in (
                 "BLOCK_M1",
@@ -1469,13 +1495,18 @@ def flex_attention_backward(*args, **kwargs):
                 "num_stages",
                 "num_warps",
             )
-        ) == (
-            preferred_config.block_m1,
-            preferred_config.block_n1,
-            preferred_config.block_m2,
-            preferred_config.block_n2,
-            preferred_config.num_stages,
-            preferred_config.num_warps,
+        )
+        selected_load_config = any(
+            config_identity
+            == (
+                policy_config.block_m1,
+                policy_config.block_n1,
+                policy_config.block_m2,
+                policy_config.block_n2,
+                policy_config.num_stages,
+                policy_config.num_warps,
+            )
+            for policy_config in policy_configs
         )
         cur_kernel_options["FLEX_BWD_CONFIG_POLICY"] = config_policy
         cur_kernel_options.setdefault(

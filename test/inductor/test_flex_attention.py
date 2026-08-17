@@ -29,6 +29,7 @@ from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwis
 from torch._inductor import config, metrics
 from torch._inductor.choices import InductorChoices
 from torch._inductor.exc import InductorError
+from torch._inductor.heuristics.template.triton import FlexBwDConfig
 from torch._inductor.kernel.flex.common import _create_causal_block_mask_fake_metadata
 from torch._inductor.kernel.flex.flex_attention import (
     _apply_exact_causal_kernel_facts,
@@ -36,6 +37,7 @@ from torch._inductor.kernel.flex.flex_attention import (
     _BWD_MASK_MODE_TRAVERSAL_SCOPED,
     _can_use_exact_causal_autotune_inputs,
     flex_attention_backward_grid,
+    _get_flex_attention_causal_dq_policy_configs,
     _is_causal_mask_graph,
     _is_tanh_softcap_score_graph,
     _select_flex_attention_bwd_mask_options,
@@ -752,6 +754,28 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                     **kwargs,
                 )
             )
+
+    def test_causal_dq_max_retains_load_balanced_families(self):
+        short = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        middle = FlexBwDConfig(32, 64, 64, 32, 3, 8)
+        long = FlexBwDConfig(64, 64, 64, 32, 3, 8)
+
+        self.assertEqual(
+            _get_flex_attention_causal_dq_policy_configs(
+                middle, max_autotune=False
+            ),
+            [middle],
+        )
+        self.assertEqual(
+            _get_flex_attention_causal_dq_policy_configs(
+                middle, max_autotune=True
+            ),
+            [middle, long],
+        )
+        self.assertEqual(
+            _get_flex_attention_causal_dq_policy_configs(short, max_autotune=True),
+            [short],
+        )
 
     @skipIfRocm
     def test_causal_dkdv_tail_trim_profitability_gate(self):
