@@ -129,6 +129,57 @@ def _is_causal_mask_graph(graph_module: torch.fx.GraphModule) -> bool:
     )
 
 
+def _is_tanh_softcap_score_graph(graph_module: torch.fx.GraphModule) -> bool:
+    """Match ``cap * tanh(score / cap)`` for a finite nonzero scalar cap."""
+    nodes = list(graph_module.graph.nodes)
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    outputs = [node for node in nodes if node.op == "output"]
+    if len(nodes) != 9 or len(placeholders) != 5 or len(outputs) != 1:
+        return False
+
+    product = outputs[0].args[0]
+    if not (
+        isinstance(product, torch.fx.Node)
+        and product.op == "call_function"
+        and product.target is torch.ops.aten.mul.Tensor
+        and not product.kwargs
+        and len(product.args) == 2
+    ):
+        return False
+    tanh, output_cap = product.args
+    if not isinstance(tanh, torch.fx.Node):
+        tanh, output_cap = output_cap, tanh
+    if not (
+        isinstance(tanh, torch.fx.Node)
+        and tanh.op == "call_function"
+        and tanh.target is torch.ops.aten.tanh.default
+        and not tanh.kwargs
+        and len(tanh.args) == 1
+    ):
+        return False
+
+    division = tanh.args[0]
+    if not (
+        isinstance(division, torch.fx.Node)
+        and division.op == "call_function"
+        and division.target is torch.ops.aten.div.Tensor
+        and not division.kwargs
+        and division.args[0] is placeholders[0]
+        and len(division.args) == 2
+    ):
+        return False
+    input_cap = division.args[1]
+    if not isinstance(input_cap, (int, float)) or not isinstance(
+        output_cap, (int, float)
+    ):
+        return False
+    return (
+        math.isfinite(float(input_cap))
+        and float(input_cap) != 0.0
+        and float(input_cap) == float(output_cap)
+    )
+
+
 def _static_int(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, sympy.Integer)) else None
 
@@ -1252,6 +1303,78 @@ def flex_attention_backward(*args, **kwargs):
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    query_length = V.graph.sizevars.guard_int(seq_len_q)
+    static_policy_dimensions = tuple(
+        _static_int(value)
+        for value in (Bq, Hq, Hkv, seq_len_q, seq_len_kv, qk_head_dim, v_head_dim)
+    )
+    policy_workload: dict[str, Any] | None = None
+    if exact_causal_autotune_inputs and all(
+        value is not None for value in static_policy_dimensions
+    ):
+        (
+            batch_size,
+            query_heads,
+            kv_heads,
+            static_query_length,
+            static_kv_length,
+            static_qk_head_dim,
+            static_v_head_dim,
+        ) = static_policy_dimensions
+        policy_workload = {
+            "batch_size": batch_size,
+            "query_heads": query_heads,
+            "kv_heads": kv_heads,
+            "query_length": static_query_length,
+            "kv_length": static_kv_length,
+            "qk_head_dim": static_qk_head_dim,
+            "v_head_dim": static_v_head_dim,
+            "sparse_query_block_size": SPARSE_Q_BLOCK_SIZE,
+            "sparse_kv_block_size": SPARSE_KV_BLOCK_SIZE,
+            "has_full_blocks": has_full_blocks,
+            "score_mod_is_softcap": _is_tanh_softcap_score_graph(
+                fw_graph.graph_module
+            ),
+        }
+    user_pinned_config = any(
+        key.startswith("bwd_")
+        or key
+        in {
+            "BLOCK_M1",
+            "BLOCK_N1",
+            "BLOCK_M2",
+            "BLOCK_N2",
+            "num_stages",
+            "num_warps",
+        }
+        for key in kernel_options
+    )
+    kernel_options["CAUSAL_DKDV_PHYSICAL_TAIL"] = bool(
+        policy_workload is not None
+        and not user_pinned_config
+        and V.choices.use_flex_attention_causal_dkdv_tail_trim(
+            query.get_device(),
+            dtype,
+            **policy_workload,
+            max_autotune=config.max_autotune,
+        )
+    )
+    exhaustive_flex_search = (
+        config.max_autotune
+        and config.max_autotune_flex_search_space == "EXHAUSTIVE"
+    )
+    causal_dq_launch_policy = (
+        V.choices.get_flex_attention_causal_dq_launch_policy(
+            query.get_device(),
+            dtype,
+            **policy_workload,
+        )
+        if policy_workload is not None
+        and not user_pinned_config
+        and not exhaustive_flex_search
+        else None
+    )
+    config_policy, preferred_config = causal_dq_launch_policy or (0, None)
     _apply_exact_causal_kernel_facts(
         kernel_options,
         exact_causal_metadata=exact_causal_autotune_inputs,
@@ -1260,15 +1383,16 @@ def flex_attention_backward(*args, **kwargs):
             query.get_device(),
             dtype,
             is_backward=True,
-            query_length=V.graph.sizevars.guard_int(seq_len_q),
+            query_length=query_length,
             head_dim=head_dim,
             sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         ),
         is_backward=True,
-        query_length=V.graph.sizevars.guard_int(seq_len_q),
+        query_length=query_length,
         sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         has_full_blocks=has_full_blocks,
     )
+    original_kernel_options = kernel_options.copy()
 
     choices: list[Any] = []
 
@@ -1276,15 +1400,19 @@ def flex_attention_backward(*args, **kwargs):
         head_dim,
         dtype,
         query.get_device().type,
-        seq_len=V.graph.sizevars.guard_int(seq_len_q),
+        seq_len=query_length,
     )
+    if preferred_config is not None:
+        if config.max_autotune:
+            if preferred_config not in configs:
+                configs.append(preferred_config)
+        else:
+            configs = [preferred_config]
 
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
     legal_kernel_options: list[dict[str, Any]] = []
-
-    original_kernel_options = kernel_options.copy()
 
     for conf in configs:
         # Performance tuning
@@ -1331,6 +1459,29 @@ def flex_attention_backward(*args, **kwargs):
         cur_kernel_options.setdefault("BLOCK_N1", block_n1)
         cur_kernel_options.setdefault("BLOCK_M2", block_m2)
         cur_kernel_options.setdefault("BLOCK_N2", block_n2)
+        selected_load_config = preferred_config is not None and tuple(
+            cur_kernel_options[name]
+            for name in (
+                "BLOCK_M1",
+                "BLOCK_N1",
+                "BLOCK_M2",
+                "BLOCK_N2",
+                "num_stages",
+                "num_warps",
+            )
+        ) == (
+            preferred_config.block_m1,
+            preferred_config.block_n1,
+            preferred_config.block_m2,
+            preferred_config.block_n2,
+            preferred_config.num_stages,
+            preferred_config.num_warps,
+        )
+        cur_kernel_options["FLEX_BWD_CONFIG_POLICY"] = config_policy
+        cur_kernel_options.setdefault(
+            "CAUSAL_DQ_LOAD_BALANCE",
+            selected_load_config,
+        )
 
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
@@ -1382,19 +1533,6 @@ def flex_attention_backward(*args, **kwargs):
 
         legal_kernel_options.append(cur_kernel_options)
 
-    user_pinned_config = any(
-        key.startswith("bwd_")
-        or key
-        in {
-            "BLOCK_M1",
-            "BLOCK_N1",
-            "BLOCK_M2",
-            "BLOCK_N2",
-            "num_stages",
-            "num_warps",
-        }
-        for key in original_kernel_options
-    )
     default_use_traversal_scoped = (
         not config.max_autotune
         and V.choices.use_flex_attention_bwd_traversal_scoped_masks(

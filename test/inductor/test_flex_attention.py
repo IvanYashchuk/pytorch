@@ -37,6 +37,7 @@ from torch._inductor.kernel.flex.flex_attention import (
     _can_use_exact_causal_autotune_inputs,
     flex_attention_backward_grid,
     _is_causal_mask_graph,
+    _is_tanh_softcap_score_graph,
     _select_flex_attention_bwd_mask_options,
 )
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
@@ -618,6 +619,14 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         }
 
     def test_causal_dq_load_balance_grid_preserves_program_count(self):
+        self.assertIn(
+            "CAUSAL_DQ_LOAD_BALANCE",
+            AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS,
+        )
+        self.assertIn(
+            "FLEX_BWD_CONFIG_POLICY",
+            AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS,
+        )
         arguments = (1, 32, 769, 128, 8, 4096)
         legacy = flex_attention_backward_grid(
             *arguments,
@@ -634,6 +643,193 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         self.assertEqual(legacy, (116, 1, 8))
         self.assertEqual(balanced, (928, 1, 1))
         self.assertEqual(math.prod(legacy), math.prod(balanced))
+
+    @skipIfRocm
+    def test_causal_dq_launch_policy_boundaries(self):
+        choices = InductorChoices()
+        kwargs = {
+            "batch_size": 1,
+            "query_heads": 32,
+            "kv_heads": 8,
+            "kv_length": 4096,
+            "qk_head_dim": 128,
+            "v_head_dim": 128,
+            "sparse_query_block_size": 128,
+            "sparse_kv_block_size": 128,
+            "has_full_blocks": True,
+            "score_mod_is_softcap": True,
+        }
+
+        def selected(sm_count, q_len):
+            with patch(
+                "torch._inductor.choices.DeviceProperties.create",
+                return_value=types.SimpleNamespace(
+                    cc=107, multi_processor_count=sm_count
+                ),
+            ):
+                result = choices.get_flex_attention_causal_dq_launch_policy(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    query_length=q_len,
+                    **kwargs,
+                )
+            if result is None:
+                return None
+            policy, config = result
+            return policy, (
+                config.block_m1,
+                config.block_n1,
+                config.block_m2,
+                config.block_n2,
+                config.num_stages,
+                config.num_warps,
+            )
+
+        short = (32, 32, 32, 32, 3, 4)
+        middle = (32, 64, 64, 32, 3, 8)
+        long = (64, 64, 64, 32, 3, 8)
+        self.assertEqual(selected(200, 256), (2001, short))
+        self.assertEqual(selected(200, 257), (2001, middle))
+        self.assertEqual(selected(200, 608), (2001, middle))
+        self.assertEqual(selected(200, 609), (2001, long))
+        self.assertEqual(selected(212, 287), (2122, short))
+        self.assertEqual(selected(212, 288), (2122, middle))
+        self.assertEqual(selected(212, 527), (2122, middle))
+        self.assertEqual(selected(212, 528), (2122, long))
+        self.assertIsNone(selected(216, 384))
+
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=types.SimpleNamespace(cc=107, multi_processor_count=212),
+        ):
+            self.assertIsNone(
+                choices.get_flex_attention_causal_dq_launch_policy(
+                    torch.device("cuda"),
+                    torch.float16,
+                    query_length=384,
+                    **kwargs,
+                )
+            )
+            self.assertIsNone(
+                choices.get_flex_attention_causal_dq_launch_policy(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    query_length=384,
+                    **{**kwargs, "kv_heads": 16},
+                )
+            )
+            self.assertIsNone(
+                choices.get_flex_attention_causal_dq_launch_policy(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    query_length=384,
+                    **{**kwargs, "v_head_dim": 256},
+                )
+            )
+            for unsupported in (
+                {"sparse_query_block_size": 64},
+                {"sparse_kv_block_size": 64},
+                {"has_full_blocks": False},
+                {"score_mod_is_softcap": False},
+            ):
+                self.assertIsNone(
+                    choices.get_flex_attention_causal_dq_launch_policy(
+                        torch.device("cuda"),
+                        torch.bfloat16,
+                        query_length=384,
+                        **(kwargs | unsupported),
+                    )
+                )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=types.SimpleNamespace(cc=100, multi_processor_count=152),
+        ):
+            self.assertIsNone(
+                choices.get_flex_attention_causal_dq_launch_policy(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    query_length=384,
+                    **kwargs,
+                )
+            )
+
+    @skipIfRocm
+    def test_causal_dkdv_tail_trim_profitability_gate(self):
+        choices = InductorChoices()
+        common = {
+            "batch_size": 1,
+            "query_heads": 32,
+            "kv_heads": 8,
+            "query_length": 129,
+            "kv_length": 4096,
+            "qk_head_dim": 128,
+            "v_head_dim": 128,
+            "sparse_query_block_size": 128,
+            "sparse_kv_block_size": 128,
+            "has_full_blocks": True,
+            "score_mod_is_softcap": True,
+            "max_autotune": False,
+        }
+        for sm_count in (200, 212):
+            with patch(
+                "torch._inductor.choices.DeviceProperties.create",
+                return_value=types.SimpleNamespace(
+                    cc=107, multi_processor_count=sm_count
+                ),
+            ):
+                self.assertTrue(
+                    choices.use_flex_attention_causal_dkdv_tail_trim(
+                        torch.device("cuda"), torch.bfloat16, **common
+                    )
+                )
+
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=types.SimpleNamespace(cc=100, multi_processor_count=152),
+        ):
+            self.assertFalse(
+                choices.use_flex_attention_causal_dkdv_tail_trim(
+                    torch.device("cuda"), torch.bfloat16, **common
+                )
+            )
+            self.assertTrue(
+                choices.use_flex_attention_causal_dkdv_tail_trim(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    **(common | {"max_autotune": True}),
+                )
+            )
+            self.assertTrue(
+                choices.use_flex_attention_causal_dkdv_tail_trim(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    **(common | {"query_length": 257}),
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_causal_dkdv_tail_trim(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    **(common | {"v_head_dim": 256, "max_autotune": True}),
+                )
+            )
+
+    def test_tanh_softcap_score_graph_matcher(self):
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def softcap(score, _batch, _head, _query, _kv):
+            return 20.0 * torch.tanh(score / 20.0)
+
+        def mismatched_cap(score, _batch, _head, _query, _kv):
+            return 10.0 * torch.tanh(score / 20.0)
+
+        args = (torch.randn(()),) + tuple(
+            torch.zeros((), dtype=torch.int64) for _ in range(4)
+        )
+        self.assertTrue(_is_tanh_softcap_score_graph(make_fx(softcap)(*args)))
+        self.assertFalse(
+            _is_tanh_softcap_score_graph(make_fx(mismatched_cap)(*args))
+        )
 
     def test_max_autotune_mask_mode_order_and_dedup(self):
         self.assertIn(
@@ -715,6 +911,7 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
 
     def test_default_mask_mode_profitability_gate(self):
         rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        rubin_200sm = types.SimpleNamespace(cc=107, multi_processor_count=200)
         choices = InductorChoices()
         with patch(
             "torch._inductor.choices.DeviceProperties.create", return_value=rubin
@@ -751,9 +948,22 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                     user_pinned_config=False,
                 )
             )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=rubin_200sm,
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
 
     def test_exact_causal_block_contiguity_profitability_gate(self):
         rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        rubin_200sm = types.SimpleNamespace(cc=107, multi_processor_count=200)
         blackwell = types.SimpleNamespace(cc=100, multi_processor_count=152)
         choices = InductorChoices()
         common = {
@@ -810,6 +1020,18 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                     torch.float16,
                     is_backward=False,
                     **common,
+                )
+            )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=rubin_200sm,
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=True,
+                    **(common | {"query_length": 129}),
                 )
             )
         with patch(

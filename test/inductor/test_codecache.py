@@ -190,7 +190,7 @@ class TestCacheKeyStrategy(TestCase):
 
         fake_strategy = FakeStrategy()
         device_properties = types.SimpleNamespace(
-            name="test-gpu", gcnArchName="test-gcn"
+            name="test-gpu", gcnArchName="test-gcn", multi_processor_count=123
         )
 
         CacheBase.get_system.cache_clear()
@@ -216,11 +216,37 @@ class TestCacheKeyStrategy(TestCase):
         self.assertEqual(
             fake_strategy.value,
             {
-                "device": {"name": "test-gpu"},
+                "device": {"name": "test-gpu", "multi_processor_count": 123},
                 "version": {"triton": None, "cuda": "test-cuda"},
             },
         )
         self.assertTrue(fake_strategy.sort_keys)
+
+    def test_cache_base_get_system_hashes_sm_count(self):
+        device_properties = types.SimpleNamespace(
+            name="same-gpu-name", gcnArchName="test-gcn", multi_processor_count=200
+        )
+
+        CacheBase.get_system.cache_clear()
+        try:
+            with (
+                mock.patch("torch._inductor.runtime.triton_compat.HAS_TRITON", False),
+                mock.patch.object(torch.cuda, "current_device", return_value=0),
+                mock.patch.object(
+                    torch.cuda,
+                    "get_device_properties",
+                    return_value=device_properties,
+                ),
+                mock.patch.object(torch.version, "cuda", "test-cuda"),
+            ):
+                sm200_hash = CacheBase.get_system()["hash"]
+                device_properties.multi_processor_count = 212
+                CacheBase.get_system.cache_clear()
+                sm212_hash = CacheBase.get_system()["hash"]
+        finally:
+            CacheBase.get_system.cache_clear()
+
+        self.assertNotEqual(sm200_hash, sm212_hash)
 
     def test_autotune_prepare_key_uses_strategy(self):
         from torch._inductor.runtime.autotune_cache import AutotuneCache

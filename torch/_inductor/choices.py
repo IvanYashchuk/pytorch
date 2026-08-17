@@ -19,6 +19,7 @@ from .heuristics.template.triton import (
     BaseConfigHeuristic,
     CPUConfigHeuristic,
     CUDAConfigHeuristic,
+    FlexBwDConfig,
     IS_ROCM,
     MTIAConfigHeuristic,
     ROCmConfigHeuristic,
@@ -128,6 +129,14 @@ class InductorChoices:
     cache key computation.
     """
 
+    # (policy revision, inclusive lower Q, exclusive upper Q). Keep the SM
+    # count in the policy identity so generated choices retain the measured
+    # floorswept Rubin provenance. Bump the revision when a band changes.
+    _FLEX_CAUSAL_DQ_LAUNCH_BANDS = {
+        200: (2001, 257, 609),
+        212: (2122, 288, 528),
+    }
+
     def get_config_heuristics(
         self, device_type: str | None = "cuda"
     ) -> BaseConfigHeuristic:
@@ -177,8 +186,127 @@ class InductorChoices:
         seq_len: sympy.Expr | None = None,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_attn_bwd_configs(
-            head_dim, dtype, seq_len=seq_len
+        return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype, seq_len=seq_len)
+
+    def _get_flex_attention_causal_softcap_d128_properties(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        batch_size: int,
+        query_heads: int,
+        kv_heads: int,
+        kv_length: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        sparse_query_block_size: int,
+        sparse_kv_block_size: int,
+        has_full_blocks: bool,
+        score_mod_is_softcap: bool,
+    ) -> DeviceProperties | None:
+        if device.type != "cuda" or torch.version.hip:
+            return None
+        props = DeviceProperties.create(device)
+        if not (
+            dtype == torch.bfloat16
+            and (batch_size, query_heads, kv_heads) == (1, 32, 8)
+            and kv_length == 4096
+            and (qk_head_dim, v_head_dim) == (128, 128)
+            and (sparse_query_block_size, sparse_kv_block_size) == (128, 128)
+            and has_full_blocks
+            and score_mod_is_softcap
+        ):
+            return None
+        return props
+
+    def get_flex_attention_causal_dq_launch_policy(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        batch_size: int,
+        query_heads: int,
+        kv_heads: int,
+        query_length: int,
+        kv_length: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        sparse_query_block_size: int,
+        sparse_kv_block_size: int,
+        has_full_blocks: bool,
+        score_mod_is_softcap: bool,
+    ) -> tuple[int, FlexBwDConfig] | None:
+        props = self._get_flex_attention_causal_softcap_d128_properties(
+            device,
+            dtype,
+            batch_size=batch_size,
+            query_heads=query_heads,
+            kv_heads=kv_heads,
+            kv_length=kv_length,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+            sparse_query_block_size=sparse_query_block_size,
+            sparse_kv_block_size=sparse_kv_block_size,
+            has_full_blocks=has_full_blocks,
+            score_mod_is_softcap=score_mod_is_softcap,
+        )
+        if props is None:
+            return None
+        band = self._FLEX_CAUSAL_DQ_LAUNCH_BANDS.get(props.multi_processor_count)
+        if props.cc != 107 or band is None:
+            return None
+
+        policy, lower_q, upper_q = band
+        if lower_q <= query_length < upper_q:
+            preferred = FlexBwDConfig(32, 64, 64, 32, 3, 8)
+        elif query_length >= 512:
+            preferred = FlexBwDConfig(64, 64, 64, 32, 3, 8)
+        else:
+            preferred = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+        return policy, preferred
+
+    def use_flex_attention_causal_dkdv_tail_trim(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        batch_size: int,
+        query_heads: int,
+        kv_heads: int,
+        query_length: int,
+        kv_length: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        sparse_query_block_size: int,
+        sparse_kv_block_size: int,
+        has_full_blocks: bool,
+        score_mod_is_softcap: bool,
+        max_autotune: bool,
+    ) -> bool:
+        props = self._get_flex_attention_causal_softcap_d128_properties(
+            device,
+            dtype,
+            batch_size=batch_size,
+            query_heads=query_heads,
+            kv_heads=kv_heads,
+            kv_length=kv_length,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+            sparse_query_block_size=sparse_query_block_size,
+            sparse_kv_block_size=sparse_kv_block_size,
+            has_full_blocks=has_full_blocks,
+            score_mod_is_softcap=score_mod_is_softcap,
+        )
+        if props is None:
+            return False
+        if props.cc == 107 and props.multi_processor_count in {200, 212}:
+            return True
+        # The exact-causal transformation is semantically safe on SM100. A
+        # matched GB200 sweep and independent replay isolate its only stable
+        # loss to short default Q129; max wins there with a smaller DKV tile,
+        # and every measured default tail beyond two sparse-Q blocks wins.
+        return props.cc == 100 and props.multi_processor_count == 152 and (
+            max_autotune or query_length > 2 * sparse_query_block_size
         )
 
     def use_flex_attention_bwd_traversal_scoped_masks(
@@ -203,11 +331,12 @@ class InductorChoices:
         ):
             return False
         props = DeviceProperties.create(device)
-        # Rubin BF16 shape sweeps justify the default flip. Other architectures
-        # retain the legacy body until cross-architecture measurements do so.
+        # Rubin BF16 shape sweeps on both measured VR SM-count classes justify
+        # the default flip. Other architectures retain the legacy body until
+        # cross-architecture measurements do so.
         return (
             props.cc == 107
-            and props.multi_processor_count == 212
+            and props.multi_processor_count in {200, 212}
             and dtype == torch.bfloat16
         )
 
@@ -227,7 +356,7 @@ class InductorChoices:
         props = DeviceProperties.create(device)
         if not (
             props.cc == 107
-            and props.multi_processor_count == 212
+            and props.multi_processor_count in {200, 212}
             and dtype == torch.bfloat16
         ):
             return False

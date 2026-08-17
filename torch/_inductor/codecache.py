@@ -151,6 +151,7 @@ T = TypeVar("T")
 
 class SystemDeviceInfo(TypedDict):
     name: str | None
+    multi_processor_count: int
 
 
 class SystemVersionInfo(TypedDict, total=False):
@@ -334,11 +335,14 @@ class CacheBase:
             triton_version = triton_key()
 
         try:
-            device_info: SystemDeviceInfo = {"name": None}
             version_info: SystemVersionInfo = {"triton": triton_version}
             device_properties = torch.cuda.get_device_properties(
                 torch.cuda.current_device()
             )
+            device_info: SystemDeviceInfo = {
+                "name": None,
+                "multi_processor_count": device_properties.multi_processor_count,
+            }
             if torch.version.cuda is not None:
                 device_info["name"] = device_properties.name
                 version_info["cuda"] = torch.version.cuda
