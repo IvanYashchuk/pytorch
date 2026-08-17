@@ -175,10 +175,16 @@ class InductorChoices:
         return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype)
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+        sparse_kv_block_size: int | None = None,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
-        return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
+        return flex_heuristics.get_flex_decode_configs(
+            head_dim, dtype, sparse_kv_block_size
+        )
 
     def append_flex_attention_choices(
         self,

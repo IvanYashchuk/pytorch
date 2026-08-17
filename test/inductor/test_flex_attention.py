@@ -21,6 +21,7 @@ from unittest import expectedFailure, mock, skip, skipUnless
 from unittest.mock import patch
 
 import sympy
+
 import torch
 import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
@@ -5437,24 +5438,75 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         self.assertEqual(
             _get_split_kv_autotune_candidates(6, 212, 64, 12),
-            (6, 3, 12, 10),
+            (6, 3, 12, 10, 7, 8, 9, 11),
         )
         self.assertEqual(
             _get_split_kv_autotune_candidates(2, 212, 128, 12),
-            (2, 1, 4, 8, 5),
+            (2, 1, 4, 8, 5, 6, 7, 9, 10, 11, 12),
         )
         self.assertEqual(
             _get_split_kv_autotune_candidates(4, 212, 64, 8),
-            (4, 2, 8),
+            (4, 2, 8, 5, 6, 7),
         )
         self.assertEqual(
             _get_split_kv_autotune_candidates(52, 212, 8, 12),
-            (52, 1, 2, 4, 8, 12),
+            (52, 1, 2, 4, 8, 12, 6, 7, 9, 10, 11),
         )
         self.assertEqual(
             _get_split_kv_autotune_candidates(106, 212, 4, 12),
-            (106, 1, 2, 4, 8, 12),
+            (106, 1, 2, 4, 8, 12, 6, 7, 9, 10, 11),
         )
+        self.assertIn(
+            15,
+            _get_split_kv_autotune_candidates(2, 212, 256, 16),
+        )
+
+    def test_flex_decode_rubin_paged_d256_config(self):
+        from torch._inductor.heuristics.template.triton import (
+            CUDAConfigHeuristic,
+            FlexDecodeConfig,
+        )
+
+        heuristic = CUDAConfigHeuristic()
+        with (
+            mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=(10, 7)
+            ),
+            config.patch("max_autotune", False),
+        ):
+            self.assertEqual(
+                heuristic.get_flex_decode_configs(
+                    256, torch.bfloat16, sparse_kv_block_size=64
+                ),
+                [FlexDecodeConfig(64, 2, 2)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_decode_configs(
+                    256, torch.bfloat16, sparse_kv_block_size=128
+                ),
+                [FlexDecodeConfig(64, 1, 2)],
+            )
+            self.assertEqual(
+                heuristic.get_flex_decode_configs(
+                    128, torch.bfloat16, sparse_kv_block_size=64
+                ),
+                [FlexDecodeConfig(64, 1, 2)],
+            )
+
+        # Preserve the pre-existing staged default on Hopper and Blackwell;
+        # the second device check must not overwrite the first branch.
+        with (
+            mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=(10, 0)
+            ),
+            config.patch("max_autotune", False),
+        ):
+            self.assertEqual(
+                heuristic.get_flex_decode_configs(
+                    128, torch.bfloat16, sparse_kv_block_size=64
+                ),
+                [FlexDecodeConfig(64, 3, 2)],
+            )
 
     def test_flex_decode_graph_module_cache_key_includes_get_attr_state(self, device):
         from torch._inductor.kernel.flex.flex_decoding_split_autotune import (

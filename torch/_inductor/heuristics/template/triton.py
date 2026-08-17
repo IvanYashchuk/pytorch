@@ -1248,7 +1248,10 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        sparse_kv_block_size: int | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -1535,7 +1538,10 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        sparse_kv_block_size: int | None = None,
     ) -> list[FlexDecodeConfig]:
         capability = torch.cuda.get_device_capability()
 
@@ -1553,10 +1559,19 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
                 default_config = FlexDecodeConfig(64, 1, 2)
             else:
                 default_config = FlexDecodeConfig(64, 3, 2)
-        if capability == (11, 0):
+        elif (
+            capability == (10, 7)
+            and dtype in (torch.bfloat16, torch.float16)
+            and head_dim == 256
+            and sparse_kv_block_size is not None
+            and sparse_kv_block_size <= 64
+        ):
+            # Rubin paged D256 decode is latency-limited by the inherited
+            # one-stage producer. Stage 2 is also absent from the generic max
+            # search, so making it the scoped default repairs both surfaces.
+            default_config = FlexDecodeConfig(64, 2, 2)
+        elif capability == (11, 0):
             default_config = FlexDecodeConfig(16, 1, 2)
-        else:
-            default_config = FlexDecodeConfig(64, 1, 2)
 
         if default_config not in flex_decode_configs:
             flex_decode_configs.append(default_config)
@@ -1968,7 +1983,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        sparse_kv_block_size: int | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 
@@ -2099,7 +2117,10 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         return flex_attn_bwd_configs
 
     def get_flex_decode_configs(
-        self, head_dim: int, dtype: Any
+        self,
+        head_dim: int,
+        dtype: Any,
+        sparse_kv_block_size: int | None = None,
     ) -> list[FlexDecodeConfig]:
         flex_decode_configs: list[FlexDecodeConfig] = []
 

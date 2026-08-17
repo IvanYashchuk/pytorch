@@ -17,7 +17,7 @@ from .common import is_tensor_ir_node
 
 flex_decode_split_template = SubgraphTemplate(name="flex_decode_split")
 
-_RUBIN_FLEX_DECODE_SPLIT_KV_CAP = 12
+_RUBIN_FLEX_DECODE_SPLIT_KV_CAP = 16
 _RUBIN_FLEX_DECODE_PROXY_VERSION = "half_batch_full_capacity_v1"
 
 
@@ -27,7 +27,7 @@ def _get_split_kv_autotune_candidates(
     base_ctas: int,
     max_generated_split: int,
 ) -> tuple[int, ...]:
-    """Bounded split candidates around the default and useful CTA waves."""
+    """Bounded split candidates around the default and dense upper-half waves."""
     if min(current_split, sm_count, base_ctas, max_generated_split) < 1:
         raise AssertionError("Flex decode split candidate inputs must be positive")
 
@@ -45,6 +45,15 @@ def _get_split_kv_autotune_candidates(
             current_split * 4,
             ceildiv(3 * sm_count, base_ctas),
         ]
+    # Rubin decode latency can oscillate between adjacent high split counts;
+    # testing only powers/multiples misses the measured 13/15 winners. Preserve
+    # the cheap legacy neighborhood, then make the bounded upper half dense.
+    generated.extend(
+        range(
+            max(1, ceildiv(max_generated_split, 2)),
+            max_generated_split + 1,
+        )
+    )
     candidates = [current_split]
     for split in generated:
         split = min(split, max_generated_split)

@@ -9,7 +9,7 @@ import sympy
 import torch
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._inductor.virtualized import ops, V
-from torch.utils._sympy.functions import FloorDiv, Mod
+from torch.utils._sympy.functions import FloorDiv, Max, Min, Mod
 
 from ... import ir
 from ...ir import FixedLayout, FlexibleLayout
@@ -293,8 +293,8 @@ def _get_split_policy_max_kv_work(
 ):
     max_kv_blocks = partial_capacity
     if full_capacity is not None:
-        max_kv_blocks = sympy.Max(max_kv_blocks, full_capacity)
-    return sympy.Min(max_kv_blocks * sparse_kv_block_size, seq_len_kv)
+        max_kv_blocks = Max(max_kv_blocks, full_capacity)
+    return Min(max_kv_blocks * sparse_kv_block_size, seq_len_kv)
 
 
 def create_flex_decoding_kernel(*args, **kwargs):
@@ -424,7 +424,10 @@ def create_flex_decoding_kernel(*args, **kwargs):
     dtype = key.get_dtype()
     head_dim = V.graph.sizevars.guard_int(key.get_size()[-1])
     configs = V.choices.get_flex_decode_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        sparse_kv_block_size=SPARSE_KV_BLOCK_SIZE,
     )
 
     kernel_options.setdefault("SM_SCALE", scale)
