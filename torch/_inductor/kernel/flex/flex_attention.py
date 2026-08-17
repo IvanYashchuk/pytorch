@@ -1252,6 +1252,21 @@ def flex_attention_backward(*args, **kwargs):
     kernel_options["AUTOTUNE_CAUSAL_BLOCK_MASK"] = exact_causal_autotune_inputs
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
+    query_length = V.graph.sizevars.guard_int(seq_len_q)
+    kv_length = V.graph.sizevars.guard_int(seq_len_kv)
+    use_causal_dq_load_balance = bool(
+        exact_causal_autotune_inputs
+        and V.choices.use_flex_attention_causal_dq_load_balance(
+            query.get_device(),
+            dtype,
+            batch_size=V.graph.sizevars.guard_int(Bq),
+            query_heads=V.graph.sizevars.guard_int(Hq),
+            kv_heads=V.graph.sizevars.guard_int(Hkv),
+            query_length=query_length,
+            kv_length=kv_length,
+            head_dim=head_dim,
+        )
+    )
     _apply_exact_causal_kernel_facts(
         kernel_options,
         exact_causal_metadata=exact_causal_autotune_inputs,
@@ -1260,12 +1275,12 @@ def flex_attention_backward(*args, **kwargs):
             query.get_device(),
             dtype,
             is_backward=True,
-            query_length=V.graph.sizevars.guard_int(seq_len_q),
+            query_length=query_length,
             head_dim=head_dim,
             sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         ),
         is_backward=True,
-        query_length=V.graph.sizevars.guard_int(seq_len_q),
+        query_length=query_length,
         sparse_query_block_size=SPARSE_Q_BLOCK_SIZE,
         has_full_blocks=has_full_blocks,
     )
@@ -1276,7 +1291,8 @@ def flex_attention_backward(*args, **kwargs):
         head_dim,
         dtype,
         query.get_device().type,
-        seq_len=V.graph.sizevars.guard_int(seq_len_q),
+        seq_len=query_length,
+        prefer_causal_dq_load_balance=use_causal_dq_load_balance,
     )
 
     # Default config for warp specialization
@@ -1285,6 +1301,19 @@ def flex_attention_backward(*args, **kwargs):
     legal_kernel_options: list[dict[str, Any]] = []
 
     original_kernel_options = kernel_options.copy()
+    user_pinned_config = any(
+        key.startswith("bwd_")
+        or key
+        in {
+            "BLOCK_M1",
+            "BLOCK_N1",
+            "BLOCK_M2",
+            "BLOCK_N2",
+            "num_stages",
+            "num_warps",
+        }
+        for key in original_kernel_options
+    )
 
     for conf in configs:
         # Performance tuning
@@ -1331,6 +1360,19 @@ def flex_attention_backward(*args, **kwargs):
         cur_kernel_options.setdefault("BLOCK_N1", block_n1)
         cur_kernel_options.setdefault("BLOCK_M2", block_m2)
         cur_kernel_options.setdefault("BLOCK_N2", block_n2)
+        selected_load_config = (
+            tuple(
+                cur_kernel_options[name]
+                for name in ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2")
+            )
+            == ((32, 32, 32, 32) if query_length < 512 else (64, 64, 64, 32))
+        )
+        cur_kernel_options.setdefault(
+            "CAUSAL_DQ_LOAD_BALANCE",
+            use_causal_dq_load_balance
+            and not user_pinned_config
+            and selected_load_config,
+        )
 
         # Blocksparse options
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
@@ -1382,19 +1424,6 @@ def flex_attention_backward(*args, **kwargs):
 
         legal_kernel_options.append(cur_kernel_options)
 
-    user_pinned_config = any(
-        key.startswith("bwd_")
-        or key
-        in {
-            "BLOCK_M1",
-            "BLOCK_N1",
-            "BLOCK_M2",
-            "BLOCK_N2",
-            "num_stages",
-            "num_warps",
-        }
-        for key in original_kernel_options
-    )
     default_use_traversal_scoped = (
         not config.max_autotune
         and V.choices.use_flex_attention_bwd_traversal_scoped_masks(

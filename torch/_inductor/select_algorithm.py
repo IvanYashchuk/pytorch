@@ -3971,6 +3971,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 "BLOCK_M2",
                 "BLOCK_N2",
                 "BWD_MASK_MODE",
+                "CAUSAL_DQ_LOAD_BALANCE",
                 "AUTOTUNE_CAUSAL_BLOCK_MASK",
                 "USE_TMA",
                 "kpack",

@@ -663,7 +663,30 @@ def bwd_dkdv_inner(
 
     # The minimum is needed to handle the case where we run with a super large
     # SPARSE_BLOCK_SIZE (i.e. no block-mask!)
-    hi = tl.minimum(sparse_q_num_blocks * SPARSE_Q_MULTIPLE, tl.maximum(tl.cdiv(Q_LEN, BLOCK_M1), 1))
+    sparse_q_physical_blocks = sparse_q_num_blocks * SPARSE_Q_MULTIPLE
+    if AUTOTUNE_CAUSAL_BLOCK_MASK and Q_LEN % SPARSE_Q_BLOCK_SIZE != 0:
+        # Exact causal transposed metadata appends the padded final sparse-Q
+        # block to every partial list that reaches it. Count only its physical
+        # query tiles; otherwise a short tail such as Q=N+1 executes a wholly
+        # empty second BLOCK_M1 iteration in every active DKV program.
+        tail_sparse_q_block = Q_LEN // SPARSE_Q_BLOCK_SIZE
+        tail_physical_blocks = tl.cdiv(
+            Q_LEN % SPARSE_Q_BLOCK_SIZE, BLOCK_M1
+        )
+        last_sparse_q_offset = tl.maximum(sparse_q_num_blocks - 1, 0)
+        last_sparse_q_block = tl.load(q_indices + last_sparse_q_offset)
+        contains_tail = (sparse_q_num_blocks > 0) & (
+            last_sparse_q_block == tail_sparse_q_block
+        )
+        empty_tail_blocks = SPARSE_Q_MULTIPLE - tail_physical_blocks
+        sparse_q_physical_blocks -= tl.where(
+            contains_tail, empty_tail_blocks, 0
+        )
+
+    hi = tl.minimum(
+        sparse_q_physical_blocks,
+        tl.maximum(tl.cdiv(Q_LEN, BLOCK_M1), 1),
+    )
 
     offset_block = 0
     for start_m in range(0, hi):

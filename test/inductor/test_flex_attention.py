@@ -618,6 +618,10 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         }
 
     def test_causal_dq_load_balance_grid_preserves_program_count(self):
+        self.assertIn(
+            "CAUSAL_DQ_LOAD_BALANCE",
+            AlgorithmSelectorCache.FLEX_ATTENTION_TUNABLE_KEYS,
+        )
         arguments = (1, 32, 769, 128, 8, 4096)
         legacy = flex_attention_backward_grid(
             *arguments,
@@ -634,6 +638,57 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         self.assertEqual(legacy, (116, 1, 8))
         self.assertEqual(balanced, (928, 1, 1))
         self.assertEqual(math.prod(legacy), math.prod(balanced))
+
+    def test_causal_dq_load_balance_profitability_gate(self):
+        rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        rubin_200sm = types.SimpleNamespace(cc=107, multi_processor_count=200)
+        choices = InductorChoices()
+        kwargs = {
+            "batch_size": 1,
+            "query_heads": 32,
+            "kv_heads": 8,
+            "query_length": 512,
+            "kv_length": 4096,
+            "head_dim": 128,
+        }
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=rubin
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_causal_dq_load_balance(
+                    torch.device("cuda"), torch.bfloat16, **kwargs
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_causal_dq_load_balance(
+                    torch.device("cuda"), torch.float16, **kwargs
+                )
+            )
+            self.assertFalse(
+                choices.use_flex_attention_causal_dq_load_balance(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    **{**kwargs, "kv_heads": 16},
+                )
+            )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=rubin_200sm,
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_causal_dq_load_balance(
+                    torch.device("cuda"), torch.bfloat16, **kwargs
+                )
+            )
+        blackwell = types.SimpleNamespace(cc=100, multi_processor_count=148)
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create", return_value=blackwell
+        ):
+            self.assertFalse(
+                choices.use_flex_attention_causal_dq_load_balance(
+                    torch.device("cuda"), torch.bfloat16, **kwargs
+                )
+            )
 
     def test_max_autotune_mask_mode_order_and_dedup(self):
         self.assertIn(
@@ -715,6 +770,7 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
 
     def test_default_mask_mode_profitability_gate(self):
         rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        rubin_200sm = types.SimpleNamespace(cc=107, multi_processor_count=200)
         choices = InductorChoices()
         with patch(
             "torch._inductor.choices.DeviceProperties.create", return_value=rubin
@@ -751,9 +807,22 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                     user_pinned_config=False,
                 )
             )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=rubin_200sm,
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_bwd_traversal_scoped_masks(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_causal=True,
+                    user_pinned_config=False,
+                )
+            )
 
     def test_exact_causal_block_contiguity_profitability_gate(self):
         rubin = types.SimpleNamespace(cc=107, multi_processor_count=212)
+        rubin_200sm = types.SimpleNamespace(cc=107, multi_processor_count=200)
         blackwell = types.SimpleNamespace(cc=100, multi_processor_count=152)
         choices = InductorChoices()
         common = {
@@ -810,6 +879,18 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
                     torch.float16,
                     is_backward=False,
                     **common,
+                )
+            )
+        with patch(
+            "torch._inductor.choices.DeviceProperties.create",
+            return_value=rubin_200sm,
+        ):
+            self.assertTrue(
+                choices.use_flex_attention_exact_causal_block_contiguity(
+                    torch.device("cuda"),
+                    torch.bfloat16,
+                    is_backward=True,
+                    **(common | {"query_length": 129}),
                 )
             )
         with patch(

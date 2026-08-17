@@ -175,10 +175,38 @@ class InductorChoices:
         device_type: str | None = "cuda",
         *,
         seq_len: sympy.Expr | None = None,
+        prefer_causal_dq_load_balance: bool = False,
     ) -> list[Any]:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_bwd_configs(
-            head_dim, dtype, seq_len=seq_len
+            head_dim,
+            dtype,
+            seq_len=seq_len,
+            prefer_causal_dq_load_balance=prefer_causal_dq_load_balance,
+        )
+
+    def use_flex_attention_causal_dq_load_balance(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        batch_size: int,
+        query_heads: int,
+        kv_heads: int,
+        query_length: int,
+        kv_length: int,
+        head_dim: int,
+    ) -> bool:
+        if device.type != "cuda" or torch.version.hip:
+            return False
+        props = DeviceProperties.create(device)
+        return (
+            props.cc == 107
+            and props.multi_processor_count in {200, 212}
+            and dtype == torch.bfloat16
+            and (batch_size, query_heads, kv_heads) == (1, 32, 8)
+            and kv_length == 4096
+            and head_dim == 128
         )
 
     def use_flex_attention_bwd_traversal_scoped_masks(
@@ -203,11 +231,12 @@ class InductorChoices:
         ):
             return False
         props = DeviceProperties.create(device)
-        # Rubin BF16 shape sweeps justify the default flip. Other architectures
-        # retain the legacy body until cross-architecture measurements do so.
+        # Rubin BF16 shape sweeps on both measured VR SM-count classes justify
+        # the default flip. Other architectures retain the legacy body until
+        # cross-architecture measurements do so.
         return (
             props.cc == 107
-            and props.multi_processor_count == 212
+            and props.multi_processor_count in {200, 212}
             and dtype == torch.bfloat16
         )
 
@@ -227,7 +256,7 @@ class InductorChoices:
         props = DeviceProperties.create(device)
         if not (
             props.cc == 107
-            and props.multi_processor_count == 212
+            and props.multi_processor_count in {200, 212}
             and dtype == torch.bfloat16
         ):
             return False

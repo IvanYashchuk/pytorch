@@ -1236,6 +1236,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         dtype: Any,
         *,
         seq_len: sympy.Expr | None = None,
+        prefer_causal_dq_load_balance: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -1469,6 +1470,7 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         dtype: Any,
         *,
         seq_len: sympy.Expr | None = None,
+        prefer_causal_dq_load_balance: bool = False,
     ) -> list[FlexBwDConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
@@ -1533,18 +1535,38 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
         # fmt: on
 
         if capability == (10, 7) and dtype == torch.bfloat16 and head_dim == 128:
-            # Both configs are already in the ordinary max-autotune set. A
-            # counterbalanced causal-GQA sweep finds the wider tile wins every
-            # stationary row from Q=768 onward; keep the sequence threshold and
-            # architecture guard explicit so SM100 and other dtypes are unchanged.
-            long_query = (
-                isinstance(seq_len, (int, sympy.Integer)) and int(seq_len) >= 768
-            )
-            default_config = (
-                FlexBwDConfig(32, 64, 64, 32, 3, 4)
-                if long_query
-                else FlexBwDConfig(32, 32, 32, 32, 3, 4)
-            )
+            # The load-balanced causal-GQA policy moves the measured crossover
+            # to Q=512. At and above that boundary, an asymmetric eight-warp
+            # DKV tile wins the broad shape sweep; other workloads retain the
+            # earlier Q=768 four-warp default.
+            wide_threshold = 512 if prefer_causal_dq_load_balance else 768
+            long_query = isinstance(seq_len, (int, sympy.Integer)) and int(
+                seq_len
+            ) >= wide_threshold
+            if prefer_causal_dq_load_balance and long_query:
+                default_config = FlexBwDConfig(64, 64, 64, 32, 3, 8)
+            elif long_query:
+                default_config = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+            else:
+                default_config = FlexBwDConfig(32, 32, 32, 32, 3, 4)
+            if config.max_autotune and prefer_causal_dq_load_balance and long_query:
+                # The caller-proven causal GQA workload has matched broad-shape
+                # evidence: every measured Q >= 512 row prefers the asymmetric
+                # eight-warp DKV tile over the load-balanced 32x64 family. Prune
+                # both superseded tile families so short autotune samples cannot
+                # select either slower kernel and so we avoid compiling their
+                # redundant stage variants for both mask bodies.
+                flex_attn_bwd_configs = [
+                    candidate
+                    for candidate in flex_attn_bwd_configs
+                    if (
+                        candidate.block_m1,
+                        candidate.block_n1,
+                        candidate.block_m2,
+                        candidate.block_n2,
+                    )
+                    not in {(32, 32, 32, 32), (32, 64, 64, 32)}
+                ]
         elif head_dim <= 256:
             default_config = config_map[capability_class](head_dim)
         else:
@@ -1956,6 +1978,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         dtype: Any,
         *,
         seq_len: sympy.Expr | None = None,
+        prefer_causal_dq_load_balance: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
@@ -2102,6 +2125,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         dtype: Any,
         *,
         seq_len: sympy.Expr | None = None,
+        prefer_causal_dq_load_balance: bool = False,
     ) -> list[FlexBwDConfig]:
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 

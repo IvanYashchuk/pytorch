@@ -247,6 +247,7 @@ class TestRubinDefaultFlexBackwardConfig(TestCase):
         heuristic = CUDAConfigHeuristic()
         rubin_short = FlexBwDConfig(32, 32, 32, 32, 3, 4)
         rubin_long = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        rubin_load_balanced = FlexBwDConfig(64, 64, 64, 32, 3, 8)
         sm10x = FlexBwDConfig(64, 128, 128, 64, 3, 4)
 
         with (
@@ -260,6 +261,24 @@ class TestRubinDefaultFlexBackwardConfig(TestCase):
             self.assertEqual(
                 heuristic.get_flex_attn_bwd_configs(128, torch.bfloat16, seq_len=768),
                 [rubin_long],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(
+                    128,
+                    torch.bfloat16,
+                    seq_len=511,
+                    prefer_causal_dq_load_balance=True,
+                ),
+                [rubin_short],
+            )
+            self.assertEqual(
+                heuristic.get_flex_attn_bwd_configs(
+                    128,
+                    torch.bfloat16,
+                    seq_len=512,
+                    prefer_causal_dq_load_balance=True,
+                ),
+                [rubin_load_balanced],
             )
             self.assertEqual(
                 heuristic.get_flex_attn_bwd_configs(128, torch.float16),
@@ -291,6 +310,55 @@ class TestRubinDefaultFlexBackwardConfig(TestCase):
             )
         self.assertEqual(short_configs.count(rubin_short), 1)
         self.assertEqual(long_configs.count(rubin_long), 1)
+
+    def test_max_autotune_prunes_dominated_load_balanced_family(self):
+        heuristic = CUDAConfigHeuristic()
+        rubin_short_tiles = (32, 32, 32, 32)
+        rubin_long = FlexBwDConfig(32, 64, 64, 32, 3, 4)
+        rubin_load_balanced = FlexBwDConfig(64, 64, 64, 32, 3, 8)
+        with (
+            inductor_config.patch(max_autotune=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 7)),
+        ):
+            below_crossover = heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len=511,
+                prefer_causal_dq_load_balance=True,
+            )
+            at_crossover = heuristic.get_flex_attn_bwd_configs(
+                128,
+                torch.bfloat16,
+                seq_len=512,
+                prefer_causal_dq_load_balance=True,
+            )
+
+        self.assertTrue(
+            any(
+                (
+                    candidate.block_m1,
+                    candidate.block_n1,
+                    candidate.block_m2,
+                    candidate.block_n2,
+                )
+                == rubin_short_tiles
+                for candidate in below_crossover
+            )
+        )
+        self.assertFalse(
+            any(
+                (
+                    candidate.block_m1,
+                    candidate.block_n1,
+                    candidate.block_m2,
+                    candidate.block_n2,
+                )
+                == rubin_short_tiles
+                for candidate in at_crossover
+            )
+        )
+        self.assertNotIn(rubin_long, at_crossover)
+        self.assertEqual(at_crossover.count(rubin_load_balanced), 1)
 
 
 if __name__ == "__main__":
