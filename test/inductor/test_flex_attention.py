@@ -800,12 +800,20 @@ class TestFlexAttentionBwdMaskOptions(InductorTestCase):
         choices = InductorChoices()
 
         self.assertIs(
-            choices.override_best_choice(middle, {middle: 1.0, long: 1.004}),
+            choices.override_best_choice(middle, {middle: 1.0, long: 1.009}),
             long,
         )
         self.assertIs(
-            choices.override_best_choice(middle, {middle: 1.0, long: 1.006}),
+            choices.override_best_choice(middle, {middle: 1.0, long: 1.011}),
             middle,
+        )
+        middle_200 = Choice(FlexBwDConfig(32, 64, 64, 32, 3, 8), policy=2001)
+        long_200 = Choice(FlexBwDConfig(64, 64, 64, 32, 3, 8), policy=2001)
+        self.assertIs(
+            choices.override_best_choice(
+                middle_200, {middle_200: 1.0, long_200: 1.001}
+            ),
+            middle_200,
         )
         different_mask = Choice(
             FlexBwDConfig(64, 64, 64, 32, 3, 8), mask="'traversal_scoped'"

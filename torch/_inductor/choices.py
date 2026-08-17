@@ -136,7 +136,7 @@ class InductorChoices:
         200: (2001, 257, 609),
         212: (2122, 288, 528),
     }
-    _FLEX_CAUSAL_DQ_MAX_NEAR_TIE_RATIO = 1.005
+    _FLEX_CAUSAL_DQ_MAX_NEAR_TIE_RATIO = 1.01
 
     def get_config_heuristics(
         self, device_type: str | None = "cuda"
@@ -634,7 +634,11 @@ class InductorChoices:
             )
 
         identity = flex_policy_identity(best_choice)
-        if identity is None or identity[2:] != (32, 64, 64, 32, 3, 8):
+        if (
+            identity is None
+            or identity[0] != self._FLEX_CAUSAL_DQ_LAUNCH_BANDS[212][0]
+            or identity[2:] != (32, 64, 64, 32, 3, 8)
+        ):
             return best_choice
 
         best_time = timings[best_choice]
