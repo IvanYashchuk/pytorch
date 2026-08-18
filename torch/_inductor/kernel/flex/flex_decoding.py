@@ -11,7 +11,7 @@ from torch._dynamo.device_interface import get_interface_for_device
 from torch._inductor.virtualized import ops, V
 from torch.utils._sympy.functions import FloorDiv, Max, Min, Mod
 
-from ... import ir
+from ... import config, ir
 from ...ir import FixedLayout, FlexibleLayout
 from ...lowering import empty, empty_strided, lowerings
 from ...runtime.runtime_utils import ceildiv, is_power_of_2, next_power_of_2
@@ -210,6 +210,7 @@ def _get_rubin_flex_decode_runtime_split_policy(
     max_kv_work: int,
     num_block_m: int,
     device: torch.device,
+    use_tma: bool = False,
 ) -> tuple[int, tuple[tuple[int, int, int], ...]] | None:
     """Select the measured long-context Rubin GQA decode split surface."""
     values = (
@@ -245,6 +246,76 @@ def _get_rubin_flex_decode_runtime_split_policy(
     ) or properties.multi_processor_count not in (212, 216):
         return None
     sm_count = properties.multi_processor_count
+    if use_tma and sm_count == 212 and int(B) == 64:
+        return (
+            16,
+            (
+                (20, 64, 15),
+                (22, 64, 14),
+                (24, 64, 13),
+                (26, 64, 12),
+                (28, 64, 11),
+                (32, 64, 10),
+                (35, 64, 16),
+                (50, 64, 14),
+                (59, 64, 13),
+            ),
+        )
+    if use_tma and sm_count == 212:
+        return (
+            16,
+            (
+                (22, 64, 13),
+                (25, 64, 12),
+                (28, 64, 11),
+                (31, 64, 10),
+                (34, 64, 16),
+                (46, 64, 14),
+                (53, 64, 13),
+                (58, 64, 12),
+                (64, 64, 16),
+                (73, 64, 15),
+                (79, 64, 9),
+                (87, 64, 16),
+                (103, 64, 7),
+                (118, 64, 16),
+            ),
+        )
+    if use_tma and sm_count == 216 and int(B) == 64:
+        return (
+            16,
+            (
+                (22, 64, 15),
+                (24, 64, 14),
+                (26, 64, 13),
+                (28, 64, 12),
+                (31, 64, 11),
+                (34, 64, 10),
+                (37, 64, 16),
+                (50, 64, 14),
+                (60, 64, 13),
+            ),
+        )
+    if use_tma and sm_count == 216:
+        return (
+            16,
+            (
+                (22, 64, 13),
+                (26, 64, 12),
+                (29, 64, 11),
+                (32, 64, 10),
+                (37, 64, 16),
+                (47, 64, 14),
+                (54, 64, 13),
+                (59, 64, 12),
+                (65, 64, 16),
+                (75, 64, 15),
+                (82, 64, 9),
+                (90, 64, 16),
+                (104, 64, 7),
+                (121, 64, 10),
+            ),
+        )
     if sm_count == 212 and int(B) == 64:
         return (
             16,
@@ -314,6 +385,41 @@ def _get_rubin_flex_decode_runtime_split_policy(
             (111, 64, 5),
             (127, 64, 14),
         ),
+    )
+
+
+def _get_flex_decode_tma_candidates(
+    kernel_options: dict[str, Any],
+    rubin_tma_policy_selected: bool,
+    tma_legal: bool,
+    max_autotune: bool,
+    xpu_available: bool,
+) -> tuple[bool, ...]:
+    """Choose descriptor-load variants without overriding explicit options."""
+    if "USE_TMA" in kernel_options:
+        candidates = (bool(kernel_options["USE_TMA"]),)
+    elif rubin_tma_policy_selected:
+        candidates = (False, True) if max_autotune else (True,)
+    else:
+        candidates = (xpu_available,)
+    if any(candidates) and not tma_legal:
+        return (False,)
+    return candidates
+
+
+def _use_rubin_flex_decode_tma_policy(
+    runtime_policy_selected: bool, device: torch.device
+) -> bool:
+    """Limit automatic descriptor loads to the measured 212/216-SM surfaces."""
+    if (
+        not runtime_policy_selected
+        or device.type != "cuda"
+        or torch.version.hip is not None
+    ):
+        return False
+    properties = get_interface_for_device(device.type).get_device_properties(device)
+    return (properties.major, properties.minor) == (10, 7) and (
+        properties.multi_processor_count in (212, 216)
     )
 
 
@@ -560,6 +666,8 @@ def create_flex_decoding_kernel(*args, **kwargs):
         "RUNTIME_SPLIT_KV_BATCH_THRESHOLD",
         "RUNTIME_SPLIT_KV_MIN_BLOCKS",
     )
+    rubin_runtime_policy_selected = False
+    runtime_policy = None
     if not any(name in kernel_options for name in runtime_option_names):
         runtime_policy = _get_rubin_flex_decode_runtime_split_policy(
             B,
@@ -575,9 +683,44 @@ def create_flex_decoding_kernel(*args, **kwargs):
             query.get_device(),
         )
         if runtime_policy is not None:
-            runtime_default, runtime_bands = runtime_policy
-            kernel_options["RUNTIME_SPLIT_KV_DEFAULT"] = runtime_default
-            kernel_options["RUNTIME_SPLIT_KV_BANDS"] = runtime_bands
+            rubin_runtime_policy_selected = True
+    xpu_available = bool(torch.xpu.is_available())
+    rubin_tma_policy_selected = _use_rubin_flex_decode_tma_policy(
+        rubin_runtime_policy_selected, query.get_device()
+    )
+    tma_requested = (
+        bool(kernel_options.get("USE_TMA", False))
+        or rubin_tma_policy_selected
+        or xpu_available
+    )
+    use_tma_candidates = _get_flex_decode_tma_candidates(
+        kernel_options,
+        rubin_tma_policy_selected,
+        not tma_requested or can_use_tma(query, key, value),
+        config.max_autotune,
+        xpu_available,
+    )
+    if runtime_policy is not None and any(use_tma_candidates):
+        tma_runtime_policy = _get_rubin_flex_decode_runtime_split_policy(
+            B,
+            Hq,
+            Hkv,
+            seq_len_q,
+            qk_head_dim,
+            v_head_dim,
+            dtype,
+            SPARSE_KV_BLOCK_SIZE,
+            max_kv_work,
+            num_block_m,
+            query.get_device(),
+            use_tma=True,
+        )
+        if tma_runtime_policy is not None:
+            runtime_policy = tma_runtime_policy
+    if runtime_policy is not None:
+        runtime_default, runtime_bands = runtime_policy
+        kernel_options["RUNTIME_SPLIT_KV_DEFAULT"] = runtime_default
+        kernel_options["RUNTIME_SPLIT_KV_BANDS"] = runtime_bands
     runtime_split_bands = kernel_options.get("RUNTIME_SPLIT_KV_BANDS")
     runtime_split_kv = bool(kernel_options.get("RUNTIME_SPLIT_KV", False)) or (
         runtime_split_bands is not None
@@ -799,8 +942,16 @@ def create_flex_decoding_kernel(*args, **kwargs):
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
 
-    for conf in configs:
+    # Tensor descriptors remove most explicit global-to-shared copies from the
+    # measured Rubin paged-decode producer. Default takes the broad winner;
+    # max-autotune retains the descriptor-off body as an independent candidate.
+    seen_choice_identities: set[tuple[Any, ...]] = set()
+
+    for conf, use_tma in (
+        (conf, use_tma) for conf in configs for use_tma in use_tma_candidates
+    ):
         cur_kernel_options = original_kernel_options.copy()
+        cur_kernel_options["USE_TMA"] = use_tma
         # Remove prefix for forward kernels options and delete backward kernel options.
         for k in list(cur_kernel_options.keys()):
             if k.startswith("fwd_"):
@@ -839,16 +990,33 @@ def create_flex_decoding_kernel(*args, **kwargs):
                 "num_buffers_warp_spec", num_buffers_warp_spec
             )
 
-        # Intel GPU enables TMA by default
-        cur_kernel_options.setdefault("USE_TMA", bool(torch.xpu.is_available()))
-
-        if cur_kernel_options["USE_TMA"] and not can_use_tma(query, key, value):
-            cur_kernel_options["USE_TMA"] = False
-
         # Add ROCm-specific parameters if they exist in the config
         for attrib in ["kpack", "matrix_instr_nonkdim", "waves_per_eu"]:
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        # Configs can collapse to the same effective launch after sparse-block
+        # clamping (for example, BLOCK_N=128 and BLOCK_N=64 both becoming 64).
+        # Avoid compiling and benchmarking duplicate choices while retaining
+        # USE_TMA as an independent autotune identity.
+        choice_identity = tuple(
+            cur_kernel_options.get(name)
+            for name in (
+                "BLOCK_M",
+                "BLOCK_N",
+                "num_warps",
+                "num_stages",
+                "USE_TMA",
+                "num_consumer_groups",
+                "num_buffers_warp_spec",
+                "kpack",
+                "matrix_instr_nonkdim",
+                "waves_per_eu",
+            )
+        )
+        if choice_identity in seen_choice_identities:
+            continue
+        seen_choice_identities.add(choice_identity)
 
         template_input_nodes = [
             query,

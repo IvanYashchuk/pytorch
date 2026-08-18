@@ -3346,6 +3346,44 @@ class TestFxGraphCacheHashing(TestCase):
         details = FxGraphHashDetails(gm, example_inputs, cast(Any, {}), [])
         return FxGraphCachePickler(gm).get_key(details)
 
+    def test_target_sm_count_affects_cache_key(self):
+        with FakeTensorMode():
+            target_input = torch.empty(4, device="cuda:1")
+
+        sm_counts = {0: 212, 1: 216}
+
+        def get_device_properties(device):
+            index = device.index if isinstance(device, torch.device) else int(device)
+            return types.SimpleNamespace(
+                name="test-gpu",
+                gcnArchName="test-gcn",
+                major=10,
+                minor=7,
+                multi_processor_count=sm_counts[index],
+            )
+
+        CacheBase.get_system.cache_clear()
+        try:
+            with (
+                mock.patch("torch._inductor.runtime.triton_compat.HAS_TRITON", False),
+                mock.patch.object(torch.cuda, "current_device", return_value=0),
+                mock.patch.object(
+                    torch.cuda,
+                    "get_device_properties",
+                    side_effect=get_device_properties,
+                ),
+                mock.patch.object(torch.version, "cuda", "test-cuda"),
+            ):
+                key_216 = self._fx_graph_cache_key(None, [target_input])
+                sm_counts[1] = 212
+                key_212 = self._fx_graph_cache_key(None, [target_input])
+        finally:
+            CacheBase.get_system.cache_clear()
+
+        # CacheBase remains memoized from current device 0. The target input's
+        # SM count must independently distinguish these graph keys.
+        self.assertNotEqual(key_216, key_212)
+
     def _no_input_factory_graph(self, device=None):
         graph = torch.fx.Graph()
         kwargs: dict[str, Any] = {"dtype": torch.float32}

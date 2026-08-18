@@ -1478,6 +1478,49 @@ class FxGraphHashDetails:
                     return True
         return False
 
+    @classmethod
+    def _accelerator_device_properties(
+        cls, example_inputs: Sequence[InputType]
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Return codegen-relevant properties for CUDA-family input devices."""
+        devices: set[torch.device] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                if value.device.type != "cpu":
+                    devices.add(value.device)
+            elif isinstance(value, (list, tuple, OrderedSet, frozenset)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in itertools.chain(value.keys(), value.values()):
+                    collect(item)
+
+        collect(example_inputs)
+        result = []
+        for device in sorted(devices, key=str):
+            if device.type not in ("cuda", "hip"):
+                continue
+            try:
+                properties = torch.cuda.get_device_properties(device)
+            except (AssertionError, RuntimeError):
+                # Fake-device cache tests and CPU-only installations still
+                # need a stable device identity even though no hardware
+                # properties are queryable.
+                result.append((str(device),))
+                continue
+            result.append(
+                (
+                    str(device),
+                    getattr(properties, "name", None),
+                    getattr(properties, "gcnArchName", None),
+                    getattr(properties, "major", None),
+                    getattr(properties, "minor", None),
+                    properties.multi_processor_count,
+                )
+            )
+        return tuple(result)
+
     def __init__(
         self,
         gm: torch.fx.GraphModule | None,
@@ -1499,6 +1542,9 @@ class FxGraphHashDetails:
             else:
                 processed_inputs.append(inp)
         self.example_inputs = processed_inputs
+        self.accelerator_device_properties = self._accelerator_device_properties(
+            example_inputs
+        )
         self.cache_key_tag = cconfig.cache_key_tag
         self.nested_inductor_config_patches = (
             _collect_nested_region_inductor_config_patches_for_hash(gm)

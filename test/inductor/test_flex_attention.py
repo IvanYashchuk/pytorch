@@ -5448,6 +5448,105 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 expected_c128,
             )
 
+    def test_flex_decode_rubin_tma_runtime_split_policy(self):
+        from torch._inductor.kernel.flex.flex_decoding import (
+            _get_rubin_flex_decode_runtime_split_policy,
+        )
+
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        expected = {
+            212: {
+                64: (
+                    (20, 64, 15),
+                    (22, 64, 14),
+                    (24, 64, 13),
+                    (26, 64, 12),
+                    (28, 64, 11),
+                    (32, 64, 10),
+                    (35, 64, 16),
+                    (50, 64, 14),
+                    (59, 64, 13),
+                ),
+                128: (
+                    (22, 64, 13),
+                    (25, 64, 12),
+                    (28, 64, 11),
+                    (31, 64, 10),
+                    (34, 64, 16),
+                    (46, 64, 14),
+                    (53, 64, 13),
+                    (58, 64, 12),
+                    (64, 64, 16),
+                    (73, 64, 15),
+                    (79, 64, 9),
+                    (87, 64, 16),
+                    (103, 64, 7),
+                    (118, 64, 16),
+                ),
+            },
+            216: {
+                64: (
+                    (22, 64, 15),
+                    (24, 64, 14),
+                    (26, 64, 13),
+                    (28, 64, 12),
+                    (31, 64, 11),
+                    (34, 64, 10),
+                    (37, 64, 16),
+                    (50, 64, 14),
+                    (60, 64, 13),
+                ),
+                128: (
+                    (22, 64, 13),
+                    (26, 64, 12),
+                    (29, 64, 11),
+                    (32, 64, 10),
+                    (37, 64, 16),
+                    (47, 64, 14),
+                    (54, 64, 13),
+                    (59, 64, 12),
+                    (65, 64, 16),
+                    (75, 64, 15),
+                    (82, 64, 9),
+                    (90, 64, 16),
+                    (104, 64, 7),
+                    (121, 64, 10),
+                ),
+            },
+        }
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            for sm_count, policies in expected.items():
+                device_interface.get_device_properties.return_value = (
+                    types.SimpleNamespace(
+                        multi_processor_count=sm_count, major=10, minor=7
+                    )
+                )
+                for batch, bands in policies.items():
+                    self.assertEqual(
+                        _get_rubin_flex_decode_runtime_split_policy(
+                            batch,
+                            32,
+                            2,
+                            1,
+                            256,
+                            256,
+                            torch.bfloat16,
+                            64,
+                            142016,
+                            1,
+                            device,
+                            use_tma=True,
+                        ),
+                        (16, bands),
+                    )
+
     def test_flex_decode_rubin_runtime_split_policy_fails_closed(self):
         from torch._inductor.kernel.flex.flex_decoding import (
             _get_rubin_flex_decode_runtime_split_policy,
@@ -5485,6 +5584,48 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             for case in cases:
                 self.assertIsNone(_get_rubin_flex_decode_runtime_split_policy(*case))
             self.assertIsNone(_get_rubin_flex_decode_runtime_split_policy(*base))
+
+    def test_flex_decode_rubin_tma_candidates(self):
+        from torch._inductor.kernel.flex.flex_decoding import (
+            _get_flex_decode_tma_candidates,
+            _use_rubin_flex_decode_tma_policy,
+        )
+
+        choose = _get_flex_decode_tma_candidates
+        self.assertEqual(choose({}, True, True, False, False), (True,))
+        self.assertEqual(choose({}, True, True, True, False), (False, True))
+        self.assertEqual(
+            choose({"USE_TMA": False}, True, True, True, False), (False,)
+        )
+        self.assertEqual(
+            choose({"USE_TMA": True}, True, True, True, False), (True,)
+        )
+        self.assertEqual(
+            choose({"USE_TMA": True}, True, False, True, False), (False,)
+        )
+        self.assertEqual(choose({}, True, False, True, False), (False,))
+        self.assertEqual(choose({}, False, True, True, False), (False,))
+        self.assertEqual(choose({}, False, True, False, True), (True,))
+
+        device = torch.device("cuda", 0)
+        device_interface = mock.Mock()
+        with (
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch(
+                "torch._inductor.kernel.flex.flex_decoding.get_interface_for_device",
+                return_value=device_interface,
+            ),
+        ):
+            for sm_count, expected in ((200, False), (212, True), (216, True)):
+                device_interface.get_device_properties.return_value = (
+                    types.SimpleNamespace(
+                        multi_processor_count=sm_count, major=10, minor=7
+                    )
+                )
+                self.assertEqual(
+                    _use_rubin_flex_decode_tma_policy(True, device), expected
+                )
+            self.assertFalse(_use_rubin_flex_decode_tma_policy(False, device))
 
     def test_flex_decode_split_policy_uses_largest_sparse_list(self):
         from torch._inductor.kernel.flex.flex_decoding import (
