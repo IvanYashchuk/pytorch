@@ -5349,6 +5349,73 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         device = torch.device("cuda", 0)
         device_interface = mock.Mock()
         device_interface.get_device_properties.return_value = properties
+        if sm_count == 212:
+            expected_c64 = (
+                16,
+                (
+                    (18, 64, 14),
+                    (20, 64, 13),
+                    (22, 64, 12),
+                    (24, 64, 11),
+                    (26, 64, 10),
+                    (28, 64, 9),
+                    (33, 64, 16),
+                    (39, 64, 14),
+                    (44, 64, 13),
+                    (55, 64, 5),
+                    (63, 64, 13),
+                ),
+            )
+            expected_c128 = (
+                16,
+                (
+                    (24, 64, 9),
+                    (32, 64, 16),
+                    (38, 64, 7),
+                    (44, 64, 13),
+                    (47, 64, 6),
+                    (52, 64, 16),
+                    (58, 64, 14),
+                    (80, 64, 16),
+                    (111, 64, 5),
+                    (127, 64, 14),
+                ),
+            )
+        else:
+            expected_c64 = (
+                16,
+                (
+                    (18, 64, 15),
+                    (19, 64, 14),
+                    (21, 64, 13),
+                    (23, 64, 12),
+                    (24, 64, 11),
+                    (27, 64, 10),
+                    (30, 64, 9),
+                    (34, 64, 16),
+                    (39, 64, 15),
+                    (42, 64, 7),
+                    (44, 64, 13),
+                    (55, 64, 5),
+                    (63, 64, 13),
+                ),
+            )
+            expected_c128 = (
+                16,
+                (
+                    (24, 64, 9),
+                    (34, 64, 16),
+                    (38, 64, 7),
+                    (43, 64, 13),
+                    (47, 64, 6),
+                    (53, 64, 11),
+                    (57, 64, 10),
+                    (63, 64, 14),
+                    (80, 64, 16),
+                    (111, 64, 5),
+                    (127, 64, 14),
+                ),
+            )
         with (
             mock.patch.object(torch.version, "hip", None),
             mock.patch(
@@ -5360,16 +5427,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 _get_rubin_flex_decode_runtime_split_policy(
                     64, 32, 2, 1, 256, 256, torch.bfloat16, 64, 142016, 1, device
                 ),
-                (
-                    16,
-                    (
-                        (20, 64, 12),
-                        (28, 64, 9),
-                        (40, 64, 13),
-                        (55, 64, 5),
-                        (63, 64, 13),
-                    ),
-                ),
+                expected_c64,
             )
             self.assertEqual(
                 _get_rubin_flex_decode_runtime_split_policy(
@@ -5385,17 +5443,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                     1,
                     device,
                 ),
-                (
-                    16,
-                    (
-                        (24, 64, 9),
-                        (40, 64, 6),
-                        (56, 64, 14),
-                        (80, 64, 16),
-                        (111, 64, 5),
-                        (127, 64, 14),
-                    ),
-                ),
+                expected_c128,
             )
 
     def test_flex_decode_rubin_runtime_split_policy_fails_closed(self):
@@ -5433,9 +5481,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             ),
         ):
             for case in cases:
-                self.assertIsNone(
-                    _get_rubin_flex_decode_runtime_split_policy(*case)
-                )
+                self.assertIsNone(_get_rubin_flex_decode_runtime_split_policy(*case))
             self.assertIsNone(_get_rubin_flex_decode_runtime_split_policy(*base))
 
     def test_flex_decode_split_policy_uses_largest_sparse_list(self):

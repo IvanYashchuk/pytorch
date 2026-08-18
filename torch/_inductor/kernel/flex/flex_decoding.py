@@ -239,18 +239,60 @@ def _get_rubin_flex_decode_runtime_split_policy(
     ):
         return None
     properties = get_interface_for_device(device.type).get_device_properties(device)
-    if (
-        (properties.major, properties.minor) != (10, 7)
-        or properties.multi_processor_count not in (212, 216)
-    ):
+    if (properties.major, properties.minor) != (
+        10,
+        7,
+    ) or properties.multi_processor_count not in (212, 216):
         return None
+    sm_count = properties.multi_processor_count
+    if sm_count == 212 and int(B) == 64:
+        return (
+            16,
+            (
+                (18, 64, 14),
+                (20, 64, 13),
+                (22, 64, 12),
+                (24, 64, 11),
+                (26, 64, 10),
+                (28, 64, 9),
+                (33, 64, 16),
+                (39, 64, 14),
+                (44, 64, 13),
+                (55, 64, 5),
+                (63, 64, 13),
+            ),
+        )
+    if sm_count == 212:
+        return (
+            16,
+            (
+                (24, 64, 9),
+                (32, 64, 16),
+                (38, 64, 7),
+                (44, 64, 13),
+                (47, 64, 6),
+                (52, 64, 16),
+                (58, 64, 14),
+                (80, 64, 16),
+                (111, 64, 5),
+                (127, 64, 14),
+            ),
+        )
     if int(B) == 64:
         return (
             16,
             (
-                (20, 64, 12),
-                (28, 64, 9),
-                (40, 64, 13),
+                (18, 64, 15),
+                (19, 64, 14),
+                (21, 64, 13),
+                (23, 64, 12),
+                (24, 64, 11),
+                (27, 64, 10),
+                (30, 64, 9),
+                (34, 64, 16),
+                (39, 64, 15),
+                (42, 64, 7),
+                (44, 64, 13),
                 (55, 64, 5),
                 (63, 64, 13),
             ),
@@ -259,8 +301,13 @@ def _get_rubin_flex_decode_runtime_split_policy(
         16,
         (
             (24, 64, 9),
-            (40, 64, 6),
-            (56, 64, 14),
+            (34, 64, 16),
+            (38, 64, 7),
+            (43, 64, 13),
+            (47, 64, 6),
+            (53, 64, 11),
+            (57, 64, 10),
+            (63, 64, 14),
             (80, 64, 16),
             (111, 64, 5),
             (127, 64, 14),
