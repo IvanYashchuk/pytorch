@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from .output_graph import OutputGraph
     from .source import Source
     from .variables.base import VariableTracker
+    from .variables.lists import ListVariable
+    from .codegen import GraphOutputEntry
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,20 @@ class HostCall:
 
 
 @dataclass(frozen=True)
+class ListReplayItem:
+    tracker: str
+    source: OperandSource | None
+    graph_output: int | None
+    constant_int: int | None
+
+
+@dataclass(frozen=True)
+class ListReplayWrite:
+    target: OperandSource | None
+    items: tuple[ListReplayItem, ...]
+
+
+@dataclass(frozen=True)
 class GuardedFrameEvidence:
     frame_code: CodeType
     emitted_code: CodeType
@@ -87,6 +103,7 @@ class GuardedFrameEvidence:
     resumes: tuple[ResumeCall, ...]
     host_calls: tuple[HostCall, ...]
     replayed_mutations: tuple[str, ...]
+    list_replays: tuple[ListReplayWrite, ...]
 
 
 @dataclass
@@ -187,7 +204,6 @@ def _operand(
     variable: "VariableTracker",
     locals_: "dict[str, VariableTracker]",
 ) -> CallOperand:
-    from .variables.constant import ConstantVariable
     from .variables.misc import GetAttrVariable
 
     variable = _peek(variable)
@@ -201,20 +217,55 @@ def _operand(
                 (*parent.attributes, variable.name),
                 parent.entry_argument,
             )
-    constant = None
+    return CallOperand(
+        type(variable).__name__,
+        source,
+        tuple(name for name, value in locals_.items() if _peek(value) is variable),
+        _constant_int(variable),
+    )
+
+
+def _constant_int(variable: "VariableTracker") -> int | None:
+    from .variables.constant import ConstantVariable
+
     if (
         type(variable) is ConstantVariable
         and variable.source is None
         and type(variable.value) is int
         and -(2**31) <= variable.value < 2**31
     ):
-        constant = variable.value
-    return CallOperand(
-        type(variable).__name__,
-        source,
-        tuple(name for name, value in locals_.items() if _peek(value) is variable),
-        constant,
-    )
+        return variable.value
+    return None
+
+
+def observe_list_replay(
+    variable: "ListVariable", graph_outputs: "dict[int, GraphOutputEntry]"
+) -> ListReplayWrite:
+    """Project a native list reconstruction and its observed direct output uses."""
+    from .variables.tensor import TensorVariable
+
+    items = []
+    for original in variable.items:
+        value = _peek(original)
+        slot = None
+        if type(value) is TensorVariable and value.source is None:
+            slot = next(
+                (
+                    entry.index
+                    for entry in graph_outputs.values()
+                    if entry.variable is value
+                ),
+                None,
+            )
+        items.append(
+            ListReplayItem(
+                type(value).__name__,
+                _operand_source(value.source),
+                slot,
+                _constant_int(value),
+            )
+        )
+    return ListReplayWrite(_operand_source(variable.source), tuple(items))
 
 
 def observe_host_call(
@@ -287,5 +338,6 @@ def record_guarded_frame(
             tuple(output.region_resumes or ()),
             tuple(output.region_host_calls or ()),
             replayed_mutations,
+            tuple(output.region_list_replays or ()),
         )
     )

@@ -52,6 +52,7 @@ from .bytecode_transformation import (
 )
 from .codegen import PyCodegen
 from .exc import collapse_resume_frames, get_stack_above_dynamo, unimplemented
+from .region_evidence import ListReplayWrite, observe_list_replay
 from .source import AttrSource, GlobalSource, LocalCellSource, Source, TempLocalSource
 from .utils import (
     is_frozen_dataclass,
@@ -1525,6 +1526,8 @@ class SideEffects:
                 side_effect_messages.append(msg)
 
         suffixes: list[list[Instruction]] = []
+        capture = cg.tx.output.region_list_replays if log_side_effects else None
+        observed: list[ListReplayWrite] | None = [] if capture is not None else None
         for var in self._get_modified_vars():
             # When replay_side_effects=False, only update variables with TempLocalSource
             if not config.replay_side_effects and not isinstance(
@@ -1543,10 +1546,19 @@ class SideEffects:
             if handler is None:
                 raise AssertionError(type(var))
             handler.codegen(ctx)
+            if (
+                observed is not None
+                and handler.codegen is _codegen_list_mutation
+                and type(var) is variables.ListVariable
+                and type(var.mutation_type) is ValueMutationExisting
+            ):
+                observed.append(observe_list_replay(var, cg.graph_outputs))
 
         # do all the actual mutations at the very end to handle dependencies
         for suffix in reversed(suffixes):
             cg.extend_output(suffix)
+        if capture is not None and observed is not None:
+            capture.extend(reversed(observed))
 
         # Send batched structured trace for all side effects in this compilation
         if log_side_effects and side_effect_messages:
