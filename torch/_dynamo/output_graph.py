@@ -124,7 +124,7 @@ from .graph_id_filter import (
 from .graph_region_tracker import GraphRegionTracker
 from .guards import GuardBuilder, install_guard
 from .mutation_guard import is_dynamic_nn_module
-from .region_evidence import capture_active, GraphInput, ResumeCall, TensorCall
+from .region_evidence import capture_active, GraphInput, HostCall, ResumeCall, TensorCall
 from .side_effects import AttributeMutationExisting, SideEffects, ValueMutationExisting
 from .source import (
     _get_source_debug_name,
@@ -770,6 +770,9 @@ class OutputGraph(OutputGraphCommon):
             [] if capture_active() else None
         )
         self.region_resumes: list[ResumeCall] | None = (
+            [] if self.region_tensor_calls is not None else None
+        )
+        self.region_host_calls: list[HostCall] | None = (
             [] if self.region_tensor_calls is not None else None
         )
 

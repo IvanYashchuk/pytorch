@@ -127,7 +127,7 @@ from .polyfills import (
     impl_MATCH_KEYS,
     impl_MATCH_SEQUENCE,
 )
-from .region_evidence import ResumeCall, resume_site
+from .region_evidence import observe_host_call, ResumeCall, resume_site
 from .replay_record import ExecutionRecorder
 from .resume_execution import (
     ContinueExecutionCache,
@@ -1201,6 +1201,28 @@ def break_graph_if_unsupported(
             # naturally reconstructs the wrapper via LOAD_GLOBAL.
             if self.parent is not None:
                 self._maybe_replace_warnings_warn_on_stack(inst)
+
+            if (
+                self.output.region_host_calls is not None
+                and self.parent is None
+                and sys.version_info >= (3, 13)
+                and inst.opname in ("CALL", "CALL_KW")
+                and inst.arg is not None
+                and inst.offset is not None
+                and self.kw_names is None
+            ):
+                has_keywords = inst.opname == "CALL_KW"
+                count = inst.arg + 2 + has_keywords
+                if len(self.stack) >= count:
+                    host = observe_host_call(
+                        self.f_code,
+                        inst.offset,
+                        self.stack[-count:],
+                        self.symbolic_locals,
+                        has_keywords,
+                    )
+                    if host is not None:
+                        self.output.region_host_calls.append(host)
 
             log.debug("%s triggered compile", inst.opname)
             all_stack_locals_metadata = self.output.compile_subgraph(

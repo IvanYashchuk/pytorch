@@ -1868,8 +1868,9 @@ def _compile(
         if tracer_output.output_graph is None:
             raise AssertionError("tracer_output.output_graph must not be None")
         output = tracer_output.output_graph
+        replayed_mutations = tuple(output.get_replayed_side_effect_source_refs())
         code_context.get_context(out_code)[_BYTECODE_HOOK_SIDE_EFFECTS_CONTEXT_KEY] = (
-            tuple(output.get_replayed_side_effect_source_refs())
+            replayed_mutations
         )
 
         for idx, hook in enumerate(_bytecode_hooks.values()):
@@ -2000,7 +2001,9 @@ def _compile(
             # they are benign and do not generate any new graphs.
             hooks.guard_export_fn(output.guards)
 
-        record_guarded_frame(output, code, emitted_code, out_code, compile_id)
+        record_guarded_frame(
+            output, code, emitted_code, out_code, compile_id, replayed_mutations
+        )
         return wrap_guarded_code(guarded_code), tracer_output
 
     metrics_context = get_metrics_context()
