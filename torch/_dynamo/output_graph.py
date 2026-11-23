@@ -124,6 +124,7 @@ from .graph_id_filter import (
 from .graph_region_tracker import GraphRegionTracker
 from .guards import GuardBuilder, install_guard
 from .mutation_guard import is_dynamic_nn_module
+from .region_evidence import capture_active, GraphInput, ResumeCall, TensorCall
 from .side_effects import AttributeMutationExisting, SideEffects, ValueMutationExisting
 from .source import (
     _get_source_debug_name,
@@ -765,6 +766,12 @@ class OutputGraph(OutputGraphCommon):
         self.compile_id: int = next(_compile_id_counter)
         # Set of globals installed via install_global* APIs
         self.installed_globals: set[str] = set()
+        self.region_tensor_calls: list[TensorCall] | None = (
+            [] if capture_active() else None
+        )
+        self.region_resumes: list[ResumeCall] | None = (
+            [] if self.region_tensor_calls is not None else None
+        )
 
         # TODO: maybe should just pass the entire f_code in here?  Not
         # sure...
@@ -3205,6 +3212,22 @@ class OutputGraph(OutputGraphCommon):
                 self.export_metadata.graph_input_idx_to_local_source[idx] = arg.source
 
             cg.make_call_generated_code(name)
+            if self.region_tensor_calls is not None:
+                self.region_tensor_calls.append(
+                    TensorCall(
+                        name,
+                        tuple(
+                            GraphInput(
+                                type(arg.source).__name__,
+                                arg.source.local_name
+                                if type(arg.source) is LocalSource
+                                else None,
+                                arg.pass_arg_as_tensor,
+                            )
+                            for arg in self.graphargs
+                        ),
+                    )
+                )
 
             return cg.get_instructions(), cg.get_pycode()
 

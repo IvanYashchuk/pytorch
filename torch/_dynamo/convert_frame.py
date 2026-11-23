@@ -144,6 +144,7 @@ from .pgo import (
     log_frame_dynamic_whitelist,
     put_code_state,
 )
+from .region_evidence import record_guarded_frame
 from .replay_record import ExecutionRecord
 from .resume_execution import TORCH_DYNAMO_RESUME_IN_PREFIX
 from .symbolic_convert import (
@@ -1839,6 +1840,7 @@ def _compile(
                 "compiler collective wasn't run before compilation completed"
             )
         out_code = dynamo_output.bytecode
+        emitted_code = out_code
         if dynamo_output.last_attempt_start_time is not None:
             last_attempt_start_time = dynamo_output.last_attempt_start_time
 
@@ -1998,6 +2000,7 @@ def _compile(
             # they are benign and do not generate any new graphs.
             hooks.guard_export_fn(output.guards)
 
+        record_guarded_frame(output, code, emitted_code, out_code, compile_id)
         return wrap_guarded_code(guarded_code), tracer_output
 
     metrics_context = get_metrics_context()

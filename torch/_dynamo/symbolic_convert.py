@@ -127,6 +127,7 @@ from .polyfills import (
     impl_MATCH_KEYS,
     impl_MATCH_SEQUENCE,
 )
+from .region_evidence import ResumeCall, resume_site
 from .replay_record import ExecutionRecorder
 from .resume_execution import (
     ContinueExecutionCache,
@@ -3820,6 +3821,11 @@ class InstructionTranslatorBase(
         self.output.install_resume_function_global(
             resume_name, new_code, self.f_globals
         )
+        if self.output.region_resumes is not None:
+            if (site := resume_site(new_code)) is not None:
+                self.output.region_resumes.append(
+                    ResumeCall(self.f_code, self.current_instruction.offset, site)
+                )
         if self.package is not None:
             self.package.add_resume_function(
                 new_code, self.f_globals["__name__"], resume_name

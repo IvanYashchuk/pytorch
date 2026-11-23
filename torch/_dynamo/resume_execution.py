@@ -259,6 +259,7 @@ class ReenterWith:
 class ResumeFunctionMetadata:
     code: types.CodeType
     instructions: list[Instruction] = dataclasses.field(default_factory=list)
+    site: tuple[int, int, tuple[str, ...]] | None = None
     # Python 3.11+ fields
     # NOTE: Python 3.11 removed blocks, but for our purposes, a "block" consists
     # of instructions of all exception table entries that have the same target.
@@ -373,7 +374,7 @@ class ContinueExecutionCache:
             )
 
         is_py311_plus = sys.version_info >= (3, 11)
-        meta = ResumeFunctionMetadata(code)
+        meta = ResumeFunctionMetadata(code, site=(resume_offset, nstack, argnames))
 
         def update(
             instructions: list[Instruction], code_options: dict[str, Any]
