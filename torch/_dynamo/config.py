@@ -684,6 +684,9 @@ only_allow_pt2_compliant_ops = False
 # This flag is ignored and maintained for backwards compatibility.
 capture_autograd_function = True
 
+# Attach backend metadata for qualified autograd.Function saved-tensor effects.
+record_autograd_saves = False
+
 # This flag is ignored and maintained for backwards compatibility.
 capture_func_transforms = True
 

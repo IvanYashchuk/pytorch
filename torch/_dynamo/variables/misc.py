@@ -1251,17 +1251,24 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name in ["save_for_backward", "mark_dirty", "mark_non_differentiable"]:
-            return LambdaVariable(
+            result = LambdaVariable(
                 lambda *args, **kwargs: self.call_method(tx, name, list(args), kwargs)
             )
-        if name == "dirty_tensors":
+        elif name == "dirty_tensors":
             if self.dirty_tensors is None:
-                return variables.ConstantVariable.create(None)
-            return variables.TupleVariable(list(self.dirty_tensors))
-        if name == "saved_tensors" and self.saved_tensors is not None:
-            return variables.TupleVariable(list(self.saved_tensors.tensors))
+                result = variables.ConstantVariable.create(None)
+            else:
+                result = variables.TupleVariable(list(self.dirty_tensors))
+        elif name == "saved_tensors" and self.saved_tensors is not None:
+            result = variables.TupleVariable(list(self.saved_tensors.tensors))
+        else:
+            result = super().tp_getattro_impl(tx, name)
 
-        return super().tp_getattro_impl(tx, name)
+        if config.record_autograd_saves:
+            from ..autograd_saved_tensors import observe_context_read
+
+            observe_context_read(self, tx.output.current_tracer.graph, name, result)
+        return result
 
 
 class AutogradEngineVariable(UserDefinedObjectVariable):

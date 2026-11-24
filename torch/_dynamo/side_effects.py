@@ -663,15 +663,22 @@ class SideEffects:
                     AttrSource(cell_source, "cell_contents")
                 )
         if self.has_pending_mutation_of_attr(cellvar, "cell_contents"):
-            return self.load_attr(cellvar, "cell_contents", check=False)
-        if cellvar.pre_existing_contents:
-            return cellvar.pre_existing_contents
-        unimplemented(
-            gb_type="Read uninitialized cell",
-            context=str(cellvar),
-            explanation="Attempted to read a cell variable that has not been populated yet.",
-            hints=[*graph_break_hints.USER_ERROR],
-        )
+            result = self.load_attr(cellvar, "cell_contents", check=False)
+        elif cellvar.pre_existing_contents:
+            result = cellvar.pre_existing_contents
+        else:
+            unimplemented(
+                gb_type="Read uninitialized cell",
+                context=str(cellvar),
+                explanation="Attempted to read a cell variable that has not been populated yet.",
+                hints=[*graph_break_hints.USER_ERROR],
+            )
+
+        if config.record_autograd_saves:
+            from .autograd_saved_tensors import observe_external_cell
+
+            observe_external_cell(result)
+        return result
 
     def load_global(self, gvar: VariableTracker, name: str) -> VariableTracker:
         if not isinstance(gvar, variables.VariableTracker):

@@ -27,7 +27,7 @@ import traceback
 import types
 import warnings
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast, get_args, Literal, Optional, TYPE_CHECKING, Union
 
@@ -280,6 +280,8 @@ def add_call_function(
     kwargs: dict[str, Any],
     flat_example_value: Any,
     config: NestedCompileRegionOptions | None = None,
+    *,
+    node_meta: Mapping[str, Any] | None = None,
 ) -> VariableTracker:
     from .builder import wrap_fx_proxy
 
@@ -300,6 +302,9 @@ def add_call_function(
             raise AssertionError(
                 "Expected proxy node target to be torch._higher_order_ops.invoke_subgraph"
             )
+
+    if node_meta is not None:
+        proxy.node.meta.update(node_meta)
 
     # Store the invocation as a call
     flat_variable = wrap_fx_proxy(
@@ -5295,14 +5300,40 @@ class AutogradFunctionApplyVariable(VariableTracker):
         )
 
         ctx = self.prepare_ctx_vt(tx, args, kwargs)
+        save_trace = None
+        if torch._dynamo.config.record_autograd_saves:
+            from ..autograd_saved_tensors import (
+                AUTOGRAD_SAVED_TENSOR_EFFECTS,
+                SavedTensorTrace,
+            )
 
-        fwd_fn, fwd_out, fwd_graph, fwd_freevars, fwd_graph_output_vts = (
-            self.trace_forward_graph(tx, ctx, fwd_tracer, args, kwargs)
-        )
+            save_trace = SavedTensorTrace(ctx, tuple(args))
 
-        bwd_args, bwd_out, bwd_graph, bwd_freevars, bwd_graph_output_vts = (
-            self.trace_backward_graph(tx, ctx, fwd_tracer, fwd_out, fwd_fn)
-        )
+        with (
+            save_trace.observing() if save_trace is not None else contextlib.nullcontext()
+        ):
+            fwd_fn, fwd_out, fwd_graph, fwd_freevars, fwd_graph_output_vts = (
+                self.trace_forward_graph(tx, ctx, fwd_tracer, args, kwargs)
+            )
+
+        if save_trace is not None:
+            save_trace.prepare_backward(
+                fwd_out, tx.output.side_effects.store_attr_mutations.get(ctx, {})
+            )
+        with (
+            save_trace.observing(backward=True)
+            if save_trace is not None
+            else contextlib.nullcontext()
+        ):
+            bwd_args, bwd_out, bwd_graph, bwd_freevars, bwd_graph_output_vts = (
+                self.trace_backward_graph(tx, ctx, fwd_tracer, fwd_out, fwd_fn)
+            )
+
+        node_meta = None
+        if save_trace is not None:
+            record = save_trace.record(fwd_tracer, bwd_graph, bwd_freevars)
+            if record is not None:
+                node_meta = {AUTOGRAD_SAVED_TENSOR_EFFECTS: record}
 
         self.rewire_bwd_graph_outputs(
             fwd_freevars, bwd_out, bwd_graph, bwd_freevars, args
@@ -5428,7 +5459,12 @@ class AutogradFunctionApplyVariable(VariableTracker):
                 )
 
         flat_variable = add_call_function(
-            tx, autograd_function_apply, p_args, kwargs_for_fn, example_value
+            tx,
+            autograd_function_apply,
+            p_args,
+            kwargs_for_fn,
+            example_value,
+            node_meta=node_meta,
         )
         # type: ignore[arg-type]
         overwrite_tensor_vt_proxy(fwd_graph_output_vts, flat_variable)

@@ -845,6 +845,12 @@ class VariableBuilder:
             )
 
     def _call_impl(self, value: object) -> VariableTracker:
+        if config.record_autograd_saves and isinstance(value, torch.Tensor):
+            from ..autograd_saved_tensors import observe_external_tensor_source
+
+            # Observe before tracker reuse coalesces distinct aliasing sources.
+            observe_external_tensor_source()
+
         self.tx.output.current_tracer.traced_sources.add(self.source)
         if (result := self._reuse_tracked_variable(value)) is not None:
             return result

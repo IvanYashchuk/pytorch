@@ -27,6 +27,9 @@ if HAS_GPU:
     from torch.testing._internal.triton_utils import add_kernel
 
 
+_saved_tensor_alias = None
+
+
 class CustomFunc1(torch.autograd.Function):
     @staticmethod
     def forward(ctx, foo):
@@ -233,6 +236,76 @@ class ModuleWithGradFunc(torch.nn.Module):
 
 
 class AutogradFunctionTests(torch._dynamo.test_case.TestCase):
+    @parametrize("mode", ("leading", "late", "direct_global"))
+    def test_autograd_saved_tensor_effect_record(self, mode):
+        class Save(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, value, unused):
+                ctx.save_for_backward(unused, None, value)
+                return value.sum()
+
+            @staticmethod
+            def backward(ctx, grad):
+                if mode == "late":
+                    grad = grad.sin()
+                _, _, value = ctx.saved_tensors
+                if mode == "direct_global":
+                    return grad * value + _saved_tensor_alias, None
+                return grad * value, None
+
+        def fn(value, unused):
+            return Save.apply(value, unused)
+
+        def capture(enabled):
+            torch._dynamo.reset()
+            backend = torch._dynamo.testing.EagerAndRecordGraphs()
+            value = torch.tensor([1.0, 2.0], requires_grad=True)
+            unused = torch.tensor([3.0, 4.0])
+            with (
+                torch._dynamo.config.patch(record_autograd_saves=enabled),
+                mock.patch.dict(globals(), {"_saved_tensor_alias": unused}),
+            ):
+                output = torch.compile(fn, backend=backend, fullgraph=True)(
+                    value, unused
+                )
+                (grad,) = torch.autograd.grad(output, value, torch.ones_like(output))
+            (graph,) = backend.graphs
+            (call,) = [
+                node
+                for node in graph.graph.nodes
+                if node.op == "call_function"
+                and node.target is torch.ops.higher_order.autograd_function_apply
+            ]
+            return graph, call, output, grad
+
+        key = "autograd_saved_tensor_effects"
+        self.assertFalse(torch._dynamo.config.record_autograd_saves)
+        stock, stock_call, stock_output, stock_grad = capture(False)
+        recorded, call, output, grad = capture(True)
+        self.assertEqual((output, grad), (stock_output, stock_grad))
+        self.assertEqual(call.kwargs, stock_call.kwargs)
+        self.assertEqual(
+            tuple(module.code for module in recorded.modules()),
+            tuple(module.code for module in stock.modules()),
+        )
+        self.assertNotIn(key, stock_call.meta)
+        if mode == "direct_global":
+            self.assertNotIn(key, call.meta)
+            return
+
+        forward = recorded.get_submodule(call.args[0].target)
+        _, (saved,) = forward.graph.output_node().args[0]
+        (unused,) = (
+            node
+            for node in forward.graph.nodes
+            if node.op == "placeholder" and node is not saved
+        )
+        self.assertEqual(call.meta[key]["saved_names"], (unused.name, None, saved.name))
+        self.assertEqual(call.meta[key]["used_slots"], (2,))
+        self.assertEqual(
+            call.meta[key]["read_prefix"], ("call_method:sin",) if mode == "late" else ()
+        )
+
     # Sound behaviors, tested for working capture
     def test_function_ctx_does_not_instantiate_function(self):
         class Foo(torch.autograd.Function):
