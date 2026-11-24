@@ -22,6 +22,7 @@ optimizer-specific optimizations and safety guarantees.
 
 import logging
 import weakref
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, cast, TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from torch._guards import Source
 from torch._logging import getArtifactLogger
 from torch.utils._pytree import tree_map_only
 
+from .. import config
 from ..guards import GuardBuilder, install_guard
 from ..source import (
     AttrSource,
@@ -85,6 +87,60 @@ def _is_static_for_cudagraphs(x: torch.Tensor) -> bool:
         return True
 
 
+def _supports_adam_scalar_state(optimizer: torch.optim.Optimizer) -> bool:
+    """Whether the optimizer can retain its eager scalar bias correction path."""
+    if (
+        type(optimizer) not in (torch.optim.Adam, torch.optim.AdamW)
+        or type(optimizer.param_groups) is not list
+        or not optimizer.param_groups
+        or type(optimizer.state) not in (dict, defaultdict)
+    ):
+        return False
+    for group in optimizer.param_groups:
+        if type(group) is not dict:
+            return False
+        params = group.get("params")
+        betas = group.get("betas")
+        fused = group.get("fused")
+        if (
+            type(params) is not list
+            or type(betas) not in (tuple, list)
+            or len(betas) != 2
+            or group.get("foreach") is not False
+            or (fused is not None and fused is not False)
+            or group.get("capturable") is not False
+            or group.get("differentiable") is not False
+            or group.get("amsgrad") is not False
+            or any(
+                type(value) not in (int, float)
+                for value in (
+                    group.get("lr"),
+                    group.get("weight_decay"),
+                    group.get("eps"),
+                    *betas,
+                )
+            )
+        ):
+            return False
+        for param in params:
+            if (
+                type(param) not in (torch.Tensor, torch.nn.Parameter)
+                or param.device.type not in ("cpu", "cuda")
+            ):
+                return False
+            if param not in optimizer.state:
+                continue
+            state = optimizer.state[param]
+            if type(state) is not dict:
+                return False
+            if not state:
+                continue
+            step = state.get("step")
+            if type(step) is not torch.Tensor or not step.is_cpu or step.ndim != 0:
+                return False
+    return True
+
+
 class OptimizerVariable(UserDefinedObjectVariable):
     _nonvar_fields = {
         "grad_to_source",
@@ -119,18 +175,24 @@ class OptimizerVariable(UserDefinedObjectVariable):
             return None
         try:
             self.graph_break_if_pending_mutation(tx)
-            self.move_step_if_cpu()
+            preserve_scalar_state = (
+                config.preserve_adam_scalar_state
+                and _supports_adam_scalar_state(self.value)
+            )
+            if not preserve_scalar_state:
+                self.move_step_if_cpu()
             py_args, py_kwargs = self.get_python_args(*args, **kwargs)
             # Eager _init_group is not traced; it reads the live dict to
             # place state["step"]. Temporarily set capturable=True so GPU
             # steps land on device, then restore so the flag does not leak
             # into eager (see OptimizerCapturableVariable for the trace path).
             saved_capturables: list[tuple[dict[str, Any], bool]] = []
-            for group in self.value.param_groups:
-                if not self._safe_to_set_capturable(group):
-                    continue
-                saved_capturables.append((group, group["capturable"]))
-                group["capturable"] = True
+            if not preserve_scalar_state:
+                for group in self.value.param_groups:
+                    if not self._safe_to_set_capturable(group):
+                        continue
+                    saved_capturables.append((group, group["capturable"]))
+                    group["capturable"] = True
             try:
                 ret_val = self.value._init_group(*py_args, **py_kwargs)
             finally:
@@ -208,10 +270,13 @@ class OptimizerVariable(UserDefinedObjectVariable):
     def _set_capturable(self, tx: "InstructionTranslatorBase") -> None:
         from . import LazyVariableTracker
 
+        if config.preserve_adam_scalar_state and _supports_adam_scalar_state(self.value):
+            return
+
         # Rewrite the VT only. Do not mutate the live param_groups dict; that
-        # leak is what issue 182706 is about. Tracing must see capturable=True
-        # for every group (including CPU) so adam()/radam() take the tensor
-        # path instead of .item(). Reconstruction uses orig_value.
+        # leak is what issue 182706 is about. By default tracing sees
+        # capturable=True so adam()/radam() take the tensor path instead of
+        # .item(). Reconstruction uses orig_value.
         source = self.source and AttrSource(self.source, "param_groups")
         param_groups_vt = LazyVariableTracker.realize_all(
             VariableTracker.build(tx, self.value.param_groups, source)

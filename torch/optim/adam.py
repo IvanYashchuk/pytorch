@@ -526,7 +526,18 @@ def _single_tensor_adam(
             else:
                 param.addcdiv_(exp_avg, denom)
         else:
-            step = _get_value(step_t)
+            if (
+                not torch.jit.is_scripting()
+                and torch.compiler.is_compiling()
+                and torch._dynamo.config.preserve_adam_scalar_state
+                and step_t.is_cpu
+                and not isinstance(lr, Tensor)
+                and not isinstance(beta1, Tensor)
+                and not isinstance(beta2, Tensor)
+            ):
+                step = cast(float, step_t.item())
+            else:
+                step = _get_value(step_t)
 
             bias_correction1 = 1 - beta1**step
             bias_correction2 = 1 - beta2**step

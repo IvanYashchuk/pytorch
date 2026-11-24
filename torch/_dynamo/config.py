@@ -776,6 +776,11 @@ compiled_autograd = False
 # This can affect numerics for non-inductor backends.
 enable_dynamo_decompositions = True
 
+# Preserve eager CPU step storage and bias correction for noncapturable,
+# single-tensor Adam and AdamW with scalar hyperparameters. Pair with
+# capture_scalar_outputs to trace the step counter's scalar extraction.
+preserve_adam_scalar_state = False
+
 
 # Checks if we should graph break when seeing nn parameter constructors
 # in dynamo; this is so that we clearly fail and ask users to move outside
