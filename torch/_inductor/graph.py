@@ -13,6 +13,7 @@ import time
 import typing_extensions
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, cast, Literal, NoReturn, TYPE_CHECKING
 
 import sympy
@@ -146,6 +147,11 @@ from torch._inductor.codecache import output_code_log
 
 log = logging.getLogger(__name__)
 perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
+
+# A scoped source-overlay hook for preparing an experimental Python entry.
+_python_wrapper_transform: ContextVar[
+    Callable[[GraphLowering, ValueWithLineMap], ValueWithLineMap] | None
+] = ContextVar("_python_wrapper_transform", default=None)
 
 
 aten = torch.ops.aten
@@ -3161,6 +3167,9 @@ class GraphLowering(torch.fx.Interpreter):
                 + '"""\n'
             )
             wrapper_code.value = tuning_code + wrapper_code.value
+        if (transform := _python_wrapper_transform.get()) is not None:
+            if not self.cpp_wrapper and not config.fx_wrapper:
+                wrapper_code = transform(self, wrapper_code)
         if GraphLowering.save_output_code is not None:
             GraphLowering.save_output_code(wrapper_code.value)
         output_code_log.debug("Output code: \n%s", wrapper_code.value)
