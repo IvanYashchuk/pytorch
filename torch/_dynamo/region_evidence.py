@@ -106,6 +106,9 @@ class DictReplayWrite:
     items: tuple[DictReplayItem, ...]
 
 
+ContainerReplay = ListReplayWrite | DictReplayWrite
+
+
 @dataclass(frozen=True)
 class GuardedFrameEvidence:
     frame_code: CodeType
@@ -118,8 +121,19 @@ class GuardedFrameEvidence:
     resumes: tuple[ResumeCall, ...]
     host_calls: tuple[HostCall, ...]
     replayed_mutations: tuple[str, ...]
-    list_replays: tuple[ListReplayWrite, ...]
-    dict_replays: tuple[DictReplayWrite, ...]
+    container_replays: tuple[ContainerReplay, ...]
+
+    @property
+    def list_replays(self) -> tuple[ListReplayWrite, ...]:
+        return tuple(
+            write for write in self.container_replays if type(write) is ListReplayWrite
+        )
+
+    @property
+    def dict_replays(self) -> tuple[DictReplayWrite, ...]:
+        return tuple(
+            write for write in self.container_replays if type(write) is DictReplayWrite
+        )
 
 
 @dataclass
@@ -380,7 +394,6 @@ def record_guarded_frame(
             tuple(output.region_resumes or ()),
             tuple(output.region_host_calls or ()),
             replayed_mutations,
-            tuple(output.region_list_replays or ()),
-            tuple(output.region_dict_replays or ()),
+            tuple(output.region_container_replays or ()),
         )
     )

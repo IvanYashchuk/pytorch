@@ -53,8 +53,7 @@ from .bytecode_transformation import (
 from .codegen import PyCodegen
 from .exc import collapse_resume_frames, get_stack_above_dynamo, unimplemented
 from .region_evidence import (
-    DictReplayWrite,
-    ListReplayWrite,
+    ContainerReplay,
     observe_dict_replay,
     observe_list_replay,
 )
@@ -95,7 +94,7 @@ class SideEffectReplayContext:
     var: VariableTracker
     suffixes: list[list[Instruction]]
     log: Callable[[VariableTracker], None]
-    dict_replays: list[DictReplayWrite] | None = None
+    container_replays: list[ContainerReplay] | None = None
 
 
 SideEffectReplayMatcher = Callable[[SideEffectReplayContext], bool]
@@ -1532,12 +1531,8 @@ class SideEffects:
                 side_effect_messages.append(msg)
 
         suffixes: list[list[Instruction]] = []
-        capture = cg.tx.output.region_list_replays if log_side_effects else None
-        observed: list[ListReplayWrite] | None = [] if capture is not None else None
-        dict_capture = cg.tx.output.region_dict_replays if log_side_effects else None
-        dict_observed: list[DictReplayWrite] | None = (
-            [] if dict_capture is not None else None
-        )
+        capture = cg.tx.output.region_container_replays if log_side_effects else None
+        observed: list[ContainerReplay] | None = [] if capture is not None else None
         for var in self._get_modified_vars():
             # When replay_side_effects=False, only update variables with TempLocalSource
             if not config.replay_side_effects and not isinstance(
@@ -1551,27 +1546,19 @@ class SideEffects:
                 var=var,
                 suffixes=suffixes,
                 log=_maybe_log_side_effect,
-                dict_replays=dict_observed,
+                container_replays=observed,
             )
             handler = _side_effect_replay_registry.lookup_handler(ctx)
             if handler is None:
                 raise AssertionError(type(var))
             handler.codegen(ctx)
-            if (
-                observed is not None
-                and handler.codegen is _codegen_list_mutation
-                and type(var) is variables.ListVariable
-                and type(var.mutation_type) is ValueMutationExisting
-            ):
-                observed.append(observe_list_replay(var, cg.graph_outputs))
 
         # do all the actual mutations at the very end to handle dependencies
         for suffix in reversed(suffixes):
             cg.extend_output(suffix)
         if capture is not None and observed is not None:
+            # Each observed write describes one contiguous suffix group.
             capture.extend(reversed(observed))
-        if dict_capture is not None and dict_observed is not None:
-            dict_capture.extend(reversed(dict_observed))
 
         # Send batched structured trace for all side effects in this compilation
         if log_side_effects and side_effect_messages:
@@ -1622,6 +1609,12 @@ def _codegen_list_mutation(ctx: SideEffectReplayContext) -> None:
     )
     ctx.suffixes.append([create_instruction("STORE_SUBSCR")])
     ctx.log(var)
+    if (
+        ctx.container_replays is not None
+        and type(var) is variables.ListVariable
+        and type(var.mutation_type) is ValueMutationExisting
+    ):
+        ctx.container_replays.append(observe_list_replay(var, cg.graph_outputs))
 
 
 @register_side_effect_replay_handler(
@@ -1741,8 +1734,9 @@ def _codegen_const_dict_or_set_mutation(ctx: SideEffectReplayContext) -> None:
     if var.has_new_items():
         cg(var.source)  # type: ignore[attr-defined]
         cg.load_method("update")
+        replay = None
         if (
-            ctx.dict_replays is not None
+            ctx.container_replays is not None
             and type(var) is variables.ConstDictVariable
             and var.python_type() is dict
             and type(var.mutation_type) is ValueMutationExisting
@@ -1755,9 +1749,7 @@ def _codegen_const_dict_or_set_mutation(ctx: SideEffectReplayContext) -> None:
             finally:
                 cg.region_dict_pairs = previous
             if reconstructed is not None and reconstructed[1] is not None:
-                ctx.dict_replays.append(
-                    observe_dict_replay(var, reconstructed[1], cg.graph_outputs)
-                )
+                replay = observe_dict_replay(var, reconstructed[1], cg.graph_outputs)
         else:
             cg(var, allow_cache=False)  # Don't codegen via source
 
@@ -1781,6 +1773,8 @@ def _codegen_const_dict_or_set_mutation(ctx: SideEffectReplayContext) -> None:
                     create_instruction("POP_TOP"),
                 ]
             )
+        if ctx.container_replays is not None and replay is not None:
+            ctx.container_replays.append(replay)
         ctx.log(var)
 
 
