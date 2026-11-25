@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from .output_graph import OutputGraph
     from .source import Source
     from .variables.base import VariableTracker
+    from .variables.dicts import ConstDictVariable
     from .variables.lists import ListVariable
     from .codegen import GraphOutputEntry
 
@@ -92,6 +93,20 @@ class ListReplayWrite:
 
 
 @dataclass(frozen=True)
+class DictReplayItem:
+    key: ListReplayItem
+    literal_key: str | None
+    value: ListReplayItem
+
+
+@dataclass(frozen=True)
+class DictReplayWrite:
+    target: OperandSource | None
+    clear_first: bool
+    items: tuple[DictReplayItem, ...]
+
+
+@dataclass(frozen=True)
 class GuardedFrameEvidence:
     frame_code: CodeType
     emitted_code: CodeType
@@ -104,6 +119,7 @@ class GuardedFrameEvidence:
     host_calls: tuple[HostCall, ...]
     replayed_mutations: tuple[str, ...]
     list_replays: tuple[ListReplayWrite, ...]
+    dict_replays: tuple[DictReplayWrite, ...]
 
 
 @dataclass
@@ -242,30 +258,56 @@ def observe_list_replay(
     variable: "ListVariable", graph_outputs: "dict[int, GraphOutputEntry]"
 ) -> ListReplayWrite:
     """Project a native list reconstruction and its observed direct output uses."""
+    return ListReplayWrite(
+        _operand_source(variable.source),
+        tuple(_replay_item(_peek(value), graph_outputs) for value in variable.items),
+    )
+
+
+def _replay_item(
+    value: "VariableTracker", graph_outputs: "dict[int, GraphOutputEntry]"
+) -> ListReplayItem:
     from .variables.tensor import TensorVariable
 
+    slot = None
+    if type(value) is TensorVariable and value.source is None:
+        slot = next(
+            (entry.index for entry in graph_outputs.values() if entry.variable is value),
+            None,
+        )
+    return ListReplayItem(
+        type(value).__name__, _operand_source(value.source), slot, _constant_int(value)
+    )
+
+
+def observe_dict_replay(
+    variable: "ConstDictVariable",
+    pairs: "list[tuple[VariableTracker, VariableTracker]]",
+    graph_outputs: "dict[int, GraphOutputEntry]",
+) -> DictReplayWrite:
+    from .variables.constant import ConstantVariable
+
     items = []
-    for original in variable.items:
-        value = _peek(original)
-        slot = None
-        if type(value) is TensorVariable and value.source is None:
-            slot = next(
-                (
-                    entry.index
-                    for entry in graph_outputs.values()
-                    if entry.variable is value
-                ),
-                None,
-            )
+    for raw_key, value in pairs:
+        key = _peek(raw_key)
+        literal_key = None
+        if (
+            type(key) is ConstantVariable
+            and key.source is None
+            and type(key.value) is str
+            and len(key.value) <= 64
+        ):
+            literal_key = key.value
         items.append(
-            ListReplayItem(
-                type(value).__name__,
-                _operand_source(value.source),
-                slot,
-                _constant_int(value),
+            DictReplayItem(
+                _replay_item(key, graph_outputs),
+                literal_key,
+                _replay_item(_peek(value), graph_outputs),
             )
         )
-    return ListReplayWrite(_operand_source(variable.source), tuple(items))
+    return DictReplayWrite(
+        _operand_source(variable.source), variable.should_reconstruct_all, tuple(items)
+    )
 
 
 def observe_host_call(
@@ -339,5 +381,6 @@ def record_guarded_frame(
             tuple(output.region_host_calls or ()),
             replayed_mutations,
             tuple(output.region_list_replays or ()),
+            tuple(output.region_dict_replays or ()),
         )
     )

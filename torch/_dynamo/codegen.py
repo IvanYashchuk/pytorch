@@ -108,6 +108,9 @@ class PyCodegen:
         self.top_of_stack: VariableTracker | Source | None = None
         self.uses: Counter[VariableTracker | Source] = collections.Counter()
         self.graph_outputs: dict[int, GraphOutputEntry] = {}
+        self.region_dict_pairs: tuple[
+            VariableTracker, list[tuple[VariableTracker, VariableTracker]] | None
+        ] | None = None
         self._output: list[Instruction] = []
         # This determines which VariableTracker/Source should be stored as
         # locals, and maps the VariableTracker/Source to the local variable

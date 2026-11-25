@@ -354,14 +354,22 @@ class ConstDictVariable(VariableTracker):
     def reconstruct_kvs_into_new_dict(self, codegen: "PyCodegen") -> None:
         # Build a dictionary that contains the keys and values.
         num_args = 0
+        target = codegen.region_dict_pairs
+        pairs: list[tuple[VariableTracker, VariableTracker]] | None = (
+            [] if target is not None and target[0] is self else None
+        )
         for key, value in self.items.items():
             # We can safely call realize() here as it won't introduce any new guards
             item = self.original_items.get(key.vt)
             if self.is_new_item(item, value) or self.should_reconstruct_all:
                 codegen(key.vt)
                 codegen(value)
+                if pairs is not None:
+                    pairs.append((key.vt, value))
                 num_args += 1
         codegen.append_output(create_instruction("BUILD_MAP", arg=num_args))
+        if pairs is not None:
+            codegen.region_dict_pairs = (self, pairs)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         if self._contains_self_reference() and self.source is None:

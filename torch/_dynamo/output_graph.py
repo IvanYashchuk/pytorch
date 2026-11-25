@@ -126,6 +126,7 @@ from .guards import GuardBuilder, install_guard
 from .mutation_guard import is_dynamic_nn_module
 from .region_evidence import (
     capture_active,
+    DictReplayWrite,
     GraphInput,
     HostCall,
     ListReplayWrite,
@@ -783,6 +784,10 @@ class OutputGraph(OutputGraphCommon):
             [] if self.region_tensor_calls is not None else None
         )
         self.region_list_replays: list[ListReplayWrite] | None = (
+            [] if self.region_tensor_calls is not None else None
+        )
+
+        self.region_dict_replays: list[DictReplayWrite] | None = (
             [] if self.region_tensor_calls is not None else None
         )
 

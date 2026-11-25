@@ -52,7 +52,12 @@ from .bytecode_transformation import (
 )
 from .codegen import PyCodegen
 from .exc import collapse_resume_frames, get_stack_above_dynamo, unimplemented
-from .region_evidence import ListReplayWrite, observe_list_replay
+from .region_evidence import (
+    DictReplayWrite,
+    ListReplayWrite,
+    observe_dict_replay,
+    observe_list_replay,
+)
 from .source import AttrSource, GlobalSource, LocalCellSource, Source, TempLocalSource
 from .utils import (
     is_frozen_dataclass,
@@ -90,6 +95,7 @@ class SideEffectReplayContext:
     var: VariableTracker
     suffixes: list[list[Instruction]]
     log: Callable[[VariableTracker], None]
+    dict_replays: list[DictReplayWrite] | None = None
 
 
 SideEffectReplayMatcher = Callable[[SideEffectReplayContext], bool]
@@ -1528,6 +1534,10 @@ class SideEffects:
         suffixes: list[list[Instruction]] = []
         capture = cg.tx.output.region_list_replays if log_side_effects else None
         observed: list[ListReplayWrite] | None = [] if capture is not None else None
+        dict_capture = cg.tx.output.region_dict_replays if log_side_effects else None
+        dict_observed: list[DictReplayWrite] | None = (
+            [] if dict_capture is not None else None
+        )
         for var in self._get_modified_vars():
             # When replay_side_effects=False, only update variables with TempLocalSource
             if not config.replay_side_effects and not isinstance(
@@ -1541,6 +1551,7 @@ class SideEffects:
                 var=var,
                 suffixes=suffixes,
                 log=_maybe_log_side_effect,
+                dict_replays=dict_observed,
             )
             handler = _side_effect_replay_registry.lookup_handler(ctx)
             if handler is None:
@@ -1559,6 +1570,8 @@ class SideEffects:
             cg.extend_output(suffix)
         if capture is not None and observed is not None:
             capture.extend(reversed(observed))
+        if dict_capture is not None and dict_observed is not None:
+            dict_capture.extend(reversed(dict_observed))
 
         # Send batched structured trace for all side effects in this compilation
         if log_side_effects and side_effect_messages:
@@ -1728,7 +1741,25 @@ def _codegen_const_dict_or_set_mutation(ctx: SideEffectReplayContext) -> None:
     if var.has_new_items():
         cg(var.source)  # type: ignore[attr-defined]
         cg.load_method("update")
-        cg(var, allow_cache=False)  # Don't codegen via source
+        if (
+            ctx.dict_replays is not None
+            and type(var) is variables.ConstDictVariable
+            and var.python_type() is dict
+            and type(var.mutation_type) is ValueMutationExisting
+        ):
+            previous = cg.region_dict_pairs
+            cg.region_dict_pairs = (var, None)
+            try:
+                cg(var, allow_cache=False)  # Don't codegen via source
+                reconstructed = cg.region_dict_pairs
+            finally:
+                cg.region_dict_pairs = previous
+            if reconstructed is not None and reconstructed[1] is not None:
+                ctx.dict_replays.append(
+                    observe_dict_replay(var, reconstructed[1], cg.graph_outputs)
+                )
+        else:
+            cg(var, allow_cache=False)  # Don't codegen via source
 
         if var.should_reconstruct_all:
             cg(var.source)  # type: ignore[attr-defined]
