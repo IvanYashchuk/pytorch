@@ -99,13 +99,18 @@ def wrap_guarded_code(guarded_code: GuardedCode) -> ConvertFrameReturn:
     )
 
 
+# Private native-dispatch result for one deliberate default-to-eager transition.
+# The CodeType is evaluated once under the ordinary result's frame strategy.
+EagerResumeReturn = tuple[ConvertFrameReturn, types.CodeType]
+
+
 class DynamoCallbackFn(Protocol):
     def __call__(
         self,
         frame: DynamoFrameType,
         cache_entry: CacheEntry | None,
         frame_state: FrameState,
-    ) -> ConvertFrameReturn: ...
+    ) -> ConvertFrameReturn | EagerResumeReturn: ...
 
 
 DynamoCallback = DynamoCallbackFn | None | bool

@@ -276,6 +276,37 @@ static py::object dynamo_call_callback(
   return result;
 }
 
+#if IS_PYTHON_3_15_PLUS
+static bool matching_eager_resume_layout(PyCodeObject* source, PyObject* code) {
+  if (!PyCode_Check(code) || code == (PyObject*)source) {
+    return false;
+  }
+  auto* candidate = (PyCodeObject*)code;
+  if (candidate->co_flags != source->co_flags ||
+      (source->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR |
+                           CO_VARARGS | CO_VARKEYWORDS)) ||
+      candidate->co_argcount != source->co_argcount ||
+      candidate->co_posonlyargcount != source->co_posonlyargcount ||
+      candidate->co_kwonlyargcount != source->co_kwonlyargcount ||
+      candidate->co_nlocalsplus != source->co_nlocalsplus ||
+      candidate->co_nfreevars != 0 || source->co_nfreevars != 0 ||
+      candidate->co_ncellvars != 0 || source->co_ncellvars != 0) {
+    return false;
+  }
+  for (int i = 0; i < source->co_nlocalsplus; ++i) {
+    PyObject* old_name = PyTuple_GET_ITEM(source->co_localsplusnames, i);
+    PyObject* new_name = PyTuple_GET_ITEM(candidate->co_localsplusnames, i);
+    if (!PyUnicode_CheckExact(old_name) || !PyUnicode_CheckExact(new_name) ||
+        PyUnicode_Compare(old_name, new_name) != 0 ||
+        PyBytes_AS_STRING(source->co_localspluskinds)[i] !=
+            PyBytes_AS_STRING(candidate->co_localspluskinds)[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
+
 static py::handle _callback_from_action(
     py::handle callback,
     FrameAction action) {
@@ -532,6 +563,9 @@ PyObject* dynamo__custom_eval_frame(
   DEBUG_CHECK(PyDict_CheckExact(frame->f_globals));
   DEBUG_CHECK(PyDict_CheckExact(frame->f_builtins));
 
+#if IS_PYTHON_3_15_PLUS
+  const bool had_guard_complete_hook = guard_complete_hook != nullptr;
+#endif
   PyObject* maybe_cached_code = nullptr;
   std::unique_ptr<FrameLocalsMapping> locals;
   if (!try_lookup_without_guard_eval(
@@ -576,7 +610,9 @@ PyObject* dynamo__custom_eval_frame(
   bool has_relevant_entries =
       extra->cache_entry_map.count(isolate_recompiles_id) > 0 ||
       extra->cache_entry_map.count(-1) > 0;
-  if (guard_complete_hook != nullptr && has_relevant_entries) {
+  const bool used_guard_complete_hook =
+      guard_complete_hook != nullptr && has_relevant_entries;
+  if (used_guard_complete_hook) {
     py::handle guard_complete_hook_handle(guard_complete_hook);
     // False means force compilation (someone cache missed)
     py::object res = guard_complete_hook_handle(!Py_IsNone(maybe_cached_code));
@@ -617,6 +653,13 @@ PyObject* dynamo__custom_eval_frame(
   CacheEntry* cache_entry = extract_cache_entry(extra, isolate_recompiles_id);
   FrameState* frame_state = extract_frame_state(extra);
   py::object callback_result;
+#if IS_PYTHON_3_15_PLUS
+  const bool owns_cache_entry = isolate_recompiles_id >= 0 &&
+      cache_entry != nullptr &&
+      cache_entry->_isolate_recompiles_id == isolate_recompiles_id &&
+      PyCode_Check(cache_entry->code.ptr());
+  PyObject* eager_resume_code = nullptr; // Borrowed from callback_result
+#endif
   FrameExecStrategy new_strategy;
   bool apply_to_code = false;
   PyObject* guarded_code = nullptr;
@@ -631,10 +674,23 @@ PyObject* dynamo__custom_eval_frame(
     PreserveGlobalState preserve_global_state;
     callback_result = dynamo_call_callback(
         callback, frame, locals.get(), cache_entry, frame_state);
+    py::handle decision = callback_result;
+#if IS_PYTHON_3_15_PLUS
+    // Exact tuples were never valid legacy decisions. Legacy objects keep
+    // their original three attribute reads, with no extra descriptor lookup.
+    if (PyTuple_CheckExact(callback_result.ptr()) &&
+        PyTuple_GET_SIZE(callback_result.ptr()) == 2) {
+      PyObject* alternate = PyTuple_GET_ITEM(callback_result.ptr(), 1);
+      if (PyCode_Check(alternate)) {
+        decision = py::handle(PyTuple_GET_ITEM(callback_result.ptr(), 0));
+        eager_resume_code = alternate;
+      }
+    }
+#endif
     new_strategy =
-        callback_result.attr("frame_exec_strategy").cast<FrameExecStrategy>();
-    apply_to_code = callback_result.attr("apply_to_code").cast<bool>();
-    guarded_code = callback_result.attr("guarded_code").ptr();
+        decision.attr("frame_exec_strategy").cast<FrameExecStrategy>();
+    apply_to_code = decision.attr("apply_to_code").cast<bool>();
+    guarded_code = decision.attr("guarded_code").ptr();
   } catch (py::error_already_set& e) {
     // internal exception, returning here will leak the exception into user
     // code this is useful for debugging -- but we don't want it to happen
@@ -686,6 +742,23 @@ PyObject* dynamo__custom_eval_frame(
     cached_code = CacheEntry_get_code(new_cache_entry),
     trace_annotation = CacheEntry_get_trace_annotation(new_cache_entry);
     eval_custom();
+#if IS_PYTHON_3_15_PLUS
+  } else if (
+      eager_resume_code != nullptr && owns_cache_entry && apply_to_code &&
+      strategy.recursive_action == FrameAction::DEFAULT &&
+      new_strategy.cur_action == FrameAction::RUN_ONLY &&
+      new_strategy.recursive_action == FrameAction::RUN_ONLY &&
+      !had_guard_complete_hook && !used_guard_complete_hook &&
+      guard_complete_hook == nullptr &&
+      get_fullgraph_compiled_frame_count() < 0 &&
+      bytecode_debugger_callback_obj == nullptr &&
+      matching_eager_resume_layout(F_CODE(frame), eager_resume_code) &&
+      !breakpoint_code_objects.contains((PyCodeObject*)eager_resume_code)) {
+    // Keep the selected recursive action and leave the guarded cache intact.
+    cached_code = (PyCodeObject*)eager_resume_code;
+    trace_annotation = "TorchDynamo eager resume";
+    eval_custom();
+#endif
   } else {
     eval_default();
   }
