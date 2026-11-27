@@ -193,7 +193,7 @@ class TestBytecodeHookContext(torch._dynamo.test_case.TestCase):
             return x.sin() + 1
 
         contexts = []
-        requested_id = CompileId(frame_id=42, frame_compile_id=999)
+        requested_id = CompileId(frame_id=42, frame_compile_id=0)
 
         def observe(old, new, context):
             if old is body.__code__:
