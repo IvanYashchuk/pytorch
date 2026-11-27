@@ -3619,6 +3619,52 @@ class TestFakeTensorConstHandling(TestCase):
             y = torch.div(4, 4, rounding_mode="trunc")
             self.assertConst(y)
 
+    @skipIfTorchDynamo("test directly checks FakeTensorMode outputs")
+    @parametrize("use_cpp_fake_tensor", [False, True])
+    def test_numeric_shortcut_respects_operator_namespace(self, use_cpp_fake_tensor):
+        calls = []
+
+        def add(x):
+            calls.append(x.tolist())
+            return torch.add(x, 1)
+
+        one = torch.tensor([3], dtype=torch.int64, device="cpu")
+        two = torch.tensor([3, 7], dtype=torch.int64, device="cpu")
+        with torch.library._scoped_library(
+            "_fake_tensor_numeric_namespace_test", "DEF"
+        ) as lib:
+            lib.define("add(Tensor x) -> Tensor")
+            lib.impl("add", add, "CPU")
+            op = torch.ops._fake_tensor_numeric_namespace_test.add.default
+            with (
+                torch._dynamo.config.patch(use_cpp_fake_tensor=use_cpp_fake_tensor),
+                torch._functorch.config.patch(fake_tensor_propagate_real_tensors=False),
+                FakeTensorMode(allow_non_fake_inputs=False) as mode,
+            ):
+                for value in (one, two):
+                    with self.assertRaisesRegex(
+                        AssertionError, "Please convert all Tensors to FakeTensors first"
+                    ):
+                        op(value)
+                    self.assertEqual(calls, [])
+
+                literal = torch.tensor([3], dtype=torch.int64, device="cpu")
+                folded = op(literal)
+                aten_out = aten.add.Tensor(one, one)
+                prims_out = torch.ops.prims.add.default(one, one)
+
+            self.assertIsInstance(
+                mode, CppFakeTensorMode if use_cpp_fake_tensor else FakeTensorMode
+            )
+            self.assertEqual(calls, [[3]])
+            self.assertEqual(maybe_get_fake_constant(literal), one)
+            self.assertEqual(
+                maybe_get_fake_constant(folded), torch.tensor([4], device="cpu")
+            )
+            six = torch.tensor([6], device="cpu")
+            self.assertEqual(maybe_get_fake_constant(aten_out), six)
+            self.assertEqual(maybe_get_fake_constant(prims_out), six)
+
 
 make_propagate_real_tensors_cls(TestFakeTensorConstHandling)
 

@@ -1218,7 +1218,11 @@ void fakeFallback(
        (!symbolic_sizes && should_allow_numbers_as_tensors() &&
         !(is_to_copy &&
           (*stack)[arguments_begin].toTensor().device().is_meta()) &&
-        !avoiding_device_init()));
+        !avoiding_device_init() &&
+        // Match the native number binding namespaces.
+        (schema.name().starts_with("aten::") ||
+         schema.name().starts_with("prims::") ||
+         schema.name().starts_with("nvprims::"))));
   if (has_python_inputs || makes_constant) {
     // Validate input subclasses before any real execution. Share the GIL scope
     // with the initial constant attempt, output checks, and lift conversion.

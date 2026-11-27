@@ -3789,6 +3789,8 @@ class FakeTensorMode(TorchDispatchMode):
             and not has_symbolic_sizes
             and not flat_arg_fake_tensors
             and not device_conversion_skip_const_prop
+            # Match the native number binding namespaces.
+            and func.namespace in ("aten", "prims", "nvprims")
         ):
             if not all(t.constant is not None for t in flat_arg_fake_tensors):
                 raise AssertionError(
