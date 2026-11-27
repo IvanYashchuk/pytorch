@@ -12,6 +12,13 @@
 #include <opcode_ids.h>
 #endif
 
+#if PY_VERSION_HEX == 0x030F02F0 && defined(__linux__) && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_DEBUG)
+#define THP_HAS_ORIGINAL_FUNCTION_WITNESS 1
+#else
+#define THP_HAS_ORIGINAL_FUNCTION_WITNESS 0
+#endif
+
 #if IS_PYTHON_3_14_PLUS && defined(_WIN32)
 #define Py_BUILD_CORE
 #include <internal/pycore_code.h>
@@ -28,6 +35,20 @@ typedef struct {
 } ModuleState;
 
 static Py_tss_t eval_frame_callback_key = Py_tss_NEEDS_INIT;
+
+#if THP_HAS_ORIGINAL_FUNCTION_WITNESS
+typedef struct {
+  uint64_t activation;
+  PyThreadState* tstate;
+  _PyInterpreterFrame* shadow;
+  _PyInterpreterFrame* parent;
+  PyFunctionObject* original;
+  PyFunctionObject* shadow_function;
+} OriginalFunctionWitness;
+
+static _Thread_local OriginalFunctionWitness original_function_witness;
+static _Thread_local uint64_t next_original_function_activation = 1;
+#endif
 
 // The flags below all describe "the Dynamo region this thread is currently
 // inside".  Stored as per-thread tagged pointers.
@@ -580,7 +601,46 @@ static PyObject* dynamo_eval_custom_code_impl(
   // calling eval_frame_default (i.e. here) and comment out the
   // clear_old_frame_if_python_312_plus call on the original frame.
 
+#if THP_HAS_ORIGINAL_FUNCTION_WITNESS
+  // The original frame still owns old_func, and the existing extra reference
+  // to func survives CPython clearing the shadow. Only publish for the stock
+  // evaluator with no saved executor to destroy after popping the shadow.
+  const bool publish_witness = throw_flag == 0 &&
+      frame->owner == FRAME_OWNED_BY_THREAD &&
+      !(F_CODE(frame)->co_flags &
+        (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR |
+         CO_ITERABLE_COROUTINE)) &&
+      tstate->current_executor == NULL &&
+      (previous_eval_frame == NULL ||
+       previous_eval_frame == _PyEval_EvalFrameDefault) &&
+      next_original_function_activation != UINT64_MAX;
+  const OriginalFunctionWitness previous = original_function_witness;
+  uint64_t activation = 0;
+  if (publish_witness) {
+    activation = next_original_function_activation++;
+    original_function_witness = (OriginalFunctionWitness){
+        .activation = activation,
+        .tstate = tstate,
+        .shadow = shadow,
+        .parent = tstate->current_frame,
+        .original = old_func,
+        .shadow_function = func,
+    };
+  }
+#endif
   PyObject* result = dynamo_eval_frame_default(tstate, shadow, throw_flag);
+#if THP_HAS_ORIGINAL_FUNCTION_WITNESS
+  if (publish_witness) {
+    if (original_function_witness.activation != activation ||
+        next_original_function_activation == UINT64_MAX) {
+      // On an out-of-order exit, older scopes must not restore saved slots.
+      next_original_function_activation = UINT64_MAX;
+      original_function_witness = (OriginalFunctionWitness){0};
+    } else {
+      original_function_witness = previous;
+    }
+  }
+#endif
 
 #if IS_PYTHON_3_12_PLUS
 
@@ -1048,7 +1108,58 @@ static PyObject* frame_call_ex_matches(
 #endif
 }
 
+static PyObject* frame_original_function_matches(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+#if THP_HAS_ORIGINAL_FUNCTION_WITNESS
+  if (nargs != 2 || !PyFrame_Check(args[0]) || !PyFunction_Check(args[1]) ||
+      next_original_function_activation == UINT64_MAX) {
+    Py_RETURN_FALSE;
+  }
+
+  PyFrameObject* object = (PyFrameObject*)args[0];
+  _PyInterpreterFrame* frame = object->f_frame;
+  PyThreadState* tstate = PyThreadState_Get();
+  const OriginalFunctionWitness* witness = &original_function_witness;
+  if (witness->activation == 0 || witness->tstate != tstate ||
+      witness->shadow != frame || (PyObject*)witness->original != args[1]) {
+    Py_RETURN_FALSE;
+  }
+
+  // Clearing can run Python after unlinking the shadow from the live stack.
+  _PyInterpreterFrame* active = tstate->current_frame;
+  while (active != NULL && active != frame) {
+    active = active->previous;
+  }
+  if (active == NULL || active->owner != FRAME_OWNED_BY_THREAD ||
+      active->frame_obj != object || !PyStackRef_IsValid(active->f_funcobj) ||
+      PyStackRef_IsTaggedInt(active->f_funcobj) ||
+      !PyStackRef_IsValid(active->f_executable) ||
+      PyStackRef_IsTaggedInt(active->f_executable)) {
+    Py_RETURN_FALSE;
+  }
+  PyObject* function = (PyObject*)FUNC(active);
+  if (function != (PyObject*)witness->shadow_function ||
+      !PyFunction_Check(function) ||
+      (PyObject*)F_CODE(active) != PyFunction_GET_CODE(function) ||
+      _PyFrame_IsIncomplete(active)) {
+    Py_RETURN_FALSE;
+  }
+  _PyInterpreterFrame* entry = active->previous;
+  return PyBool_FromLong(
+      entry != NULL && entry->owner == FRAME_OWNED_BY_INTERPRETER &&
+      entry->previous == witness->parent);
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
 static PyMethodDef _methods[] = {
+    {"frame_original_function_matches",
+     _PyCFunction_CAST(frame_original_function_matches),
+     METH_FASTCALL,
+     "Check which Python function entered a live Dynamo frame on this thread."},
     {"frame_closure_matches",
      _PyCFunction_CAST(frame_closure_matches),
      METH_FASTCALL,
