@@ -5,6 +5,7 @@ import sysconfig
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dis import get_instructions
+from types import MethodType
 
 from torch._C._dynamo.eval_frame import frame_call_ex_matches, set_eval_frame
 
@@ -124,6 +125,49 @@ class TestFrameCallExMatches(unittest.TestCase):
             set_eval_frame(False)
             self.assertIs(invoke(), value)
             self.assertEqual(opcodes, ["CALL_EX_PY", "CALL_EX_PY"])
+        finally:
+            set_eval_frame(original)
+
+    @unittest.skipUnless(SUPPORTED, "requires the audited CPython 3.15.2 ABI")
+    def test_matches_plain_function_after_bound_method_history(self):
+        value = object()
+        operands = (value,)
+        hooked = False
+        opcodes = []
+
+        def warm(receiver, arg):
+            return arg
+
+        bound = MethodType(warm, object())
+
+        def target(arg):
+            frame = sys._getframe(1)
+            (call,) = [
+                instruction
+                for instruction in get_instructions(frame.f_code, adaptive=True)
+                if instruction.offset == frame.f_lasti
+            ]
+            opcodes.append(call.opname)
+            prior = set_eval_frame(None)
+            try:
+                self.assertIs(prior, False if hooked else None)
+                self.assertIs(frame_call_ex_matches(frame, target, operands), hooked)
+            finally:
+                set_eval_frame(prior)
+            return arg
+
+        def invoke(callee):
+            return next(fn(*args) for fn, args in ((callee, operands),))
+
+        original = set_eval_frame(None)
+        try:
+            for _ in range(32):
+                self.assertIs(invoke(bound), value)
+            self.assertIs(invoke(target), value)
+            hooked = True
+            set_eval_frame(False)
+            self.assertIs(invoke(target), value)
+            self.assertEqual(opcodes, ["CALL_EX_NON_PY_GENERAL"] * 2)
         finally:
             set_eval_frame(original)
 

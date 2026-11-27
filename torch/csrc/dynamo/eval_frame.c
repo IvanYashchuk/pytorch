@@ -1024,10 +1024,12 @@ static PyObject* frame_call_ex_matches(
       (pc - start) / sizeof(_Py_CODEUNIT) > (size_t)Py_SIZE(code) - 2) {
     Py_RETURN_FALSE;
   }
-  // A hooked CALL_EX_PY deopts without changing the stored opcode.
+  // Both specializations can enter the generic call with their stored opcode.
   const _Py_CODEUNIT instruction = *active->instr_ptr;
-  if ((instruction.op.code != CALL_FUNCTION_EX &&
-       instruction.op.code != CALL_EX_PY) || instruction.op.arg != 0) {
+  const int opcode = instruction.op.code;
+  if ((opcode != CALL_FUNCTION_EX && opcode != CALL_EX_PY &&
+       opcode != CALL_EX_NON_PY_GENERAL) ||
+      instruction.op.arg != 0) {
     Py_RETURN_FALSE;
   }
 
