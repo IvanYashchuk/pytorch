@@ -169,6 +169,23 @@ static PyObject* set_eval_frame_isolate_recompiles_id_py(
 DECLARE_PYOBJ_ATTR(f_globals)
 DECLARE_PYOBJ_ATTR(f_builtins)
 
+static PyObject* THPPyInterpreterFrame_f_function(
+    THPPyInterpreterFrame* self,
+    PyObject* _noargs) {
+#if IS_PYTHON_3_11_PLUS
+#if IS_PYTHON_3_14_PLUS
+  if (PyStackRef_IsNull(self->frame->f_funcobj)) {
+    Py_RETURN_NONE;
+  }
+#endif
+  PyObject* func = (PyObject*)FUNC(self->frame);
+  if (func != NULL && PyFunction_Check(func)) {
+    return Py_NewRef(func);
+  }
+#endif
+  Py_RETURN_NONE;
+}
+
 static PyObject* THPPyInterpreterFrame_f_locals(
     THPPyInterpreterFrame* self,
     PyObject* _noargs) {
@@ -265,6 +282,7 @@ static PyObject* THPPyInterpreterFrame_closure(
 static struct PyGetSetDef THPPyInterpreterFrame_properties[] = {
     {"f_globals", (getter)THPPyInterpreterFrame_f_globals, NULL, NULL, NULL},
     {"f_builtins", (getter)THPPyInterpreterFrame_f_builtins, NULL, NULL, NULL},
+    {"f_function", (getter)THPPyInterpreterFrame_f_function, NULL, NULL, NULL},
     {"f_locals", (getter)THPPyInterpreterFrame_f_locals, NULL, NULL, NULL},
 #if IS_PYTHON_3_13_PLUS
     {"f_code", (getter)THPPyInterpreterFrame_f_executable, NULL, NULL, NULL},

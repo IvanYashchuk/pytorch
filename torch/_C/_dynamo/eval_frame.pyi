@@ -65,6 +65,8 @@ class _PyInterpreterFrame:
     f_locals: dict[str, object]
     f_globals: dict[str, object]
     f_builtins: dict[str, object]
+    @property
+    def f_function(self) -> types.FunctionType | None: ...
     f_lasti: int
     f_lineno: int
     f_back: types.FrameType

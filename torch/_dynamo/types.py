@@ -149,7 +149,33 @@ class ProfilerEndHook(Protocol):
     def __call__(self, record: Any) -> None: ...
 
 
+@dataclasses.dataclass(frozen=True, slots=True, eq=False, repr=False)
+class BytecodeHookContext:
+    """Process-local provenance for the current Dynamo compile hook.
+
+    The namespace references are the original live dictionaries. Treat them
+    and the function as read-only. Keeping a context can extend their lifetime.
+    A compile without a live frame has no frame provenance or isolation scope.
+    The isolation ID is the compile scope, before native cache installation.
+    """
+
+    compile_id: CompileId
+    isolation_id: int | None
+    f_globals: Mapping[str, object] | None
+    f_builtins: Mapping[str, object] | None
+    f_function: types.FunctionType | None
+
+
 class BytecodeHook(Protocol):
     def __call__(
         self, code: types.CodeType, new_code: types.CodeType
+    ) -> types.CodeType | None: ...
+
+
+class ContextualBytecodeHook(Protocol):
+    def __call__(
+        self,
+        code: types.CodeType,
+        new_code: types.CodeType,
+        context: BytecodeHookContext,
     ) -> types.CodeType | None: ...
