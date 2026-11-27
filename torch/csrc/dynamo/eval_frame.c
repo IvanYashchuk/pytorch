@@ -973,17 +973,18 @@ static PyObject* frame_call_ex_matches(
     Py_RETURN_FALSE;
   }
 
-  PyThreadState* tstate = PyThreadState_Get();
   PyFrameObject* object = (PyFrameObject*)args[0];
   _PyInterpreterFrame* frame = object->f_frame;
-  if (tstate->interp->eval_frame == NULL || tstate->current_frame == frame) {
-    Py_RETURN_FALSE;
-  }
-  _PyInterpreterFrame* active = tstate->current_frame;
+  _PyInterpreterFrame* active = PyThreadState_Get()->current_frame;
+  _PyInterpreterFrame* entry = NULL;
   while (active != NULL && active != frame) {
+    entry = active;
     active = active->previous;
   }
-  if (active == NULL || active->owner != FRAME_OWNED_BY_GENERATOR ||
+  // PyObject_Call enters the Python callee through an interpreter-owned shim.
+  if (active == NULL || entry == NULL ||
+      entry->owner != FRAME_OWNED_BY_INTERPRETER ||
+      active->owner != FRAME_OWNED_BY_GENERATOR ||
       active->frame_obj != object || !PyStackRef_IsValid(active->f_executable) ||
       PyStackRef_IsTaggedInt(active->f_executable) ||
       !PyStackRef_IsValid(active->f_funcobj) ||
@@ -1020,14 +1021,18 @@ static PyObject* frame_call_ex_matches(
   uintptr_t start = (uintptr_t)bytecode;
   uintptr_t pc = (uintptr_t)active->instr_ptr;
   if (pc < start || (pc - start) % sizeof(_Py_CODEUNIT) != 0 || Py_SIZE(code) < 2 ||
-      (pc - start) / sizeof(_Py_CODEUNIT) > (size_t)Py_SIZE(code) - 2 ||
-      active->instr_ptr->op.code != CALL_FUNCTION_EX ||
-      active->instr_ptr->op.arg != 0) {
+      (pc - start) / sizeof(_Py_CODEUNIT) > (size_t)Py_SIZE(code) - 2) {
+    Py_RETURN_FALSE;
+  }
+  // A hooked CALL_EX_PY deopts without changing the stored opcode.
+  const _Py_CODEUNIT instruction = *active->instr_ptr;
+  if ((instruction.op.code != CALL_FUNCTION_EX &&
+       instruction.op.code != CALL_EX_PY) || instruction.op.arg != 0) {
     Py_RETURN_FALSE;
   }
 
-  // CPython 3.15.2 spills all four slots before the PEP 523 PyObject_Call.
-  // Compare identities only. LOAD_FAST_BORROW slots are not object owners.
+  // CPython 3.15.2 spills all four slots before PyObject_Call. The caller
+  // must retain both expected operands from before the call.
   if (!PyStackRef_IsNull(top[-3]) || !PyStackRef_IsNull(top[-1]) ||
       !PyStackRef_IsValid(top[-4]) || PyStackRef_IsTaggedInt(top[-4]) ||
       !PyStackRef_IsValid(top[-2]) || PyStackRef_IsTaggedInt(top[-2])) {

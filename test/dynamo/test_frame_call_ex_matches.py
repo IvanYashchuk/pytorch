@@ -4,6 +4,7 @@ import sys
 import sysconfig
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dis import get_instructions
 
 from torch._C._dynamo.eval_frame import frame_call_ex_matches, set_eval_frame
 
@@ -61,7 +62,7 @@ class TestFrameCallExMatches(unittest.TestCase):
         finally:
             set_eval_frame(prior)
 
-    def test_declines_calls_with_kwargs_or_without_pep523(self):
+    def test_declines_calls_with_kwargs_or_inlined_callees(self):
         def target(arg):
             frame = sys._getframe(1)
             self.assertIs(frame_call_ex_matches(frame, target, operands), False)
@@ -79,6 +80,52 @@ class TestFrameCallExMatches(unittest.TestCase):
             self.assertIs(next(fn(*args) for fn, args in ((target, operands),)), value)
         finally:
             set_eval_frame(prior)
+
+    @unittest.skipUnless(SUPPORTED, "requires the audited CPython 3.15.2 ABI")
+    def test_matches_adaptive_call_after_hook_is_disabled_in_callee(self):
+        value = object()
+        armed = False
+        hooked = False
+        opcodes = []
+
+        def target(arg):
+            if not armed:
+                return arg
+            frame = sys._getframe(1)
+            (call,) = [
+                instruction
+                for instruction in get_instructions(frame.f_code, adaptive=True)
+                if instruction.offset == frame.f_lasti
+            ]
+            opcodes.append(call.opname)
+            if hooked:
+                prior = set_eval_frame(None)
+                try:
+                    self.assertIs(prior, False)
+                    self.assertIs(frame_call_ex_matches(frame, target, operands), True)
+                finally:
+                    set_eval_frame(prior)
+            else:
+                self.assertIs(frame_call_ex_matches(frame, target, operands), False)
+            return arg
+
+        operands = (value,)
+
+        def invoke():
+            return next(fn(*args) for fn, args in ((target, operands),))
+
+        original = set_eval_frame(None)
+        try:
+            for _ in range(32):
+                self.assertIs(invoke(), value)
+            armed = True
+            self.assertIs(invoke(), value)
+            hooked = True
+            set_eval_frame(False)
+            self.assertIs(invoke(), value)
+            self.assertEqual(opcodes, ["CALL_EX_PY", "CALL_EX_PY"])
+        finally:
+            set_eval_frame(original)
 
 
 if __name__ == "__main__":
