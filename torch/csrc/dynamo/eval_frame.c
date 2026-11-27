@@ -8,6 +8,10 @@
 #include <torch/csrc/dynamo/eval_frame_cpp.h>
 #include <torch/csrc/utils/python_compat.h>
 
+#if PY_VERSION_HEX == 0x030F02F0 && !defined(Py_GIL_DISABLED) && !defined(_WIN32)
+#include <opcode_ids.h>
+#endif
+
 #if IS_PYTHON_3_14_PLUS && defined(_WIN32)
 #define Py_BUILD_CORE
 #include <internal/pycore_code.h>
@@ -959,11 +963,93 @@ static PyObject* frame_closure_matches(
 #endif
 }
 
+static PyObject* frame_call_ex_matches(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+#if PY_VERSION_HEX == 0x030F02F0 && !defined(Py_GIL_DISABLED) && !defined(_WIN32)
+  if (nargs != 3 || !PyFrame_Check(args[0]) || !PyFunction_Check(args[1]) ||
+      !PyTuple_CheckExact(args[2])) {
+    Py_RETURN_FALSE;
+  }
+
+  PyThreadState* tstate = PyThreadState_Get();
+  PyFrameObject* object = (PyFrameObject*)args[0];
+  _PyInterpreterFrame* frame = object->f_frame;
+  if (tstate->interp->eval_frame == NULL || tstate->current_frame == frame) {
+    Py_RETURN_FALSE;
+  }
+  _PyInterpreterFrame* active = tstate->current_frame;
+  while (active != NULL && active != frame) {
+    active = active->previous;
+  }
+  if (active == NULL || active->owner != FRAME_OWNED_BY_GENERATOR ||
+      active->frame_obj != object || !PyStackRef_IsValid(active->f_executable) ||
+      PyStackRef_IsTaggedInt(active->f_executable) ||
+      !PyStackRef_IsValid(active->f_funcobj) ||
+      PyStackRef_IsTaggedInt(active->f_funcobj)) {
+    Py_RETURN_FALSE;
+  }
+  PyGenObject* generator = _PyGen_GetGeneratorFromFrame(active);
+  if (!PyGen_CheckExact(generator) || generator->gi_frame_state != FRAME_EXECUTING) {
+    Py_RETURN_FALSE;
+  }
+
+  PyCodeObject* code = F_CODE(active);
+  PyObject* function = (PyObject*)FUNC(active);
+  if (code == NULL || !PyCode_Check(code) || function == NULL ||
+      !PyFunction_Check(function) ||
+      PyFunction_GET_CODE(function) != (PyObject*)code ||
+      !(code->co_flags & CO_GENERATOR) ||
+      !PyUnicode_CheckExact(code->co_name) ||
+      PyUnicode_CompareWithASCIIString(code->co_name, "<genexpr>") != 0) {
+    Py_RETURN_FALSE;
+  }
+  // The audited genexpr has two iteration slots and four call operands.
+  if (code->co_stacksize != 6 || code->co_nlocalsplus < 0 ||
+      (Py_ssize_t)code->co_framesize !=
+          (Py_ssize_t)code->co_nlocalsplus + 6 + FRAME_SPECIALS_SIZE) {
+    Py_RETURN_FALSE;
+  }
+  _PyStackRef* top = active->stackpointer;
+  if (top != active->localsplus + (Py_ssize_t)code->co_nlocalsplus + 6) {
+    Py_RETURN_FALSE;
+  }
+
+  const _Py_CODEUNIT* bytecode = _PyCode_CODE(code);
+  uintptr_t start = (uintptr_t)bytecode;
+  uintptr_t pc = (uintptr_t)active->instr_ptr;
+  if (pc < start || (pc - start) % sizeof(_Py_CODEUNIT) != 0 || Py_SIZE(code) < 2 ||
+      (pc - start) / sizeof(_Py_CODEUNIT) > (size_t)Py_SIZE(code) - 2 ||
+      active->instr_ptr->op.code != CALL_FUNCTION_EX ||
+      active->instr_ptr->op.arg != 0) {
+    Py_RETURN_FALSE;
+  }
+
+  // CPython 3.15.2 spills all four slots before the PEP 523 PyObject_Call.
+  // Compare identities only. LOAD_FAST_BORROW slots are not object owners.
+  if (!PyStackRef_IsNull(top[-3]) || !PyStackRef_IsNull(top[-1]) ||
+      !PyStackRef_IsValid(top[-4]) || PyStackRef_IsTaggedInt(top[-4]) ||
+      !PyStackRef_IsValid(top[-2]) || PyStackRef_IsTaggedInt(top[-2])) {
+    Py_RETURN_FALSE;
+  }
+  return PyBool_FromLong(
+      THP_PyStackRef_AsPyObjectBorrow(&top[-4]) == args[1] &&
+      THP_PyStackRef_AsPyObjectBorrow(&top[-2]) == args[2]);
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
 static PyMethodDef _methods[] = {
     {"frame_closure_matches",
      _PyCFunction_CAST(frame_closure_matches),
      METH_FASTCALL,
      "Check cell identity for a live Python frame on this thread."},
+    {"frame_call_ex_matches",
+     _PyCFunction_CAST(frame_call_ex_matches),
+     METH_FASTCALL,
+     "Check retained call operands in a live generator expression."},
     {"set_eval_frame", set_eval_frame_py, METH_O, NULL},
     {"set_skip_guard_eval_unsafe", set_skip_guard_eval_unsafe, METH_O, NULL},
     {"get_eval_frame_callback", get_eval_frame_callback_py, METH_NOARGS, NULL},
