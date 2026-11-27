@@ -901,7 +901,69 @@ static PyObject* set_fullgraph_error_on_nested_compile_py(
   Py_RETURN_FALSE;
 }
 
+static PyObject* frame_closure_matches(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+#if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION == 15 && !defined(Py_GIL_DISABLED)
+  if (nargs != 2 || !PyFrame_Check(args[0]) || !PyTuple_CheckExact(args[1])) {
+    Py_RETURN_FALSE;
+  }
+
+  PyFrameObject* object = (PyFrameObject*)args[0];
+  _PyInterpreterFrame* frame = object->f_frame;
+  _PyInterpreterFrame* active = PyThreadState_Get()->current_frame;
+  // The public frame may represent a returned call or a different thread.
+  while (active != NULL && active != frame) {
+    active = active->previous;
+  }
+  if (active == NULL || active->owner != FRAME_OWNED_BY_THREAD ||
+      active->frame_obj != object || _PyFrame_IsIncomplete(active) ||
+      PyStackRef_IsNull(active->f_funcobj)) {
+    Py_RETURN_FALSE;
+  }
+
+  PyCodeObject* code = F_CODE(active);
+  PyObject* function = (PyObject*)FUNC(active);
+  if (function == NULL || !PyFunction_Check(function) ||
+      PyFunction_GET_CODE(function) != (PyObject*)code) {
+    Py_RETURN_FALSE;
+  }
+
+  PyObject* expected = args[1];
+  Py_ssize_t count = PyTuple_GET_SIZE(expected);
+  if (count != PyCode_GetNumFree(code)) {
+    Py_RETURN_FALSE;
+  }
+  PyObject* closure = PyFunction_GET_CLOSURE(function);
+  if (closure == NULL) {
+    return PyBool_FromLong(count == 0);
+  }
+  if (!PyTuple_CheckExact(closure) || PyTuple_GET_SIZE(closure) != count) {
+    Py_RETURN_FALSE;
+  }
+
+  // COPY_FREE_VARS ran before the first RESUME. Check the actual slots too.
+  _PyStackRef* freevars = active->localsplus + PyUnstable_Code_GetFirstFree(code);
+  for (Py_ssize_t i = 0; i < count; i++) {
+    PyObject* cell = PyTuple_GET_ITEM(expected, i);
+    if (!PyCell_Check(cell) || PyTuple_GET_ITEM(closure, i) != cell ||
+        PyStackRef_IsNullOrInt(freevars[i]) ||
+        THP_PyStackRef_AsPyObjectBorrow(&freevars[i]) != cell) {
+      Py_RETURN_FALSE;
+    }
+  }
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
 static PyMethodDef _methods[] = {
+    {"frame_closure_matches",
+     _PyCFunction_CAST(frame_closure_matches),
+     METH_FASTCALL,
+     "Check cell identity for a live Python frame on this thread."},
     {"set_eval_frame", set_eval_frame_py, METH_O, NULL},
     {"set_skip_guard_eval_unsafe", set_skip_guard_eval_unsafe, METH_O, NULL},
     {"get_eval_frame_callback", get_eval_frame_callback_py, METH_NOARGS, NULL},
